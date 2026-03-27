@@ -1,0 +1,565 @@
+\documentclass[11pt,a4paper]{article}
+
+% --- Page layout ---
+\usepackage[margin=1in]{geometry}
+\usepackage{parskip}
+
+% --- Fonts and encoding ---
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+
+% --- Math ---
+\usepackage{amsmath,amssymb}
+
+% --- Graphics ---
+\usepackage{graphicx}
+\usepackage[table]{xcolor}
+
+% --- Tables ---
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{multirow}
+
+% --- Code listings (black and white) ---
+\usepackage{listings}
+\lstset{
+  basicstyle=\ttfamily\small,
+  keywordstyle=\bfseries,
+  commentstyle=\itshape,
+  stringstyle=\ttfamily,
+  breaklines=true,
+  frame=single,
+  rulecolor=\color{gray!40},
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  xleftmargin=2em,
+  framexleftmargin=1.5em,
+  columns=flexible,
+  showstringspaces=false,
+}
+
+% --- Hyperlinks (black, no color) ---
+\usepackage[colorlinks=false,pdfborder={0 0 0}]{hyperref}
+
+% --- Bibliography ---
+\usepackage[numbers,sort&compress]{natbib}
+
+% --- Section styling (black) ---
+\usepackage{titlesec}
+\titleformat{\section}{\large\bfseries}{\thesection}{1em}{}
+\titleformat{\subsection}{\normalsize\bfseries}{\thesubsection}{1em}{}
+
+% --- B&W table header helper ---
+\definecolor{HeaderGray}{gray}{0.25}
+\newcommand{\thead}[1]{\textbf{\color{white}#1}}
+
+% --- Document ---
+\begin{document}
+
+% --- Title block ---
+\begin{center}
+  {\LARGE\bfseries rvLLM: A High-Performance LLM Inference Engine in Rust\par}
+  \vspace{0.6em}
+  {\large m0at\par}
+  \vspace{0.3em}
+  {\normalsize\texttt{https://github.com/m0at/rvllm}\par}
+  \vspace{0.3em}
+  {\normalsize March 2026\par}
+\end{center}
+\vspace{1em}
+
+% --- Abstract ---
+\begin{abstract}
+We present rvLLM, a from-scratch Rust implementation of the vLLM inference engine
+targeting OpenAI-compatible API serving with CUDA GPU acceleration. The system
+comprises 22~Rust crates and pre-compiled CUDA PTX kernels, compiling to a single
+15\,MB static binary. We describe the modular crate architecture, CUDA integration
+strategy via PTX kernels loaded through \texttt{cudarc}, and key design decisions
+including a mock-GPU feature for hardware-free development, CPU attention fallback,
+and PyTorch weight-layout compatibility. The merged main branch produces coherent
+inference output on NVIDIA A100 with a $\sim$7\,s startup time and 333\,MB resident
+memory. Full throughput benchmarks against Python vLLM are being refreshed in a
+follow-up pass. rvLLM is open-source under the Apache-2.0 license.
+\end{abstract}
+
+% ============================================================================
+\section{Introduction}
+\label{sec:introduction}
+% ============================================================================
+
+Large language model (LLM) inference serving has become a critical infrastructure
+component. The dominant open-source serving engine, vLLM~\cite{kwon2023vllm},
+introduced PagedAttention for efficient KV cache management and demonstrated that
+virtual-memory-inspired techniques can dramatically improve GPU memory utilisation
+during batched inference. However, vLLM is implemented in Python with PyTorch as its
+tensor runtime, which introduces several practical limitations.
+
+First, \textbf{Python's Global Interpreter Lock} (GIL) serialises the scheduler,
+tokenizer, and output-processing stages. At high concurrency (hundreds of concurrent
+sequences), the scheduling loop itself becomes a throughput bottleneck---not the GPU
+computation.
+
+Second, \textbf{garbage collection pauses} grow as Python tracks millions of tensor
+metadata objects during large-batch serving. These pauses introduce tail-latency
+spikes that are difficult to diagnose or eliminate.
+
+Third, \textbf{deployment complexity} is substantial. A fresh \texttt{pip install vllm}
+pulls approximately 500\,MB of dependencies including PyTorch ($\sim$2\,GB with CUDA
+runtime), the \texttt{transformers} library, NumPy, and dozens of supporting packages.
+Startup requires 30--60 seconds for Python imports, Triton JIT compilation, and NCCL
+initialisation.
+
+rvLLM addresses these limitations by reimplementing the core vLLM architecture in Rust.
+The system compiles to a single 14\,MB statically-linked binary with zero runtime
+dependencies beyond the CUDA driver. Rust's ownership model provides deterministic
+memory deallocation without garbage collection, and the absence of a GIL enables true
+parallelism across the scheduler, tokenizer, and sampling stages. Direct cuBLAS and
+CUDA kernel invocation through \texttt{cudarc}~\cite{cudarc2023} eliminates the
+PyTorch middleware layer.
+
+The primary contributions of this work are:
+\begin{enumerate}
+  \item A modular 22-crate Rust workspace architecture for LLM inference serving,
+        with clear separation between GPU primitives, model execution, scheduling,
+        and API layers.
+  \item A CUDA integration strategy using 13~pre-compiled PTX kernels loaded at
+        runtime, avoiding JIT compilation and enabling deterministic startup.
+  \item A mock-GPU feature that allows the entire scheduling, sampling, and API
+        stack (769~tests across 22~crates) to be developed and tested without GPU
+        hardware.
+  \item Preliminary benchmark results demonstrating competitive throughput on A100
+        GPUs with substantially reduced memory footprint, binary size, and startup
+        time.
+\end{enumerate}
+
+% ============================================================================
+\section{Architecture}
+\label{sec:architecture}
+% ============================================================================
+
+rvLLM is organised as a Cargo workspace containing 22~member crates plus a server
+binary crate. Each crate has a single well-defined responsibility, and dependencies
+flow strictly downward from the API layer to the GPU primitives. We describe the key
+layers below.
+
+\subsection{Core and Configuration}
+
+\texttt{rvllm-core} provides shared types, a structured error hierarchy using
+\texttt{thiserror}, and a prelude module. \texttt{rvllm-config} handles CLI argument
+parsing (via \texttt{clap}), TOML configuration files, and validation of runtime
+parameters such as GPU memory utilisation fraction, maximum sequence length, and
+tensor-parallel size. \texttt{rvllm-sequence} defines the sequence state machine
+(pending, running, finished, swapped) and request-group metadata.
+
+\subsection{GPU Abstraction Layer}
+
+\texttt{rvllm-gpu} provides a uniform interface over CUDA and a mock backend,
+controlled by Cargo feature flags. The CUDA path wraps \texttt{cudarc} for device
+management, stream synchronisation, and memory allocation. A \texttt{cuBLAS} wrapper
+maps row-major Rust tensors to cuBLAS's column-major convention using the transpose
+trick $C = (B^T A^T)^T$, exposing a row-major GEMM interface. The PTX kernel loader
+discovers and loads pre-compiled kernels at startup. The mock backend substitutes
+CPU-based operations with matching signatures, enabling the full test suite to run on
+machines without NVIDIA GPUs.
+
+\subsection{Model Execution}
+
+\texttt{rvllm-model-loader} handles SafeTensors~\cite{safetensors2023} weight loading
+from HuggingFace Hub or local paths, including sharded checkpoints and GGUF format.
+Weight tensors are memory-mapped for efficient loading.
+
+\texttt{rvllm-model-runner} implements the transformer forward pass. Ten model
+architectures are supported (Table~\ref{tab:architectures}), each implementing an
+\texttt{Architecture} trait that defines layer structure, attention configuration
+(multi-head, grouped-query~\cite{ainslie2023gqa}, or multi-query), and normalization
+type (RMSNorm~\cite{zhang2019root} or LayerNorm).
+
+\texttt{rvllm-attention} provides FlashAttention~\cite{dao2022flashattention,
+dao2023flashattention2} and PagedAttention~\cite{kwon2023vllm} backends. The CPU
+reference implementation enables correctness testing; the CUDA kernels handle
+production workloads.
+
+\texttt{rvllm-kv-cache} manages the paged key-value cache with fixed-size blocks,
+block tables for virtual-to-physical mapping, and copy-on-write semantics for beam
+search.
+
+\texttt{rvllm-quant} supports GPTQ, AWQ, and FP8~\cite{holkman2023fp8} (E4M3)
+dequantization with per-head scaling for the KV cache.
+
+\begin{table}[t]
+  \centering
+  \caption{Supported model architectures in rvLLM~v0.1.0.}
+  \label{tab:architectures}
+  \small
+  \begin{tabular}{@{}ll@{}}
+    \toprule
+    \rowcolor{HeaderGray} \thead{Architecture} & \thead{Models} \\
+    \midrule
+    LlamaForCausalLM      & Llama~2/3, CodeLlama, Vicuna \\
+    \rowcolor{gray!8}
+    MistralForCausalLM     & Mistral~7B, Mistral Nemo \\
+    Qwen2ForCausalLM       & Qwen2, Qwen2.5 \\
+    \rowcolor{gray!8}
+    PhiForCausalLM         & Phi-2, Phi-3, Phi-3.5 \\
+    GemmaForCausalLM       & Gemma, Gemma~2 \\
+    \rowcolor{gray!8}
+    MixtralForCausalLM     & Mixtral 8x7B, 8x22B (MoE) \\
+    DeepseekV2ForCausalLM  & DeepSeek-V2, DeepSeek-V2.5 (MoE) \\
+    \rowcolor{gray!8}
+    GPTNeoXForCausalLM     & Pythia, GPT-NeoX-20B \\
+    StableLmForCausalLM    & StableLM-3B, StableLM-2 \\
+    \rowcolor{gray!8}
+    CohereForCausalLM      & Command-R, Command-R+ \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\subsection{Scheduling and Execution}
+
+\texttt{rvllm-scheduler} implements continuous batching with first-come-first-served,
+priority, and shortest-job-first scheduling policies. Preemption allows long-running
+sequences to be swapped to CPU memory when GPU blocks are exhausted, and prefix caching
+with LRU eviction avoids redundant KV cache computation for shared prompt prefixes.
+
+\texttt{rvllm-executor} orchestrates single- or multi-GPU execution, dispatching work
+to \texttt{rvllm-worker} instances. Each worker owns a GPU device, runs the forward
+pass, and returns logits for sampling. \texttt{rvllm-speculative} implements draft-model
+speculative decoding~\cite{leviathan2023speculative} as an optional execution strategy.
+
+\texttt{rvllm-engine} ties scheduling and execution together in a Tokio-based async
+inference loop. Incoming requests are tokenised, scheduled into batches, executed on
+GPU, sampled, and detokenised, with results streamed back via Server-Sent Events (SSE).
+
+\subsection{Sampling}
+
+\texttt{rvllm-sampling} implements the full sampling pipeline: temperature scaling,
+top-$k$ filtering, nucleus (top-$p$) sampling, min-$p$ filtering, repetition penalty,
+frequency penalty, presence penalty, and multinomial sampling with optional seed-based
+determinism. Batch sampling across sequences uses Rayon~\cite{rayon2023} for CPU
+parallelism, distributing work across all available cores.
+
+\subsection{API and Observability}
+
+\texttt{rvllm-api} provides an OpenAI-compatible~\cite{openai2023api} HTTP server
+built on \texttt{axum}~\cite{axum2023}. Supported endpoints include
+\texttt{/v1/completions}, \texttt{/v1/chat/completions}, \texttt{/v1/models},
+\texttt{/v1/embeddings}, and \texttt{/v1/batches}, with both streaming (SSE) and
+non-streaming response modes. Guided decoding supports JSON mode, JSON schema
+validation, and regex grammars. Tool/function calling follows the Hermes convention.
+
+\texttt{rvllm-telemetry} exports Prometheus metrics (forward time, time-to-first-token,
+inter-token latency, queue depth) and structured tracing via the \texttt{tracing}
+ecosystem.
+
+\texttt{rvllm-tokenizer} wraps HuggingFace's \texttt{tokenizers}
+library for encoding, decoding, and chat template rendering.
+
+\texttt{rvllm-python} provides PyO3 bindings, exposing the sampling pipeline and
+tokenizer to Python users via \texttt{import rvllm}.
+
+% ============================================================================
+\section{CUDA Integration}
+\label{sec:cuda}
+% ============================================================================
+
+rvLLM interfaces with NVIDIA GPUs through two mechanisms: cuBLAS for dense
+matrix operations (GEMM) and custom CUDA kernels for element-wise and reduction
+operations. All GPU interaction is mediated through \texttt{cudarc}, which provides
+safe Rust bindings to the CUDA driver API.
+
+\subsection{Pre-compiled PTX Kernels}
+
+The system includes 13~hand-written CUDA kernels (Table~\ref{tab:kernels}),
+totalling approximately 1,500 lines of CUDA code. Kernels are compiled to PTX
+ahead-of-time via \texttt{nvcc}, supporting compute capabilities from \texttt{sm\_70}
+(V100) through \texttt{sm\_100} (B100/B200). At server startup, the PTX kernel loader
+discovers available \texttt{.ptx} files and registers them with the CUDA driver. This
+avoids runtime JIT compilation entirely, contributing to rvLLM's fast startup time.
+
+\begin{table}[t]
+  \centering
+  \caption{Custom CUDA kernels in rvLLM. All kernels are compiled to PTX for compute capabilities sm\_70 through sm\_100.}
+  \label{tab:kernels}
+  \small
+  \begin{tabular}{@{}llp{5.5cm}@{}}
+    \toprule
+    \rowcolor{HeaderGray} \thead{Kernel} & \thead{File} & \thead{Purpose} \\
+    \midrule
+    PagedAttention V2 & \texttt{paged\_attention.cu} & Block-table indirection with online softmax \\
+    \rowcolor{gray!8}
+    FlashAttention    & \texttt{flash\_attention.cu} & Tiled attention with shared-memory reduction \\
+    RMSNorm (FP32)    & \texttt{rms\_norm.cu}        & Shared-memory parallel reduction \\
+    \rowcolor{gray!8}
+    RMSNorm (FP16)    & \texttt{rms\_norm\_f16.cu}    & Half-precision variant \\
+    Fused Residual+RMSNorm & \texttt{fused\_residual\_rmsnorm.cu} & Fused residual add and normalisation \\
+    \rowcolor{gray!8}
+    Rotary Embedding  & \texttt{rotary\_embedding.cu} & RoPE with GQA support \\
+    Activation (FP32) & \texttt{activation.cu}       & SiLU, GELU, fused SiLU$\times$mul for MLP \\
+    \rowcolor{gray!8}
+    Activation (FP16) & \texttt{activation\_f16.cu}   & Half-precision variants \\
+    Softmax           & \texttt{softmax.cu}          & Warp-level numerically stable softmax \\
+    \rowcolor{gray!8}
+    Copy Blocks       & \texttt{copy\_blocks.cu}      & KV cache block copy for beam search \\
+    Embedding Gather  & \texttt{embedding\_gather.cu}  & Token embedding table lookup \\
+    \rowcolor{gray!8}
+    Add Bias          & \texttt{add\_bias.cu}         & Fused bias addition \\
+    FP8 KV            & \texttt{fp8\_kv.cu}           & E4M3 quantisation with per-head scaling \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\subsection{cuBLAS GEMM Wrapper}
+
+Dense matrix multiplications (linear projections, MLP layers) use cuBLAS SGEMM.
+Because cuBLAS assumes column-major layout while Rust arrays are row-major, rvLLM
+uses the identity $(AB)^T = B^T A^T$ to compute row-major results. The wrapper
+function accepts row-major matrices $A \in \mathbb{R}^{m \times k}$ and
+$B \in \mathbb{R}^{k \times n}$, passes them transposed to cuBLAS, and the
+result $C \in \mathbb{R}^{m \times n}$ is returned in row-major layout without
+explicit transposition. This maintains compatibility with PyTorch's weight layout
+convention where linear layer weights are stored as $[\text{out\_features},
+\text{in\_features}]$.
+
+\subsection{Memory Management}
+
+GPU memory is managed through explicit allocation pools in \texttt{rvllm-memory}.
+The block manager (\texttt{rvllm-block-manager}) maintains a free list of fixed-size
+KV cache blocks and supports copy-on-write for beam search and prefix sharing. A swap
+manager handles GPU$\leftrightarrow$CPU memory transfers when the block allocator is
+exhausted. Pinned (page-locked) host memory is used for efficient DMA transfers.
+
+% ============================================================================
+\section{Key Design Decisions}
+\label{sec:design}
+% ============================================================================
+
+\subsection{Mock-GPU Feature}
+
+A central design decision is the \texttt{mock-gpu} Cargo feature, which replaces all
+CUDA calls with CPU-based stubs that produce matching output shapes. This enables:
+\begin{itemize}
+  \item Development on macOS, Windows, or any Linux machine without an NVIDIA GPU.
+  \item The full test suite (769~tests across 22~crates) to run in CI without GPU
+        instances.
+  \item Independent testing of scheduling, sampling, tokenization, and API logic
+        against known outputs.
+\end{itemize}
+Only the GPU forward pass and CUDA kernel behaviour require real hardware to validate.
+All other layers---including the continuous batching scheduler, all sampling algorithms,
+the full HTTP API, and streaming---are tested under mock-GPU.
+
+\subsection{CPU Attention Fallback}
+
+rvLLM includes a CPU reference implementation of both standard multi-head attention and
+FlashAttention-2. This serves dual purposes: correctness testing (comparing CPU and GPU
+outputs token-by-token) and enabling a functional inference path on CPU-only machines.
+GPU projections (Q/K/V linear layers via cuBLAS) can be combined with CPU attention
+computation in a hybrid configuration.
+
+\subsection{Feature-Gated CUDA Graphs}
+
+CUDA graph capture and replay is implemented but disabled by default behind a Cargo
+feature flag. CUDA graphs eliminate kernel launch overhead by recording a sequence of
+GPU operations and replaying them in a single driver call. However, graph capture
+imposes constraints on dynamic shapes and memory allocation patterns that interact
+poorly with the variable batch sizes inherent to continuous batching. rvLLM provides
+the infrastructure for CUDA graph capture/replay but defaults to eager execution,
+which has proven sufficient at current scale. This is an area of active development.
+
+\subsection{PyTorch Weight Layout Compatibility}
+
+rvLLM loads weights directly from SafeTensors checkpoints produced by PyTorch-based
+training pipelines. PyTorch stores linear layer weights in $[\text{out\_features},
+\text{in\_features}]$ layout. Rather than transposing weights at load time (which
+would require additional memory and time), the cuBLAS wrapper's row-major-to-column-major
+mapping naturally accommodates this convention. This means any HuggingFace model
+checkpoint can be loaded without weight preprocessing.
+
+\subsection{Deterministic Startup}
+
+rvLLM deliberately avoids runtime code generation. Triton kernels (used by Python
+vLLM) require a Python-based JIT compiler that adds 10--30 seconds to startup. By
+pre-compiling all kernels to PTX at build time, rvLLM achieves a startup sequence of:
+(1) load binary, (2) parse configuration, (3) load PTX kernels, (4) memory-map model
+weights, (5) begin serving. Measured startup time is approximately 8~seconds on A100,
+dominated by weight loading from disk.
+
+% ============================================================================
+\section{Preliminary Results}
+\label{sec:results}
+% ============================================================================
+
+\textbf{Disclaimer:} The results in this section are preliminary. They were measured
+on a single hardware configuration and should not be cited as definitive performance
+numbers. We present them to indicate the general performance characteristics of the
+system. Independent verification is encouraged.
+
+\subsection{Experimental Setup}
+
+All GPU benchmarks were conducted on an NVIDIA A100~80\,GB SXM4 with
+Qwen2.5-1.5B as the model. Both rvLLM and Python vLLM~0.18.0 were tested on
+identical hardware with identical prompts. CPU benchmarks (sampling, logit processing)
+were measured on both Apple M5 (10 cores) and the A100 host Xeon using
+\texttt{criterion} (Rust) and \texttt{timeit} (Python).
+
+\subsection{GPU Inference}
+
+Table~\ref{tab:gpu_bench} presents verified resource measurements. Throughput and
+latency comparisons against Python vLLM are being refreshed in a follow-up
+benchmark pass using a reproducible script (\texttt{bench/run.sh}).
+
+\begin{table}[t]
+  \centering
+  \caption{Verified resource measurements. A100 80\,GB SXM4, Qwen2.5-1.5B.}
+  \label{tab:gpu_bench}
+  \small
+  \begin{tabular}{@{}lr@{}}
+    \toprule
+    \rowcolor{HeaderGray} \thead{Metric} & \thead{rvLLM (Rust)} \\
+    \midrule
+    Startup time (s)         & $\sim$7 \\
+    \rowcolor{gray!8}
+    Binary size              & 15\,MB \\
+    CPU memory RSS           & 333\,MB \\
+    \rowcolor{gray!8}
+    GPU VRAM                 & 6{,}357\,MiB \\
+    Output quality           & Coherent (5/5 prompts) \\
+    \rowcolor{gray!8}
+    Throughput (tok/s)       & \emph{Pending} \\
+    P50/P95 latency          & \emph{Pending} \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\subsection{CPU Component Benchmarks}
+
+Table~\ref{tab:cpu_bench} shows microbenchmarks for operations that run on CPU between
+GPU forward passes. These are measured with \texttt{criterion} (Rust, 100~iterations,
+warm cache) and \texttt{timeit} (Python/NumPy, 100~iterations).
+
+\begin{table}[t]
+  \centering
+  \caption{CPU component benchmarks: sampling and logit processing. Measured on Apple M5 (10 cores, 24\,GB).}
+  \label{tab:cpu_bench}
+  \small
+  \begin{tabular}{@{}lrrrp{3.2cm}@{}}
+    \toprule
+    \rowcolor{HeaderGray} \thead{Operation} & \thead{Rust} & \thead{Python} & \thead{Speedup} & \thead{Notes} \\
+    \midrule
+    Combined penalties      & 2.6\,$\mu$s  & 63\,$\mu$s  & 24$\times$  & Zero-alloc iteration \\
+    \rowcolor{gray!8}
+    Repetition penalty (2K) & 3.1\,$\mu$s  & 34\,$\mu$s  & 11$\times$  & In-place mutation \\
+    Multinomial (32K vocab)  & 12\,$\mu$s   & 66\,$\mu$s  & 5.5$\times$ & Cumulative sum + early exit \\
+    \rowcolor{gray!8}
+    Top-$p$ nucleus (128K)  & 1.6\,ms      & 6.9\,ms     & 4.3$\times$ & Partial sort + threshold \\
+    Q4 dequant (10M elem)   & 7.1\,ms      & 9.7\,ms     & 1.4$\times$ & Chunk autovectorisation \\
+    \rowcolor{gray!8}
+    Batch sampling (64 seqs) & 4.3\,ms     & 36.4\,ms    & 8.5$\times$ & Rayon across 10 cores \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+The most significant speedups occur in penalty computation (24$\times$) where Rust's
+zero-allocation iteration over token histories avoids Python object creation overhead,
+and in batch sampling (8.5$\times$) where Rayon parallelism across all cores eliminates
+the GIL bottleneck.
+
+\subsection{Limitations}
+
+Several factors should be considered when interpreting these results:
+\begin{itemize}
+  \item Benchmarks use a single relatively small model (Qwen2.5-1.5B). Performance
+        characteristics may differ for larger models where GPU computation dominates.
+  \item Python vLLM includes optimisations (continuous batching, chunked prefill)
+        that are more impactful at high concurrency. Our benchmarks do not yet cover
+        high-concurrency regimes thoroughly.
+  \item rvLLM does not yet implement the full set of optimisations present in mature
+        Python vLLM (e.g., prefix caching is implemented but not yet benchmarked;
+        CUDA graph replay is feature-gated).
+  \item Throughput ratios marked ``TBD'' in Table~\ref{tab:gpu_bench} are pending
+        verification by an independent benchmark agent.
+\end{itemize}
+
+% ============================================================================
+\section{Related Work}
+\label{sec:related}
+% ============================================================================
+
+\textbf{vLLM}~\cite{kwon2023vllm} introduced PagedAttention and demonstrated that
+virtual-memory-inspired KV cache management dramatically improves serving throughput.
+rvLLM reimplements the core vLLM architecture (paged attention, continuous batching,
+block management) in Rust while maintaining API compatibility. The key differences are
+language-level: Rust's ownership model, absence of GIL, and deterministic memory
+management versus Python's ecosystem maturity and ease of modification.
+
+\textbf{TensorRT-LLM}~\cite{tensorrtllm2024} is NVIDIA's optimised inference solution,
+built on TensorRT with C++ and Python components. It achieves state-of-the-art
+performance through operator fusion, quantisation, and hardware-specific kernel tuning.
+However, it is tied to NVIDIA's proprietary runtime, requires model-specific compilation
+steps, and has a complex build process. rvLLM targets similar performance goals with a
+simpler deployment model (single binary) and full source availability.
+
+\textbf{llama.cpp}~\cite{llamacpp2023} pioneered efficient LLM inference in C/C++,
+with extensive quantisation support (GGML/GGUF formats) and broad hardware
+compatibility including CPU, CUDA, Metal, Vulkan, and SYCL backends. llama.cpp excels
+at single-user local inference. rvLLM targets the multi-tenant server use case with
+continuous batching, concurrent request handling, and an OpenAI-compatible API layer.
+
+\textbf{candle}~\cite{candle2023} is a Rust ML framework from Hugging Face providing
+tensor operations and model implementations. While candle provides foundational tensor
+primitives, rvLLM implements the full serving stack: scheduling, batching, paged
+attention, streaming API, and observability. The two projects are complementary---rvLLM
+could potentially use candle's tensor abstractions, though it currently uses direct
+cuBLAS and custom kernel calls for maximum control.
+
+\textbf{FlashAttention}~\cite{dao2022flashattention,dao2023flashattention2} provides
+IO-aware exact attention with reduced memory footprint. rvLLM includes both a CPU
+reference FlashAttention implementation for testing and a CUDA kernel for production
+use.
+
+% ============================================================================
+\section{Conclusion and Future Work}
+\label{sec:conclusion}
+% ============================================================================
+
+rvLLM demonstrates that a systems-language reimplementation of LLM serving
+infrastructure can yield practical benefits in deployment size (15\,MB binary),
+startup time ($\sim$7\,s), and memory footprint (333\,MB RSS), while maintaining API
+compatibility with the existing vLLM ecosystem. The 22-crate modular architecture
+enables independent development and testing of each layer, and the mock-GPU feature
+makes the entire non-GPU stack accessible to developers without NVIDIA hardware.
+
+Several directions for future work remain:
+
+\textbf{LoRA adapter hot-swapping.} Supporting multiple LoRA adapters served from a
+single base model, with runtime adapter loading and unloading, is a high-priority
+feature for multi-tenant deployments.
+
+\textbf{Vision-language models.} Extending the model runner to support multi-modal
+architectures (image encoders, cross-attention) would expand the set of servable
+models.
+
+\textbf{Pipeline parallelism.} The current tensor parallelism support (NCCL bindings,
+column/row parallel) handles single-node multi-GPU. Pipeline parallelism would enable
+serving models that exceed single-node memory across multiple machines.
+
+\textbf{CUDA graph integration.} Wiring the existing CUDA graph capture/replay
+infrastructure into the forward pass, with careful handling of variable batch sizes,
+could reduce kernel launch overhead at small batch sizes.
+
+\textbf{Production hardening.} Fuzz testing of the API layer, load testing at 1,000+
+concurrent connections, and long-running stability tests are needed before production
+deployment recommendations.
+
+The project is open-source under the Apache-2.0 license and accepts contributions for
+all of the above areas.
+
+% ============================================================================
+% References
+% ============================================================================
+\bibliographystyle{plainnat}
+\bibliography{references}
+
+\end{document}

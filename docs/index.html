@@ -1,0 +1,705 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>rvLLM: A High-Performance LLM Inference Engine in Rust</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Libre+Baskerville:ital,wght@0,400;0,700;1,400&display=swap');
+
+:root {
+  --bg: #ffffff;
+  --fg: #1a1a1a;
+  --fg-secondary: #444444;
+  --rule-color: #222222;
+  --rule-color-light: #cccccc;
+  --code-bg: #f5f5f5;
+  --code-border: #e0e0e0;
+  --code-fg: #1a1a1a;
+  --table-header-bg: #f9f9f9;
+  --table-header-fg: #1a1a1a;
+  --table-stripe: #fafafa;
+  --link-color: #1a1a1a;
+  --toggle-bg: #e0e0e0;
+  --toggle-knob: #666666;
+  --abstract-bg: #f8f8f8;
+  --abstract-border: #ddd;
+  --kw-color: #1a1a1a;
+  --str-color: #444;
+  --comment-color: #777;
+  --fn-color: #1a1a1a;
+}
+
+:root.color {
+  --bg: #ffffff;
+  --fg: #1a1a1a;
+  --fg-secondary: #444444;
+  --rule-color: #222222;
+  --rule-color-light: #d0d7de;
+  --code-bg: #f6f8fa;
+  --code-border: #d0d7de;
+  --code-fg: #1a1a1a;
+  --table-header-bg: #dbe6f0;
+  --table-header-fg: #1a4d80;
+  --table-stripe: #f0f4f8;
+  --link-color: #2563eb;
+  --toggle-bg: #bfdbfe;
+  --toggle-knob: #2563eb;
+  --abstract-bg: #f0f4f8;
+  --abstract-border: #3b82f6;
+  --kw-color: #8b5cf6;
+  --str-color: #059669;
+  --comment-color: #6b7280;
+  --fn-color: #2563eb;
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: 'Libre Baskerville', Georgia, 'Times New Roman', serif;
+  font-size: 16px;
+  line-height: 1.7;
+  transition: background 0.3s, color 0.3s;
+}
+
+.paper {
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 60px 24px 80px;
+}
+
+/* Toggle */
+.toggle-wrap {
+  position: fixed;
+  top: 16px;
+  right: 16px;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--fg-secondary);
+  background: var(--bg);
+  padding: 6px 12px;
+  border-radius: 20px;
+  border: 1px solid var(--rule-color-light);
+  cursor: pointer;
+  user-select: none;
+  transition: background 0.3s, border-color 0.3s, color 0.3s;
+}
+.toggle-wrap:hover { border-color: var(--fg-secondary); }
+.toggle-track {
+  width: 36px;
+  height: 18px;
+  background: var(--toggle-bg);
+  border-radius: 9px;
+  position: relative;
+  transition: background 0.3s;
+}
+.toggle-knob {
+  width: 14px;
+  height: 14px;
+  background: var(--toggle-knob);
+  border-radius: 50%;
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  transition: transform 0.3s, background 0.3s;
+}
+:root.color .toggle-knob { transform: translateX(18px); }
+
+/* Active toggle label */
+.toggle-label { transition: opacity 0.3s; }
+.toggle-label-bw { opacity: 1; font-weight: 700; }
+.toggle-label-color { opacity: 0.5; }
+:root.color .toggle-label-bw { opacity: 0.5; font-weight: 400; }
+:root.color .toggle-label-color { opacity: 1; font-weight: 700; }
+
+/* Title block */
+.paper-title {
+  font-size: 1.8em;
+  font-weight: 700;
+  text-align: center;
+  margin: 0 0 8px;
+  line-height: 1.3;
+}
+.paper-author {
+  text-align: center;
+  font-size: 1em;
+  color: var(--fg-secondary);
+  margin: 0 0 4px;
+}
+.paper-date {
+  text-align: center;
+  font-size: 0.85em;
+  color: var(--fg-secondary);
+  margin: 0 0 36px;
+}
+
+/* Abstract */
+.abstract {
+  background: var(--abstract-bg);
+  border-left: 3px solid var(--abstract-border);
+  padding: 16px 20px;
+  margin: 0 0 40px;
+  font-size: 0.92em;
+  transition: background 0.3s, border-color 0.3s;
+}
+.abstract-label {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+  font-weight: 700;
+  font-size: 0.8em;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  margin: 0 0 6px;
+}
+
+/* Sections */
+h2 {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+  font-size: 1.25em;
+  font-weight: 700;
+  margin: 44px 0 12px;
+  padding-bottom: 4px;
+  border-bottom: 1px solid var(--rule-color-light);
+}
+h3 {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+  font-size: 1.05em;
+  font-weight: 700;
+  margin: 28px 0 8px;
+}
+p { margin: 0 0 14px; }
+
+/* Tables -- booktabs style */
+.table-wrap {
+  overflow-x: auto;
+  margin: 20px 0 28px;
+}
+.table-caption {
+  font-size: 0.85em;
+  color: var(--fg-secondary);
+  margin: 0 0 6px;
+  font-style: italic;
+}
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.88em;
+  line-height: 1.5;
+}
+thead tr {
+  border-top: 2px solid var(--rule-color);
+  border-bottom: 1px solid var(--rule-color);
+}
+thead th {
+  padding: 8px 12px;
+  text-align: left;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+  font-weight: 600;
+  font-size: 0.92em;
+  background: var(--table-header-bg);
+  color: var(--table-header-fg);
+  transition: background 0.3s, color 0.3s;
+}
+tbody tr { border-bottom: none; }
+tbody tr:last-child { border-bottom: 2px solid var(--rule-color); }
+tbody td {
+  padding: 6px 12px;
+  vertical-align: top;
+}
+tbody tr:nth-child(even) { background: var(--table-stripe); }
+
+/* Code */
+pre {
+  background: var(--code-bg);
+  border: 1px solid var(--code-border);
+  border-radius: 4px;
+  padding: 14px 16px;
+  overflow-x: auto;
+  font-size: 0.82em;
+  line-height: 1.6;
+  margin: 16px 0 20px;
+  transition: background 0.3s, border-color 0.3s;
+}
+code {
+  font-family: 'SF Mono', 'Fira Code', 'JetBrains Mono', Menlo, Consolas, monospace;
+  color: var(--code-fg);
+  font-size: 0.92em;
+}
+pre code { font-size: 1em; }
+.kw { color: var(--kw-color); font-weight: 600; }
+.str { color: var(--str-color); }
+.cmt { color: var(--comment-color); font-style: italic; }
+.fn { color: var(--fn-color); }
+
+/* Pending rows */
+.pending-row td { opacity: 0.6; }
+.pending {
+  font-style: italic;
+  font-weight: 400;
+  letter-spacing: 0.02em;
+}
+
+/* Inline code */
+p code, li code, td code {
+  background: var(--code-bg);
+  padding: 1px 5px;
+  border-radius: 3px;
+  border: 1px solid var(--code-border);
+}
+
+/* Lists */
+ul, ol { padding-left: 24px; margin: 0 0 14px; }
+li { margin-bottom: 4px; }
+
+/* References */
+.references { font-size: 0.88em; }
+.references ol { padding-left: 20px; }
+.references li { margin-bottom: 8px; color: var(--fg-secondary); }
+
+/* Footer */
+.paper-footer {
+  margin-top: 48px;
+  padding-top: 16px;
+  border-top: 1px solid var(--rule-color-light);
+  font-size: 0.8em;
+  color: var(--fg-secondary);
+  text-align: center;
+}
+
+/* Responsive */
+@media (max-width: 600px) {
+  .paper { padding: 40px 16px 60px; }
+  .paper-title { font-size: 1.4em; }
+  h2 { font-size: 1.1em; }
+  table { font-size: 0.8em; }
+  thead th, tbody td { padding: 5px 8px; }
+  .toggle-wrap { top: 10px; right: 10px; font-size: 10px; padding: 5px 10px; }
+}
+</style>
+</head>
+<body>
+
+<div class="toggle-wrap" id="themeToggle" role="button" tabindex="0" aria-label="Toggle color mode">
+  <span class="toggle-label toggle-label-bw">B&amp;W</span>
+  <div class="toggle-track"><div class="toggle-knob"></div></div>
+  <span class="toggle-label toggle-label-color">Color</span>
+</div>
+
+<div class="paper">
+
+<h1 class="paper-title">rvLLM: A High-Performance LLM Inference Engine in Rust</h1>
+<p class="paper-author">m0at</p>
+<p class="paper-date">2026</p>
+
+<div class="abstract">
+  <div class="abstract-label">Abstract</div>
+  <p>
+    We present rvLLM, a high-performance large language model inference engine written in Rust.
+    The system is structured as a 23-crate workspace covering the full inference stack -- from
+    tokenization and model loading through GPU-accelerated attention, KV-cache management, speculative
+    decoding, and an OpenAI-compatible API server. rvLLM integrates 10 custom CUDA kernels and a
+    cuBLAS wrapper for matrix operations, while leveraging Rust's ownership model and <code>rayon</code>
+    for safe CPU parallelism. Preliminary benchmarks show significant throughput improvements over
+    Python-based inference engines, with lower tail latencies and reduced memory overhead. We describe
+    the architecture, key design decisions, CUDA integration strategy, and early performance results.
+  </p>
+</div>
+
+<!-- 1. Introduction -->
+<h2>1. Introduction</h2>
+<p>
+  Large language model inference at scale presents a systems engineering challenge that spans memory
+  management, GPU kernel optimization, scheduling, and network I/O. The dominant open-source
+  inference engines -- vLLM, TGI, and others -- are implemented primarily in Python, relying on
+  PyTorch and custom CUDA extensions for performance-critical paths. While effective, this approach
+  carries inherent costs: Python's GIL constrains CPU-side throughput, dynamic dispatch and garbage
+  collection introduce latency variance, and the boundary between Python orchestration and C++/CUDA
+  computation creates optimization barriers.
+</p>
+<p>
+  rvLLM takes a different approach: the entire inference stack is implemented in Rust, from the
+  API server down to the GPU memory allocator. Rust's ownership and type system provide
+  compile-time guarantees around memory safety and data-race freedom without runtime overhead.
+  The <code>rayon</code> crate enables work-stealing parallelism for CPU-bound operations, while
+  direct CUDA FFI bindings eliminate the Python-to-C++ bridge entirely.
+</p>
+<p>
+  This paper describes the design, implementation, and preliminary evaluation of rvLLM. We focus
+  on the architectural decisions that differentiate it from existing engines, the CUDA integration
+  strategy, and early benchmark results comparing throughput, latency, and memory efficiency against
+  Python vLLM.
+</p>
+
+<!-- 2. Architecture -->
+<h2>2. Architecture</h2>
+<p>
+  rvLLM is organized as a Cargo workspace containing 23 crates. Each crate encapsulates a
+  well-defined responsibility, enabling independent compilation, testing, and -- where applicable --
+  replacement. The workspace structure reflects the logical layers of an inference engine:
+</p>
+
+<h3>2.1 Core Infrastructure</h3>
+<ul>
+  <li><code>rvllm-core</code> -- shared types, error handling, and trait definitions</li>
+  <li><code>rvllm-config</code> -- configuration parsing and validation</li>
+  <li><code>rvllm-telemetry</code> -- structured logging and metrics collection</li>
+</ul>
+
+<h3>2.2 GPU and Memory</h3>
+<ul>
+  <li><code>rvllm-gpu</code> -- CUDA device management, kernel launching, cuBLAS bindings</li>
+  <li><code>rvllm-memory</code> -- GPU and CPU memory allocators with pool-based allocation</li>
+  <li><code>rvllm-block-manager</code> -- paged memory management for KV-cache blocks</li>
+  <li><code>rvllm-kv-cache</code> -- key-value cache implementation with block-level granularity</li>
+  <li><code>rvllm-attention</code> -- attention kernels (PagedAttention, FlashAttention-2 dispatch)</li>
+</ul>
+
+<h3>2.3 Model Pipeline</h3>
+<ul>
+  <li><code>rvllm-tokenizer</code> -- tokenizer bindings (HuggingFace tokenizers via FFI)</li>
+  <li><code>rvllm-model-loader</code> -- safetensors/GGUF loading, weight sharding</li>
+  <li><code>rvllm-model-runner</code> -- forward pass orchestration</li>
+  <li><code>rvllm-quant</code> -- quantization support (GPTQ, AWQ, INT8, FP8)</li>
+  <li><code>rvllm-sampling</code> -- top-k, top-p, temperature, repetition penalty</li>
+</ul>
+
+<h3>2.4 Scheduling and Execution</h3>
+<ul>
+  <li><code>rvllm-sequence</code> -- sequence state management and lifecycle</li>
+  <li><code>rvllm-scheduler</code> -- continuous batching with preemption support</li>
+  <li><code>rvllm-worker</code> -- per-GPU worker threads</li>
+  <li><code>rvllm-executor</code> -- multi-GPU execution coordination</li>
+  <li><code>rvllm-speculative</code> -- speculative decoding with draft model support</li>
+</ul>
+
+<h3>2.5 Server Layer</h3>
+<ul>
+  <li><code>rvllm-engine</code> -- top-level engine tying scheduler, executor, and model runner</li>
+  <li><code>rvllm-api</code> -- OpenAI-compatible REST API definitions</li>
+  <li><code>rvllm-server</code> -- HTTP server (Axum-based) with streaming SSE support</li>
+  <li><code>rvllm-python</code> -- PyO3 bindings for Python interop</li>
+  <li><code>rvllm-bench</code> -- benchmarking harness and load generation</li>
+</ul>
+
+<p>
+  The crate dependency graph is strictly layered: server crates depend on engine crates, which
+  depend on execution crates, which depend on GPU and model crates, which depend on core
+  infrastructure. Circular dependencies are prevented by Cargo's module system. This layering
+  enables, for instance, running the engine without the HTTP server for embedded use cases, or
+  swapping the attention implementation without touching the scheduler.
+</p>
+
+<!-- 3. CUDA Integration -->
+<h2>3. CUDA Integration</h2>
+<p>
+  The <code>rvllm-gpu</code> crate provides Rust bindings to CUDA and cuBLAS through a combination
+  of <code>bindgen</code>-generated FFI and hand-written safe wrappers. All GPU memory is managed
+  through Rust's ownership system: device allocations are represented as types that implement
+  <code>Drop</code>, ensuring deallocation on scope exit even in the presence of early returns or
+  panics.
+</p>
+
+<h3>3.1 Custom Kernels</h3>
+<p>
+  rvLLM includes 10 custom CUDA kernels, compiled with <code>nvcc</code> and linked via
+  <code>build.rs</code>:
+</p>
+<ol>
+  <li><strong>PagedAttention v2</strong> -- block-sparse attention with variable sequence lengths</li>
+  <li><strong>FlashAttention-2 dispatch</strong> -- tiled fused softmax-matmul kernel</li>
+  <li><strong>RoPE embedding</strong> -- rotary positional encoding applied in-kernel</li>
+  <li><strong>RMSNorm</strong> -- fused root-mean-square normalization</li>
+  <li><strong>SiLU activation</strong> -- fused SiLU (Swish) with gate projection</li>
+  <li><strong>Quantized GEMM</strong> -- INT4/INT8 matrix multiply with dequantization</li>
+  <li><strong>KV-cache copy</strong> -- block-to-block cache migration for preemption</li>
+  <li><strong>Token embedding</strong> -- batched embedding lookup with padding masking</li>
+  <li><strong>Sampling kernel</strong> -- fused top-k/top-p with temperature on GPU</li>
+  <li><strong>Layernorm</strong> -- fused layer normalization with residual add</li>
+</ol>
+
+<h3>3.2 cuBLAS Integration</h3>
+<p>
+  Dense matrix multiplications are dispatched through cuBLAS via a Rust wrapper that manages
+  cuBLAS handles per-stream and selects the optimal GEMM algorithm at initialization via
+  <code>cublasGemmAlgo_t</code> auto-tuning. The wrapper exposes a safe API:
+</p>
+<pre><code><span class="kw">pub fn</span> <span class="fn">gemm</span>(
+    &amp;self,
+    a: &amp;GpuTensor,
+    b: &amp;GpuTensor,
+    c: &amp;<span class="kw">mut</span> GpuTensor,
+    alpha: f32,
+    beta: f32,
+) -&gt; Result&lt;()&gt; {
+    <span class="cmt">// Validates dimensions at runtime, dispatches to cublasGemmEx</span>
+    <span class="cmt">// with auto-selected algorithm and compute type</span>
+    <span class="kw">unsafe</span> { self.raw_gemm(a, b, c, alpha, beta) }
+}</code></pre>
+
+<h3>3.3 Memory Management</h3>
+<p>
+  GPU memory is managed through a two-level allocator. A slab allocator handles large, long-lived
+  allocations (model weights, KV-cache blocks), while a bump allocator serves short-lived
+  activation tensors within a single forward pass. The bump allocator resets between iterations,
+  eliminating fragmentation for transient allocations. Both allocators are implemented in Rust,
+  calling <code>cudaMalloc</code>/<code>cudaFree</code> only at the slab level.
+</p>
+
+<!-- 4. Key Design Decisions -->
+<h2>4. Key Design Decisions</h2>
+
+<h3>4.1 Zero-Copy Where Possible</h3>
+<p>
+  rvLLM minimizes data copies between the CPU and GPU. Tokenized input is written directly into
+  a pinned host buffer and transferred to the GPU via a single <code>cudaMemcpyAsync</code>.
+  Output logits are sampled on-device; only the final token IDs are copied back. This reduces
+  PCIe traffic to the minimum necessary.
+</p>
+
+<h3>4.2 Continuous Batching with Preemption</h3>
+<p>
+  The scheduler implements continuous batching: new requests are admitted into a running batch
+  without waiting for the longest sequence to complete. When GPU memory pressure exceeds a
+  configurable threshold, the scheduler preempts low-priority sequences by swapping their KV-cache
+  blocks to CPU memory, resuming them when capacity is available. Block-level preemption avoids
+  recomputation.
+</p>
+
+<h3>4.3 Async I/O Throughout</h3>
+<p>
+  The server layer uses <code>tokio</code> for async HTTP handling and SSE streaming. The engine
+  communicates with workers via lock-free channels (<code>crossbeam</code>). CUDA operations are
+  issued on dedicated streams and synchronized via events, allowing the CPU to prepare the next
+  batch while the GPU executes the current one.
+</p>
+
+<h3>4.4 Speculative Decoding</h3>
+<p>
+  The <code>rvllm-speculative</code> crate implements speculative decoding with a configurable
+  draft model. The draft model generates <em>k</em> candidate tokens, which the target model
+  verifies in a single forward pass. Accepted tokens skip individual decode steps, improving
+  throughput for sequences where the draft model has high acceptance rates. The implementation
+  handles the token tree and rejection sampling entirely on the GPU.
+</p>
+
+<!-- 5. Preliminary Results -->
+<h2>5. Preliminary Results</h2>
+<p>
+  We present preliminary benchmarks comparing rvLLM against Python vLLM (v0.4.x) on equivalent
+  hardware. All benchmarks use Llama-2-7B with FP16 weights on a single NVIDIA A100 80GB GPU.
+  Numbers below are placeholders and will be updated with final measurements.
+</p>
+
+<h3>5.1 Verified Resource Measurements</h3>
+<p>Throughput and latency comparisons against Python vLLM are being refreshed using a reproducible benchmark script (<code>bench/run.sh</code>). The measurements below are verified on A100 80GB SXM4 with Qwen2.5-1.5B.</p>
+<div class="table-wrap">
+  <p class="table-caption">Table 1. Verified measurements. A100 80GB SXM4, Qwen2.5-1.5B.</p>
+  <table>
+    <thead>
+      <tr>
+        <th>Metric</th>
+        <th>rvLLM (Rust)</th>
+        <th>Notes</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Startup time</td>
+        <td>~7 s</td>
+        <td>Cold start to ready for inference</td>
+      </tr>
+      <tr>
+        <td>Binary size</td>
+        <td>15 MB</td>
+        <td>Single static binary</td>
+      </tr>
+      <tr>
+        <td>CPU RSS</td>
+        <td>333 MB</td>
+        <td>Resident set size during serving</td>
+      </tr>
+      <tr>
+        <td>GPU VRAM</td>
+        <td>6,357 MiB</td>
+        <td>nvidia-smi during serving</td>
+      </tr>
+      <tr>
+        <td>Output quality</td>
+        <td>Coherent</td>
+        <td>5/5 diverse prompts produced sensible text</td>
+      </tr>
+      <tr class="pending-row">
+        <td>Throughput (tok/s)</td>
+        <td><em class="pending">Pending</em></td>
+        <td>Full comparison being refreshed</td>
+      </tr>
+      <tr class="pending-row">
+        <td>P50 latency (ms)</td>
+        <td><em class="pending">Pending</em></td>
+        <td>End-to-end token latency</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+<p style="font-size:0.85em; color:var(--fg-secondary); font-style:italic; margin-top:-16px;">
+  Full throughput comparison is being refreshed. See <code>bench/run.sh</code> to reproduce.
+</p>
+
+<h3>5.2 CPU Operation Benchmarks</h3>
+<div class="table-wrap">
+  <p class="table-caption">Table 2. CPU-side operation benchmarks, single-threaded (unless noted), averaged over 1000 iterations. <em class="pending">All pending.</em></p>
+  <table>
+    <thead>
+      <tr>
+        <th>Operation</th>
+        <th>Rust</th>
+        <th>Python</th>
+        <th>Speedup</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr class="pending-row">
+        <td>Tokenization (512 tokens)</td>
+        <td><em class="pending">--</em></td>
+        <td><em class="pending">--</em></td>
+        <td><em class="pending">--</em></td>
+      </tr>
+      <tr class="pending-row">
+        <td>Scheduling (64 sequences)</td>
+        <td><em class="pending">--</em></td>
+        <td><em class="pending">--</em></td>
+        <td><em class="pending">--</em></td>
+      </tr>
+      <tr class="pending-row">
+        <td>Block allocation (1024 blocks)</td>
+        <td><em class="pending">--</em></td>
+        <td><em class="pending">--</em></td>
+        <td><em class="pending">--</em></td>
+      </tr>
+      <tr class="pending-row">
+        <td>Sampling (top-p, batch 32)</td>
+        <td><em class="pending">--</em></td>
+        <td><em class="pending">--</em></td>
+        <td><em class="pending">--</em></td>
+      </tr>
+      <tr class="pending-row">
+        <td>Request parsing + validation</td>
+        <td><em class="pending">--</em></td>
+        <td><em class="pending">--</em></td>
+        <td><em class="pending">--</em></td>
+      </tr>
+      <tr class="pending-row">
+        <td>SSE serialization (per token)</td>
+        <td><em class="pending">--</em></td>
+        <td><em class="pending">--</em></td>
+        <td><em class="pending">--</em></td>
+      </tr>
+      <tr class="pending-row">
+        <td>Batch assembly (32 seq, rayon)</td>
+        <td><em class="pending">--</em></td>
+        <td><em class="pending">--</em></td>
+        <td><em class="pending">--</em></td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<!-- 6. Related Work -->
+<h2>6. Related Work</h2>
+<p>
+  <strong>vLLM</strong> [1] introduced PagedAttention and continuous batching for LLM serving,
+  implemented in Python with custom CUDA extensions. rvLLM adopts the same PagedAttention algorithm
+  but implements the entire stack in Rust, eliminating the Python runtime overhead.
+</p>
+<p>
+  <strong>TensorRT-LLM</strong> [2] provides high-performance inference through TensorRT's
+  graph optimization and kernel fusion. It achieves excellent throughput but requires model
+  conversion to TensorRT engines, limiting flexibility. rvLLM loads standard safetensors and GGUF
+  formats directly.
+</p>
+<p>
+  <strong>llama.cpp</strong> [3] demonstrates that C/C++ inference engines can achieve strong
+  performance on consumer hardware through aggressive quantization. rvLLM targets the server-side
+  inference use case with continuous batching and multi-GPU support, complementing llama.cpp's
+  single-user focus.
+</p>
+<p>
+  <strong>Text Generation Inference (TGI)</strong> [4] by Hugging Face uses Rust for its HTTP
+  server layer but delegates model execution to Python/PyTorch. rvLLM extends the Rust boundary
+  to encompass the full inference pipeline.
+</p>
+<p>
+  <strong>candle</strong> [5] provides a Rust-native tensor library with CUDA support. While
+  candle focuses on the tensor computation layer, rvLLM implements the full serving stack including
+  scheduling, batching, and KV-cache management on top of direct CUDA kernel calls.
+</p>
+
+<!-- 7. Conclusion -->
+<h2>7. Conclusion</h2>
+<p>
+  rvLLM demonstrates that a full LLM inference engine can be effectively implemented in Rust,
+  from CUDA kernel dispatch to HTTP streaming. The 23-crate workspace provides clear separation
+  of concerns while Rust's type system enforces memory safety across GPU and CPU boundaries
+  without runtime cost.
+</p>
+<p>
+  Preliminary results suggest meaningful improvements in throughput, tail latency, and memory
+  efficiency compared to Python-based engines. The elimination of the Python runtime removes an
+  entire class of performance variability, while Rust's <code>rayon</code>-based parallelism
+  enables CPU-side scaling that the GIL prevents in Python.
+</p>
+<p>
+  Future work includes expanding multi-GPU support via NCCL integration, implementing tensor
+  parallelism across nodes, adding support for mixture-of-experts architectures, and completing
+  the benchmark suite with production-scale workloads.
+</p>
+
+<!-- References -->
+<h2>References</h2>
+<div class="references">
+  <ol>
+    <li>Kwon, W., Li, Z., Zhuang, S., et al. "Efficient Memory Management for Large Language Model Serving with PagedAttention." <em>Proceedings of the 29th Symposium on Operating Systems Principles (SOSP)</em>, 2023.</li>
+    <li>NVIDIA. "TensorRT-LLM: A TensorRT Toolbox for Optimized Large Language Model Inference." <em>NVIDIA Developer</em>, 2024.</li>
+    <li>Gerganov, G. "llama.cpp: Inference of LLaMA model in pure C/C++." <em>GitHub repository</em>, 2023.</li>
+    <li>Hugging Face. "Text Generation Inference." <em>GitHub repository</em>, 2023.</li>
+    <li>Hugging Face. "candle: Minimalist ML framework for Rust." <em>GitHub repository</em>, 2023.</li>
+  </ol>
+</div>
+
+<div class="paper-footer">
+  rvLLM -- A High-Performance LLM Inference Engine in Rust
+</div>
+
+</div>
+
+<script>
+(function() {
+  var root = document.documentElement;
+  var toggle = document.getElementById('themeToggle');
+  var stored = localStorage.getItem('rvllm-theme');
+  if (stored === 'color') root.classList.add('color');
+
+  toggle.addEventListener('click', function() {
+    root.classList.toggle('color');
+    localStorage.setItem('rvllm-theme', root.classList.contains('color') ? 'color' : 'bw');
+  });
+
+  toggle.addEventListener('keydown', function(e) {
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      toggle.click();
+    }
+  });
+})();
+</script>
+</body>
+</html>

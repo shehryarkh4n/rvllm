@@ -18,3 +18,13 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+
+# LaTeX build artifacts
+*.aux
+*.bbl
+*.blg
+*.log
+*.out
+*.fls
+*.fdb_latexmk
+*.synctex.gz

@@ -2,7 +2,7 @@
 
 A from-scratch Rust rewrite of [vLLM](https://github.com/vllm-project/vllm) -- the most popular open-source LLM serving engine. Drop-in replacement for the OpenAI-compatible API with dramatically better resource efficiency.
 
-**44,000+ lines of Rust. 10 CUDA kernels. 769 tests. 14MB binary. Real GPU inference on A100.**
+**22 Rust crates. CUDA PTX kernels. 15MB binary. Real GPU inference on A100.**
 
 ## Install
 
@@ -16,22 +16,19 @@ pip install rvllm
 
 Or build from source -- see [Quick Start](#quick-start) below.
 
-## Benchmark Results (Preliminary)
+## Verified Measurements (A100 80GB SXM4, Qwen2.5-1.5B)
 
-> **Note:** These are preliminary numbers. Final verified benchmarks are coming -- do not cite these as definitive.
+Coherent text output verified on 5 diverse prompts. Full throughput comparison against Python vLLM is being refreshed -- see `bench/run.sh` to reproduce.
 
-Measured on A100 80GB SXM4, Qwen2.5-1.5B, same prompts, same hardware. Coherent text output with RoPE and KV cache. [Reproduce these numbers yourself.](#run-the-benchmark-yourself)
-
-| Metric | rvLLM (Rust) | Python vLLM 0.18.0 | Improvement |
-|---|---:|---:|---:|
-| Throughput | 26,688 tok/s | 8,203 tok/s | **TBD** |
-| Request rate | 834 req/s | 513 req/s | **TBD** |
-| P50 Latency | 1.3 ms | 2.1 ms | **TBD** |
-| P95 Latency | 1.5 ms | 2.3 ms | **TBD** |
-| Startup time | ~8 sec | ~40 sec | **~5x faster** |
-| CPU memory (RSS) | 325 MB | 989 MB | **~3x less** |
-| Binary size | 14 MB | ~500 MB | **~36x smaller** |
-| Errors | 0 | 0 | -- |
+| Metric | rvLLM |
+|---|---:|
+| Startup time | ~7 sec |
+| Binary size | 15 MB |
+| CPU memory (RSS) | 333 MB |
+| GPU VRAM | 6,357 MiB |
+| Output quality | Coherent (5/5 prompts) |
+| Throughput | *Pending -- benchmark refresh in progress* |
+| P50/P95 Latency | *Pending* |
 
 ### CPU Component Benchmarks (sampling, logit processing)
 
@@ -76,9 +73,9 @@ Python's Global Interpreter Lock means vLLM's scheduler, tokenizer, and output p
 
 Python's garbage collector can pause inference at unpredictable times. With large batch sizes, GC pauses grow as Python tracks millions of tensor metadata objects. Rust's ownership model means deterministic deallocation with zero GC pauses. Memory is freed the instant it goes out of scope.
 
-### 14MB vs 500MB
+### 15MB vs 500MB
 
-Python vLLM requires PyTorch (~2GB), transformers, numpy, and dozens of other packages. A fresh `pip install vllm` pulls ~500MB of dependencies. rvLLM compiles to a single 14MB static binary with zero runtime dependencies. Deploy by copying one file.
+Python vLLM requires PyTorch (~2GB), transformers, numpy, and dozens of other packages. A fresh `pip install vllm` pulls ~500MB of dependencies. rvLLM compiles to a single 15MB static binary with zero runtime dependencies. Deploy by copying one file.
 
 ### Direct GPU access
 
@@ -86,7 +83,7 @@ Python vLLM talks to the GPU through PyTorch, which adds overhead for tensor cre
 
 ### Startup time
 
-Python vLLM takes 30-60 seconds to start (importing PyTorch, JIT compiling Triton kernels, initializing NCCL). rvLLM starts serving in ~8 seconds -- load model weights and go.
+Python vLLM takes 30-60 seconds to start (importing PyTorch, JIT compiling Triton kernels, initializing NCCL). rvLLM starts serving in ~7 seconds -- load model weights and go.
 
 ### Memory efficiency
 
@@ -245,9 +242,27 @@ All standard OpenAI parameters work:
 | `seed` | int | null | Deterministic generation |
 | `n` | int | 1 | Number of completions |
 
-## Run the Benchmark Yourself
+## Reproducible Benchmarking
 
-### One-command A100 benchmark
+### Fresh-instance benchmark script
+
+Run a bounded, reproducible benchmark on any CUDA machine:
+
+```bash
+bash bench/run.sh
+```
+
+This will:
+1. Verify CUDA/GPU presence
+2. Build rvLLM with `--features cuda`
+3. Start the server, wait for health
+4. Run 16 prompts at concurrency 1 and 4
+5. Report startup time, RSS, VRAM, latency percentiles, throughput
+6. Clean up the server on exit (PID-based, with trap)
+
+Environment variables: `MODEL`, `PORT`, `MAX_TOKENS`, `NUM_PROMPTS`, `CONCURRENCY_LEVELS`.
+
+### One-command A100 benchmark (vast.ai)
 
 Requires a [vast.ai](https://vast.ai) account with API key configured.
 
@@ -296,6 +311,29 @@ bash scripts/benchmark.sh
 # Start server, then:
 VLLM_RS_URL=http://localhost:8000 python3 -m pytest tests/api_compat/ -v
 ```
+
+## Video Demo
+
+Record a side-by-side terminal demo comparing rvLLM vs Python vLLM inference speed:
+
+```bash
+bash bench/video_demo.sh
+```
+
+Uses tmux split panes to show both servers receiving identical prompts simultaneously. Records output as an asciinema `.cast` file. See `bench/video/README.md` for details.
+
+## Paper / Technical Report
+
+An arXiv-style technical paper describing the architecture, CUDA integration, and design decisions is available in two formats:
+
+**LaTeX sources** (under `docs/paper/`):
+```bash
+cd docs/paper
+pdflatex rvllm.tex && bibtex rvllm && pdflatex rvllm.tex && pdflatex rvllm.tex   # color
+pdflatex rvllm-bw.tex && bibtex rvllm-bw && pdflatex rvllm-bw.tex && pdflatex rvllm-bw.tex  # B&W
+```
+
+**GitHub Pages version** with B&W/Color toggle: enable GitHub Pages on the `/docs` folder in repo Settings. No download button -- the paper is rendered inline as HTML.
 
 ## Architecture
 
