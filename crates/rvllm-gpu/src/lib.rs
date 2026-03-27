@@ -11,6 +11,8 @@ pub mod cuda_graph;
 #[cfg(feature = "cuda")]
 pub mod cublas;
 #[cfg(feature = "cuda")]
+pub mod cublas_ops;
+#[cfg(feature = "cuda")]
 pub mod cuda_allocator;
 #[cfg(feature = "cuda")]
 pub mod kernel_loader;
