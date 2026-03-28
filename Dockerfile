@@ -1,6 +1,6 @@
 # Multi-stage build for rvllm on CUDA
 # Stage 1: Build the Rust binary with CUDA support
-FROM nvidia/cuda:12.4.1-devel-ubuntu22.04 AS builder
+FROM nvidia/cuda:13.0.1-devel-ubuntu24.04 AS builder
 
 # Install Rust toolchain
 RUN apt-get update && apt-get install -y curl build-essential pkg-config libssl-dev && \
@@ -14,9 +14,9 @@ COPY . .
 RUN cargo build --release --features cuda -p rvllm-server 2>&1 | tail -20
 
 # Stage 2: Runtime image (smaller)
-FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04
+FROM nvidia/cuda:13.0.1-runtime-ubuntu24.04
 
-RUN apt-get update && apt-get install -y libssl3 ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y libssl3t64 ca-certificates && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/target/release/rvllm /usr/local/bin/rvllm
 COPY --from=builder /build/kernels/*.ptx /usr/local/share/rvllm/kernels/
