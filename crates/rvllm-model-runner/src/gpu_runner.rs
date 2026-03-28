@@ -135,6 +135,12 @@ mod cuda_impl {
         cpu_scratch: RefCell<Vec<i32>>,
         /// Fixed max blocks per sequence for CUDA graph capture/replay.
         graph_max_blocks: usize,
+        /// Fused QKV weights per layer: [q_dim + kv_dim + kv_dim, hidden] f16.
+        /// One GEMM instead of 3 per layer. Populated by fuse_weights().
+        fused_qkv_weights: Vec<CudaSlice<half::f16>>,
+        /// Fused gate+up weights per layer: [intermediate*2, hidden] f16.
+        /// One GEMM instead of 2 per layer. Populated by fuse_weights().
+        fused_gate_up_weights: Vec<CudaSlice<half::f16>>,
     }
 
     impl GpuModelRunner {
@@ -238,7 +244,69 @@ mod cuda_impl {
                 graph_output: RefCell::new(None),
                 cpu_scratch: RefCell::new(Vec::with_capacity(4096)),
                 graph_max_blocks,
+                fused_qkv_weights: Vec::new(),
+                fused_gate_up_weights: Vec::new(),
             })
+        }
+
+        /// Fuse QKV and gate+up weights for each layer.
+        /// Concatenates on GPU: q_proj || k_proj || v_proj -> fused_qkv
+        /// and gate_proj || up_proj -> fused_gate_up.
+        /// Reduces 5 GEMMs to 2 per layer (3 QKV->1, 2 gate+up->1).
+        pub fn fuse_weights(&mut self) -> Result<()> {
+            if !self.use_fp16 {
+                return Ok(()); // Only for f16 path
+            }
+            let num_layers = self.layers.len();
+            let hidden = self.config.hidden_size;
+            let q_dim = self.config.num_heads * self.config.head_dim;
+            let kv_dim = self.config.num_kv_heads * self.config.head_dim;
+            let qkv_dim = q_dim + kv_dim + kv_dim;
+            let intermediate = self.config.intermediate_size;
+            let gate_up_dim = intermediate * 2;
+
+            for i in 0..num_layers {
+                // Fuse QKV: concat [q_dim, hidden] + [kv_dim, hidden] + [kv_dim, hidden]
+                let q_w = self.weights.get_f16(
+                    &format!("model.layers.{i}.self_attn.q_proj.weight")
+                ).ok_or_else(|| LLMError::GpuError(format!("missing f16 q_proj layer {i}")))?;
+                let k_w = self.weights.get_f16(
+                    &format!("model.layers.{i}.self_attn.k_proj.weight")
+                ).ok_or_else(|| LLMError::GpuError(format!("missing f16 k_proj layer {i}")))?;
+                let v_w = self.weights.get_f16(
+                    &format!("model.layers.{i}.self_attn.v_proj.weight")
+                ).ok_or_else(|| LLMError::GpuError(format!("missing f16 v_proj layer {i}")))?;
+
+                let mut fused_qkv = self.stream.alloc_zeros::<half::f16>(qkv_dim * hidden)
+                    .map_err(|e| LLMError::GpuError(format!("fused_qkv alloc: {e}")))?;
+                // Copy Q, K, V contiguously
+                self.stream.memcpy_dtod(q_w, &mut fused_qkv.slice_mut(..q_dim * hidden))
+                    .map_err(|e| LLMError::GpuError(format!("fused_qkv q copy: {e}")))?;
+                self.stream.memcpy_dtod(k_w, &mut fused_qkv.slice_mut(q_dim * hidden..(q_dim + kv_dim) * hidden))
+                    .map_err(|e| LLMError::GpuError(format!("fused_qkv k copy: {e}")))?;
+                self.stream.memcpy_dtod(v_w, &mut fused_qkv.slice_mut((q_dim + kv_dim) * hidden..qkv_dim * hidden))
+                    .map_err(|e| LLMError::GpuError(format!("fused_qkv v copy: {e}")))?;
+                self.fused_qkv_weights.push(fused_qkv);
+
+                // Fuse gate+up: concat [intermediate, hidden] + [intermediate, hidden]
+                let gate_w = self.weights.get_f16(
+                    &format!("model.layers.{i}.mlp.gate_proj.weight")
+                ).ok_or_else(|| LLMError::GpuError(format!("missing f16 gate_proj layer {i}")))?;
+                let up_w = self.weights.get_f16(
+                    &format!("model.layers.{i}.mlp.up_proj.weight")
+                ).ok_or_else(|| LLMError::GpuError(format!("missing f16 up_proj layer {i}")))?;
+
+                let mut fused_gu = self.stream.alloc_zeros::<half::f16>(gate_up_dim * hidden)
+                    .map_err(|e| LLMError::GpuError(format!("fused_gate_up alloc: {e}")))?;
+                self.stream.memcpy_dtod(gate_w, &mut fused_gu.slice_mut(..intermediate * hidden))
+                    .map_err(|e| LLMError::GpuError(format!("fused_gate_up gate copy: {e}")))?;
+                self.stream.memcpy_dtod(up_w, &mut fused_gu.slice_mut(intermediate * hidden..gate_up_dim * hidden))
+                    .map_err(|e| LLMError::GpuError(format!("fused_gate_up up copy: {e}")))?;
+                self.fused_gate_up_weights.push(fused_gu);
+            }
+
+            info!(num_layers, qkv_dim, gate_up_dim, "fused QKV and gate+up weights");
+            Ok(())
         }
 
         pub fn forward(
@@ -1098,6 +1166,8 @@ mod cuda_impl {
                 gate_proj: g_f16(&format!("model.layers.{i}.mlp.gate_proj.weight"))?,
                 up_proj: g_f16(&format!("model.layers.{i}.mlp.up_proj.weight"))?,
                 down_proj: g_f16(&format!("model.layers.{i}.mlp.down_proj.weight"))?,
+                fused_qkv: self.fused_qkv_weights.get(i),
+                fused_gate_up: self.fused_gate_up_weights.get(i),
             })
         }
     }

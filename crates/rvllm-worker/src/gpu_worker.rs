@@ -643,6 +643,10 @@ impl GpuWorker {
             if self.config.dtype.is_half() {
                 runner.enable_fp16();
                 info!("FP16 inference enabled (hgemm path)");
+                // Fuse QKV and gate+up weights for fewer GEMM calls per layer.
+                if let Err(e) = runner.fuse_weights() {
+                    warn!("weight fusion failed: {e} -- using unfused path");
+                }
             }
 
             // Pre-allocate cuBLAS workspace for CUDA graph capture.

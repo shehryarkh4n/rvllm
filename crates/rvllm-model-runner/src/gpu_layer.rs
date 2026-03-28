@@ -79,6 +79,10 @@ mod inner {
         pub gate_proj: &'a CudaSlice<f16>,
         pub up_proj: &'a CudaSlice<f16>,
         pub down_proj: &'a CudaSlice<f16>,
+        /// Fused QKV weight: [q_dim + kv_dim + kv_dim, hidden]. None if not fused.
+        pub fused_qkv: Option<&'a CudaSlice<f16>>,
+        /// Fused gate+up weight: [intermediate*2, hidden]. None if not fused.
+        pub fused_gate_up: Option<&'a CudaSlice<f16>>,
     }
 
     /// Metadata needed for a single layer forward pass.
@@ -165,9 +169,10 @@ mod inner {
                 hidden,
             )?;
 
-            // 2. QKV projections: cast normed f32->f16 ONCE, share across Q/K/V
+            // 2. QKV projections
             let q_dim = num_heads * head_dim;
             let kv_dim = num_kv_heads * head_dim;
+            let qkv_dim = q_dim + kv_dim + kv_dim;
 
             let cast_f32_f16 = self.loader.get_func("cast_fp", "cast_f32_to_f16_kernel")
                 .map_err(|e| LLMError::GpuError(format!("load cast: {e}")))?;
@@ -175,15 +180,45 @@ mod inner {
                 &self.stream, &normed, num_tokens * hidden, &cast_f32_f16,
             )?;
 
-            let mut q = CudaLinearLayer::forward_f16_in(
-                &normed_f16, weights.q_proj, num_tokens, q_dim, hidden, blas,
-            )?;
-            let mut k = CudaLinearLayer::forward_f16_in(
-                &normed_f16, weights.k_proj, num_tokens, kv_dim, hidden, blas,
-            )?;
-            let mut v = CudaLinearLayer::forward_f16_in(
-                &normed_f16, weights.v_proj, num_tokens, kv_dim, hidden, blas,
-            )?;
+            let (mut q, mut k, mut v) = if let Some(fused_qkv) = weights.fused_qkv {
+                // Fused QKV: single GEMM [num_tokens, hidden] x [qkv_dim, hidden]^T -> [num_tokens, qkv_dim]
+                let qkv = CudaLinearLayer::forward_f16_in(
+                    &normed_f16, fused_qkv, num_tokens, qkv_dim, hidden, blas,
+                )?;
+                // Split output: Q [0..q_dim], K [q_dim..q_dim+kv_dim], V [q_dim+kv_dim..]
+                // For num_tokens=1 (decode), output is [qkv_dim] contiguous.
+                // For batched, output is [num_tokens, qkv_dim] row-major.
+                let q_end = num_tokens * q_dim;
+                let k_end = q_end + num_tokens * kv_dim;
+                let v_end = k_end + num_tokens * kv_dim;
+                // Need owned CudaSlice for each split (for &mut in RoPE).
+                // Copy from the fused output into separate buffers.
+                let mut q_buf = self.stream.alloc_zeros::<f32>(num_tokens * q_dim)
+                    .map_err(|e| LLMError::GpuError(format!("q split alloc: {e}")))?;
+                let mut k_buf = self.stream.alloc_zeros::<f32>(num_tokens * kv_dim)
+                    .map_err(|e| LLMError::GpuError(format!("k split alloc: {e}")))?;
+                let mut v_buf = self.stream.alloc_zeros::<f32>(num_tokens * kv_dim)
+                    .map_err(|e| LLMError::GpuError(format!("v split alloc: {e}")))?;
+                self.stream.memcpy_dtod(&qkv.slice(..q_end), &mut q_buf)
+                    .map_err(|e| LLMError::GpuError(format!("q split copy: {e}")))?;
+                self.stream.memcpy_dtod(&qkv.slice(q_end..k_end), &mut k_buf)
+                    .map_err(|e| LLMError::GpuError(format!("k split copy: {e}")))?;
+                self.stream.memcpy_dtod(&qkv.slice(k_end..v_end), &mut v_buf)
+                    .map_err(|e| LLMError::GpuError(format!("v split copy: {e}")))?;
+                (q_buf, k_buf, v_buf)
+            } else {
+                // Unfused: 3 separate GEMMs (fallback)
+                let q = CudaLinearLayer::forward_f16_in(
+                    &normed_f16, weights.q_proj, num_tokens, q_dim, hidden, blas,
+                )?;
+                let k = CudaLinearLayer::forward_f16_in(
+                    &normed_f16, weights.k_proj, num_tokens, kv_dim, hidden, blas,
+                )?;
+                let v = CudaLinearLayer::forward_f16_in(
+                    &normed_f16, weights.v_proj, num_tokens, kv_dim, hidden, blas,
+                )?;
+                (q, k, v)
+            };
 
             // QKV biases (f32)
             if let Some(bias) = weights.q_proj_bias {
@@ -280,13 +315,28 @@ mod inner {
             let normed2_f16 = CudaLinearLayer::gpu_cast_f32_to_f16(
                 &self.stream, &normed2, num_tokens * hidden, &cast_f32_f16,
             )?;
-            let gate = CudaLinearLayer::forward_f16_in(
-                &normed2_f16, weights.gate_proj, num_tokens, intermediate, hidden, blas,
-            )?;
-            let up = CudaLinearLayer::forward_f16_in(
-                &normed2_f16, weights.up_proj, num_tokens, intermediate, hidden, blas,
-            )?;
-            let fused = Self::fused_silu_mul(&self.stream, &self.loader, &gate, &up, num_tokens * intermediate)?;
+
+            let fused = if let Some(fused_gate_up) = weights.fused_gate_up {
+                // Fused gate+up: single GEMM -> [num_tokens, intermediate*2]
+                let gate_up = CudaLinearLayer::forward_f16_in(
+                    &normed2_f16, fused_gate_up, num_tokens, intermediate * 2, hidden, blas,
+                )?;
+                // Split: gate = [0..intermediate], up = [intermediate..intermediate*2]
+                // fused_silu_mul reads gate and up separately, so split via slices
+                let n = num_tokens * intermediate;
+                Self::fused_silu_mul_split(
+                    &self.stream, &self.loader, &gate_up, n,
+                )?
+            } else {
+                // Unfused fallback
+                let gate = CudaLinearLayer::forward_f16_in(
+                    &normed2_f16, weights.gate_proj, num_tokens, intermediate, hidden, blas,
+                )?;
+                let up = CudaLinearLayer::forward_f16_in(
+                    &normed2_f16, weights.up_proj, num_tokens, intermediate, hidden, blas,
+                )?;
+                Self::fused_silu_mul(&self.stream, &self.loader, &gate, &up, num_tokens * intermediate)?
+            };
             // down_proj: fused is unique input, use forward_mixed (includes its own cast)
             let mlp_out = CudaLinearLayer::forward_mixed(
                 &fused, weights.down_proj, num_tokens, hidden, intermediate, blas, &self.loader,
@@ -1154,6 +1204,43 @@ mod inner {
                     })?;
             }
 
+            Ok(output)
+        }
+
+        /// Fused SiLU*mul on a contiguous [gate || up] buffer.
+        /// gate = gate_up[0..n], up = gate_up[n..2n].
+        fn fused_silu_mul_split(
+            stream: &Arc<CudaStream>,
+            loader: &KernelLoader,
+            gate_up: &CudaSlice<f32>,
+            n: usize,
+        ) -> Result<CudaSlice<f32>> {
+            let gate_view = gate_up.slice(..n);
+            let up_view = gate_up.slice(n..n * 2);
+
+            let mut output = stream
+                .alloc_zeros::<f32>(n)
+                .map_err(|e| LLMError::GpuError(format!("fused_silu_mul_split alloc: {e}")))?;
+
+            let kernel = loader.get_func("activation", "fused_silu_mul_kernel")?;
+            let threads = 256u32;
+            let blocks = ((n as u32) + threads - 1) / threads;
+            let cfg = LaunchConfig {
+                grid_dim: (blocks, 1, 1),
+                block_dim: (threads, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let n_i32 = n as i32;
+            unsafe {
+                stream
+                    .launch_builder(&kernel)
+                    .arg(&mut output)
+                    .arg(&gate_view)
+                    .arg(&up_view)
+                    .arg(&n_i32)
+                    .launch(cfg)
+                    .map_err(|e| LLMError::GpuError(format!("fused_silu_mul_split launch: {e}")))?;
+            }
             Ok(output)
         }
 
