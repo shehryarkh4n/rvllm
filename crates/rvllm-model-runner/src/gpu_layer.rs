@@ -22,7 +22,6 @@ mod inner {
     use half::f16;
     use tracing::{info, trace};
 
-    use rvllm_attention::choose_num_splits;
     use rvllm_core::error::{LLMError, Result};
     use rvllm_gpu::cublas::CublasHandle;
     use rvllm_gpu::kernel_loader::KernelLoader;
@@ -1265,8 +1264,7 @@ mod inner {
             Ok(output)
         }
 
-        /// Decode attention: read f16 K/V from paged cache using split-KV kernels.
-        /// Falls back to FA2 decode kernel if split_kv_attention module is not loaded.
+        /// Decode attention: read f16 K/V from paged cache, one FA2 decode kernel per layer.
         /// Q is f32, cache is f16; kernel promotes f16 to f32 on load.
         fn decode_attention(
             stream: &Arc<CudaStream>,
@@ -1291,11 +1289,32 @@ mod inner {
 
             let scale = 1.0f32 / (head_dim as f32).sqrt();
 
-            // Split-KV constants (match split_kv_attention.cu)
-            const SKV_BC: usize = 64;
-            const SKV_THREADS: u32 = 128;
-            let shared_mem_bytes = ((2 * SKV_BC * head_dim + SKV_BC + (SKV_THREADS as usize / 32))
+            // Use FA2 decode kernel: correct block-level reductions, GQA support.
+            // FA2_BC=64, FA2_THREADS=128 (compile-time constants in flash_attention.cu)
+            const FA2_BC: usize = 64;
+            const FA2_THREADS: u32 = 128;
+            // smem: s_key[FA2_BC*head_dim] + s_val[FA2_BC*head_dim] + s_score[FA2_BC] + s_reduce[FA2_THREADS/32]
+            let shared_mem_bytes = ((2 * FA2_BC * head_dim + FA2_BC + (FA2_THREADS as usize / 32))
                 * std::mem::size_of::<f32>()) as u32;
+
+            let module_name = "flash_attention";
+            let func_name = "flash_attention_2_decode_f16kv_kernel";
+
+            let cfg = LaunchConfig {
+                grid_dim: (num_seqs as u32, num_heads as u32, 1),
+                block_dim: (FA2_THREADS, 1, 1),
+                shared_mem_bytes,
+            };
+
+            let kernel = loader.get_func(module_name, func_name)?;
+
+            // Opt into extended shared memory if needed
+            if shared_mem_bytes > 49152 {
+                kernel.set_attribute(
+                    cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    shared_mem_bytes as i32,
+                ).map_err(|e| LLMError::GpuError(format!("decode FA2 set max shared mem: {e}")))?;
+            }
 
             let p_num_heads = num_heads as i32;
             let p_num_kv_heads = num_kv_heads as i32;
@@ -1303,197 +1322,32 @@ mod inner {
             let p_block_size = block_size as i32;
             let p_max_blocks = (block_tables.len() / num_seqs.max(1)) as i32;
 
-            // Try split-KV path; fall back to FA2 if module not loaded
-            if loader.has_module("split_kv_attention") {
-                let num_splits = choose_num_splits(max_context_len as usize);
-
-                if num_splits <= 1 {
-                    // -- Single-split fast path: no workspace needed --
-                    let kernel = loader.get_func(
-                        "split_kv_attention",
-                        "split_kv_decode_single_f16kv_kernel",
-                    )?;
-
-                    let cfg = LaunchConfig {
-                        grid_dim: (num_seqs as u32, num_heads as u32, 1),
-                        block_dim: (SKV_THREADS, 1, 1),
-                        shared_mem_bytes,
-                    };
-
-                    if shared_mem_bytes > 49152 {
-                        kernel.set_attribute(
-                            cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                            shared_mem_bytes as i32,
-                        ).map_err(|e| LLMError::GpuError(format!("split_kv single set max shared mem: {e}")))?;
-                    }
-
-                    // SAFETY: All slices are valid GPU memory on this device.
-                    // Kernel signature: (output, query, key_cache, value_cache, block_tables,
-                    //   context_lens, scale, num_heads, num_kv_heads, head_dim, block_size,
-                    //   max_blocks_per_seq)
-                    unsafe {
-                        stream
-                            .launch_builder(&kernel)
-                            .arg(&mut output)
-                            .arg(q)
-                            .arg(key_cache)
-                            .arg(value_cache)
-                            .arg(block_tables)
-                            .arg(context_lens)
-                            .arg(&scale)
-                            .arg(&p_num_heads)
-                            .arg(&p_num_kv_heads)
-                            .arg(&p_head_dim)
-                            .arg(&p_block_size)
-                            .arg(&p_max_blocks)
-                            .launch(cfg)
-                            .map_err(|e| {
-                                LLMError::GpuError(format!("split_kv_decode_single launch failed: {e}"))
-                            })?;
-                    }
-                } else {
-                    // -- Multi-split path: allocate workspace, launch split + combine --
-                    let ws_out_len = num_splits * num_seqs * num_heads * head_dim;
-                    let ws_scalar_len = num_splits * num_seqs * num_heads;
-
-                    let mut partial_out = stream
-                        .alloc_zeros::<f32>(ws_out_len)
-                        .map_err(|e| LLMError::GpuError(format!("split_kv partial_out alloc: {e}")))?;
-                    let mut partial_max = stream
-                        .alloc_zeros::<f32>(ws_scalar_len)
-                        .map_err(|e| LLMError::GpuError(format!("split_kv partial_max alloc: {e}")))?;
-                    let mut partial_sum = stream
-                        .alloc_zeros::<f32>(ws_scalar_len)
-                        .map_err(|e| LLMError::GpuError(format!("split_kv partial_sum alloc: {e}")))?;
-
-                    let p_num_seqs = num_seqs as i32;
-                    let p_num_splits = num_splits as i32;
-
-                    // 1) Launch split_kv_decode_f16kv_kernel
-                    let decode_kernel = loader.get_func(
-                        "split_kv_attention",
-                        "split_kv_decode_f16kv_kernel",
-                    )?;
-
-                    let decode_cfg = LaunchConfig {
-                        grid_dim: (num_seqs as u32, num_heads as u32, num_splits as u32),
-                        block_dim: (SKV_THREADS, 1, 1),
-                        shared_mem_bytes,
-                    };
-
-                    if shared_mem_bytes > 49152 {
-                        decode_kernel.set_attribute(
-                            cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                            shared_mem_bytes as i32,
-                        ).map_err(|e| LLMError::GpuError(format!("split_kv decode set max shared mem: {e}")))?;
-                    }
-
-                    // SAFETY: All slices are valid GPU memory. Kernel signature:
-                    // (partial_out, partial_max, partial_sum, query, key_cache, value_cache,
-                    //  block_tables, context_lens, scale, num_seqs, num_heads, num_kv_heads,
-                    //  head_dim, block_size, max_blocks_per_seq, num_splits)
-                    unsafe {
-                        stream
-                            .launch_builder(&decode_kernel)
-                            .arg(&mut partial_out)
-                            .arg(&mut partial_max)
-                            .arg(&mut partial_sum)
-                            .arg(q)
-                            .arg(key_cache)
-                            .arg(value_cache)
-                            .arg(block_tables)
-                            .arg(context_lens)
-                            .arg(&scale)
-                            .arg(&p_num_seqs)
-                            .arg(&p_num_heads)
-                            .arg(&p_num_kv_heads)
-                            .arg(&p_head_dim)
-                            .arg(&p_block_size)
-                            .arg(&p_max_blocks)
-                            .arg(&p_num_splits)
-                            .launch(decode_cfg)
-                            .map_err(|e| {
-                                LLMError::GpuError(format!("split_kv_decode launch failed: {e}"))
-                            })?;
-                    }
-
-                    // 2) Launch split_kv_combine_kernel
-                    let combine_kernel = loader.get_func(
-                        "split_kv_attention",
-                        "split_kv_combine_kernel",
-                    )?;
-
-                    let combine_cfg = LaunchConfig {
-                        grid_dim: (num_seqs as u32, num_heads as u32, 1),
-                        block_dim: (head_dim as u32, 1, 1),
-                        shared_mem_bytes: 0,
-                    };
-
-                    // SAFETY: All workspace slices were just written by the decode kernel.
-                    // Kernel signature: (output, partial_out, partial_max, partial_sum,
-                    //  context_lens, num_seqs, num_heads, head_dim, num_splits)
-                    unsafe {
-                        stream
-                            .launch_builder(&combine_kernel)
-                            .arg(&mut output)
-                            .arg(&partial_out)
-                            .arg(&partial_max)
-                            .arg(&partial_sum)
-                            .arg(context_lens)
-                            .arg(&p_num_seqs)
-                            .arg(&p_num_heads)
-                            .arg(&p_head_dim)
-                            .arg(&p_num_splits)
-                            .launch(combine_cfg)
-                            .map_err(|e| {
-                                LLMError::GpuError(format!("split_kv_combine launch failed: {e}"))
-                            })?;
-                    }
-                }
-            } else {
-                // Fallback: FA2 decode kernel
-                trace!("split_kv_attention not loaded, falling back to FA2 decode");
-
-                let cfg = LaunchConfig {
-                    grid_dim: (num_seqs as u32, num_heads as u32, 1),
-                    block_dim: (SKV_THREADS, 1, 1),
-                    shared_mem_bytes,
-                };
-
-                let kernel = loader.get_func(
-                    "flash_attention",
-                    "flash_attention_2_decode_f16kv_kernel",
-                )?;
-
-                if shared_mem_bytes > 49152 {
-                    kernel.set_attribute(
-                        cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                        shared_mem_bytes as i32,
-                    ).map_err(|e| LLMError::GpuError(format!("decode FA2 set max shared mem: {e}")))?;
-                }
-
-                // SAFETY: Same layout as before -- FA2 decode kernel has identical signature
-                // to split_kv_decode_single.
-                unsafe {
-                    stream
-                        .launch_builder(&kernel)
-                        .arg(&mut output)
-                        .arg(q)
-                        .arg(key_cache)
-                        .arg(value_cache)
-                        .arg(block_tables)
-                        .arg(context_lens)
-                        .arg(&scale)
-                        .arg(&p_num_heads)
-                        .arg(&p_num_kv_heads)
-                        .arg(&p_head_dim)
-                        .arg(&p_block_size)
-                        .arg(&p_max_blocks)
-                        .launch(cfg)
-                        .map_err(|e| {
-                            LLMError::GpuError(format!("flash_attention_2_decode launch failed: {e}"))
-                        })?;
-                }
+            // SAFETY: All slices are valid GPU memory on this device.
+            // output: [num_seqs, num_heads, head_dim]
+            // q:      [num_seqs, num_heads, head_dim]  (decode: num_seqs == num_tokens)
+            // key_cache, value_cache: [num_blocks, block_size, num_kv_heads, head_dim]
+            // block_tables: [num_seqs, max_blocks_per_seq]
+            // context_lens: [num_seqs]
+            // Scalar int args cast from usize; all values fit in i32 range.
+            unsafe {
+                stream
+                    .launch_builder(&kernel)
+                    .arg(&mut output)
+                    .arg(q)
+                    .arg(key_cache)
+                    .arg(value_cache)
+                    .arg(block_tables)
+                    .arg(context_lens)
+                    .arg(&scale)
+                    .arg(&p_num_heads)
+                    .arg(&p_num_kv_heads)
+                    .arg(&p_head_dim)
+                    .arg(&p_block_size)
+                    .arg(&p_max_blocks)
+                    .launch(cfg)
+                    .map_err(|e| {
+                        LLMError::GpuError(format!("flash_attention_2_decode launch failed: {e}"))
+                    })?;
             }
 
             Ok(output)
