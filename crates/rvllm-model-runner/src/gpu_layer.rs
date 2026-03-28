@@ -83,6 +83,10 @@ mod inner {
         pub fused_qkv: Option<&'a CudaSlice<f16>>,
         /// Fused gate+up weight: [intermediate*2, hidden]. None if not fused.
         pub fused_gate_up: Option<&'a CudaSlice<f16>>,
+        /// Pre-converted f16 norm weights and biases for zero-cast f16 forward.
+        pub input_layernorm_f16: Option<&'a CudaSlice<f16>>,
+        pub post_attention_layernorm_f16: Option<&'a CudaSlice<f16>>,
+        pub fused_qkv_bias: Option<&'a CudaSlice<f16>>,
     }
 
     /// Metadata needed for a single layer forward pass.

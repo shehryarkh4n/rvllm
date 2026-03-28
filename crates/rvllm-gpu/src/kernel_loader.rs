@@ -45,6 +45,7 @@ static KERNEL_FUNCTIONS: &[(&str, &[&str])] = &[
             "flash_attention_2_decode_kernel",
             "flash_attention_2_f16kv_kernel",
             "flash_attention_2_decode_f16kv_kernel",
+            "flash_attention_2_decode_f16io_kernel",
         ],
     ),
     (
