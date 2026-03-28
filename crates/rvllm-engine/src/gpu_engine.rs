@@ -20,7 +20,7 @@ mod inner {
         BlockId, FinishReason, LLMError, LogProb, RequestId, RequestOutput, Result, SamplingParams,
         SequenceId, TokenId,
     };
-    use rvllm_sequence::{Sequence, SequenceData, SequenceGroup, SequenceGroupMetadata};
+    use rvllm_sequence::{Sequence, SequenceData, SequenceGroup, SequenceGroupMetadata, SequenceStatus};
     use rvllm_tokenizer::Tokenizer;
     use rvllm_worker::gpu_worker::GpuWorker;
 
@@ -243,6 +243,18 @@ mod inner {
             }
         }
 
+        /// Mark a sequence as finished so `schedule()` can purge it.
+        fn finish_seq(&mut self, seq_id: SequenceId, status: SequenceStatus) {
+            for group in self.running.iter_mut().chain(self.waiting.iter_mut()) {
+                for seq in group.get_seqs_mut() {
+                    if seq.seq_id == seq_id {
+                        let _ = seq.set_status(status);
+                        return;
+                    }
+                }
+            }
+        }
+
         fn get_num_unfinished_seq_groups(&self) -> usize {
             self.waiting.len() + self.running.len()
         }
@@ -315,6 +327,8 @@ mod inner {
         next_request_id: AtomicU64,
         next_seq_id: u64,
         prefix_cache: Option<PrefixCache>,
+        /// Total number of GPU KV-cache blocks available.
+        num_gpu_blocks: u32,
         /// Persistent block allocation with recycling.
         next_block_id: u32,
         /// Free list of recycled block IDs.
@@ -420,6 +434,7 @@ mod inner {
                 next_request_id: AtomicU64::new(1),
                 next_seq_id: 0,
                 prefix_cache,
+                num_gpu_blocks: num_gpu_blocks as u32,
                 next_block_id: 0,
                 free_blocks: Vec::new(),
                 seq_block_tables: HashMap::new(),
@@ -635,6 +650,16 @@ mod inner {
                                 &req.sampling_params,
                                 eos,
                             );
+                            // Sync finish status back to the scheduler so
+                            // schedule() purges the group and blocks get recycled.
+                            if let Some(reason) = state.finish_reason {
+                                let status = match reason {
+                                    FinishReason::Stop => SequenceStatus::FinishedStopped,
+                                    FinishReason::Length => SequenceStatus::FinishedLength,
+                                    FinishReason::Abort => SequenceStatus::FinishedAborted,
+                                };
+                                self.scheduler.finish_seq(seq.seq_id, status);
+                            }
                         }
                     }
                 }
@@ -659,8 +684,11 @@ mod inner {
                 self.requests.remove(id);
                 self.scheduler.abort_seq_group(id);
             }
-            // Clean up block tables for finished sequences -- recycle block IDs
-            if !finished_ids.is_empty() {
+            // Recycle blocks from dead sequences every step, not just when
+            // requests finish.  With continuous batching there are always
+            // unfinished seqs, so gating on finished_ids caused blocks to
+            // leak and next_block_id to grow past num_gpu_blocks.
+            {
                 let live_seq_ids: std::collections::HashSet<SequenceId> =
                     self.scheduler.live_seq_ids();
                 let dead_sids: Vec<SequenceId> = self
@@ -671,6 +699,7 @@ mod inner {
                     .collect();
                 for sid in dead_sids {
                     if let Some(blocks) = self.seq_block_tables.remove(&sid) {
+                        debug!(seq_id = sid.0, num_blocks = blocks.len(), "recycling blocks from finished sequence");
                         for b in blocks {
                             self.free_blocks.push(b.0);
                         }
@@ -731,11 +760,22 @@ mod inner {
                     // Reuse existing blocks, append new ones if needed
                     let existing = self.seq_block_tables.entry(seq.seq_id).or_default();
                     while existing.len() < needed_blocks {
-                        let block_id = self.free_blocks.pop().unwrap_or_else(|| {
+                        let block_id = if let Some(recycled) = self.free_blocks.pop() {
+                            recycled
+                        } else if self.next_block_id < self.num_gpu_blocks {
                             let id = self.next_block_id;
                             self.next_block_id += 1;
                             id
-                        });
+                        } else {
+                            warn!(
+                                seq_id = seq.seq_id.0,
+                                next_block_id = self.next_block_id,
+                                num_gpu_blocks = self.num_gpu_blocks,
+                                free_blocks = self.free_blocks.len(),
+                                "block allocation failed: no free GPU KV-cache blocks"
+                            );
+                            break;
+                        };
                         existing.push(BlockId(block_id));
                     }
                     block_tables.insert(seq.seq_id, existing.clone());

@@ -18,6 +18,7 @@ use rvllm_core::prelude::{BlockId, LLMError, Result, SamplingParams, TokenId};
 use rvllm_gpu::prelude::{CublasHandle, CudaGpuAllocator, GpuStream};
 
 use rvllm_kv_cache::CacheEngine;
+use rvllm_model_runner::gpu_runner::ForwardOutput;
 use rvllm_model_runner::input::ModelInput;
 use rvllm_model_runner::ModelRunnerConfig;
 use rvllm_sampling::batch::make_rng;
@@ -663,6 +664,19 @@ impl GpuWorker {
         }
     }
 
+    /// Check if all requests in the batch can use greedy (temperature=0) GPU argmax.
+    /// Returns false if any request uses temperature>0, guided decoding, or repetition penalty.
+    fn all_greedy(metadata: &[SequenceGroupMetadata]) -> bool {
+        metadata.iter().all(|g| {
+            let p = &g.sampling_params;
+            p.temperature == 0.0
+                && matches!(p.response_format, ResponseFormat::Text)
+                && p.repetition_penalty == 1.0
+                && p.frequency_penalty == 0.0
+                && p.presence_penalty == 0.0
+        })
+    }
+
     /// Execute one inference step with real GPU matmuls.
     pub fn execute(&mut self, metadata: &[SequenceGroupMetadata]) -> Result<GpuWorkerOutput> {
         if metadata.is_empty() {
@@ -686,16 +700,28 @@ impl GpuWorker {
             "input prepared"
         );
 
-        // Run real GPU forward pass with RoPE and KV cache
-        info!("gpu_worker: entering gpu_forward");
-        let logits = self.gpu_forward(&model_input)?;
-        info!(
-            logits_len = logits.len(),
-            "gpu_worker: gpu_forward returned"
-        );
+        let greedy_only = Self::all_greedy(metadata);
 
-        // Sample tokens from logits
-        let outputs = self.sample_tokens(&logits, metadata)?;
+        // Run real GPU forward pass with RoPE and KV cache
+        info!(greedy_only, "gpu_worker: entering gpu_forward");
+        let fwd_output = self.gpu_forward_ex(&model_input, greedy_only)?;
+
+        let outputs = match fwd_output {
+            ForwardOutput::TokenIds(ref token_ids) => {
+                info!(
+                    num_ids = token_ids.len(),
+                    "gpu_worker: gpu argmax fast path"
+                );
+                self.sample_tokens_from_gpu_argmax(token_ids, metadata)?
+            }
+            ForwardOutput::Logits(ref logits) => {
+                info!(
+                    logits_len = logits.len(),
+                    "gpu_worker: full logits path"
+                );
+                self.sample_tokens(logits, metadata)?
+            }
+        };
 
         debug!(
             device_id = self.device_id,
@@ -736,6 +762,38 @@ impl GpuWorker {
 
         #[cfg(not(feature = "cuda"))]
         {
+            return Err(LLMError::GpuError(
+                "GPU forward pass requires --features cuda. CPU fallback is disabled.".into(),
+            ));
+        }
+    }
+
+    /// Extended raw forward: supports greedy_only flag to skip logits DtoH.
+    fn raw_gpu_forward_ex(
+        &self,
+        model_input: &ModelInput,
+        greedy_only: bool,
+    ) -> Result<ForwardOutput> {
+        #[cfg(feature = "cuda")]
+        {
+            let runner = self.gpu_model_runner.as_ref().ok_or_else(|| {
+                LLMError::GpuError(
+                    "GPU model runner not initialized -- build with --features cuda".into(),
+                )
+            })?;
+
+            return runner.forward_ex(
+                &model_input.token_ids,
+                &model_input.position_ids,
+                &model_input.attention_metadata,
+                model_input.is_prefill,
+                greedy_only,
+            );
+        }
+
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (model_input, greedy_only);
             return Err(LLMError::GpuError(
                 "GPU forward pass requires --features cuda. CPU fallback is disabled.".into(),
             ));
@@ -802,6 +860,72 @@ impl GpuWorker {
         }
 
         Ok(logits)
+    }
+
+    /// Extended GPU forward with greedy fast path. When `greedy_only` is true and
+    /// CUDA graphs are not replaying, runs argmax on GPU and returns only token IDs.
+    /// Falls back to full logits when graph replay is active (graph captured with
+    /// full logits path).
+    fn gpu_forward_ex(
+        &mut self,
+        model_input: &ModelInput,
+        greedy_only: bool,
+    ) -> Result<ForwardOutput> {
+        self.forward_count += 1;
+
+        // Try graph replay for eligible decode steps -- graph path always
+        // returns full logits since it was captured with the standard forward.
+        if self.graph_runner.can_use_graph(model_input) {
+            let (padded_input, actual_batch) = self.graph_runner.pad_input(model_input)?;
+            let replayed = self
+                .graph_runner
+                .try_replay(&self.compute_stream, actual_batch)?;
+            if replayed {
+                debug!(actual_batch, "CUDA graph replayed, unpadding logits");
+                let padded_logits = self.raw_gpu_forward(&padded_input)?;
+                let logits = self.graph_runner.unpad_logits(&padded_logits, actual_batch);
+                return Ok(ForwardOutput::Logits(logits));
+            }
+        }
+
+        // Normal forward pass with optional greedy argmax on GPU.
+        let output = self.raw_gpu_forward_ex(model_input, greedy_only)?;
+
+        // After warmup, capture a graph for this decode batch size if not yet captured.
+        // Graph capture always uses the standard (non-greedy) forward.
+        if self.forward_count > Self::GRAPH_WARMUP_CALLS
+            && !model_input.is_prefill
+            && self.graph_runner.can_use_graph(model_input)
+        {
+            let (padded_input, _actual_batch) = self.graph_runner.pad_input(model_input)?;
+            let padded_bs = padded_input.num_tokens();
+            if !self.graph_runner.was_capture_attempted(padded_bs) {
+                info!(padded_bs, "capturing CUDA graph after warmup");
+                #[cfg(feature = "cuda")]
+                {
+                    let gpu_runner = self.gpu_model_runner.as_ref();
+                    let capture_result =
+                        self.graph_runner
+                            .capture_graph(&self.compute_stream, padded_bs, || {
+                                let runner = gpu_runner.ok_or_else(|| {
+                                    LLMError::GpuError("GPU model runner not initialized".into())
+                                })?;
+                                let _ = runner.forward(
+                                    &padded_input.token_ids,
+                                    &padded_input.position_ids,
+                                    &padded_input.attention_metadata,
+                                    padded_input.is_prefill,
+                                )?;
+                                Ok(())
+                            });
+                    if let Err(e) = capture_result {
+                        warn!(%e, "CUDA graph capture failed, continuing without graph");
+                    }
+                }
+            }
+        }
+
+        Ok(output)
     }
 
     /// Legacy CPU forward pass (kept for comparison benchmarks only, not used in production).
@@ -1556,6 +1680,53 @@ impl GpuWorker {
                 });
 
                 offset += num_tokens * vocab_size;
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Fast path: convert GPU-side argmax token IDs to sampling results.
+    /// Used when all requests in the batch use temperature=0 (greedy).
+    /// The argmax kernel produces one token ID per input token row;
+    /// we pick the last token per sequence (same logic as sample_tokens).
+    fn sample_tokens_from_gpu_argmax(
+        &self,
+        token_ids: &[i32],
+        metadata: &[SequenceGroupMetadata],
+    ) -> Result<Vec<GpuSamplerResult>> {
+        let mut results = Vec::new();
+        let mut offset = 0usize;
+
+        for group in metadata {
+            for (seq_id, seq_data) in &group.seq_data {
+                let num_tokens = if group.is_prompt {
+                    seq_data.prompt_token_ids.len()
+                } else {
+                    1
+                };
+
+                let last_idx = offset + num_tokens - 1;
+                let token_id = if last_idx < token_ids.len() {
+                    token_ids[last_idx] as u32
+                } else {
+                    warn!(
+                        seq_id = seq_id.0,
+                        token_ids_len = token_ids.len(),
+                        expected_idx = last_idx,
+                        "argmax token_ids too short, producing dummy token"
+                    );
+                    0
+                };
+
+                results.push(GpuSamplerResult {
+                    seq_id: seq_id.0,
+                    token_id,
+                    logprob: 0.0, // no logprob available in greedy fast path
+                    top_logprobs: Vec::new(),
+                });
+
+                offset += num_tokens;
             }
         }
 

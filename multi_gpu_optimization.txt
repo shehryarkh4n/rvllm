@@ -1,0 +1,380 @@
+MULTI-GPU OPTIMIZATION GUIDE: 4x/8x B200 & H200
+=================================================
+
+Maximize training speed and VRAM utilization across all GPUs,
+even when the model itself doesn't fill available memory.
+
+
+1. PARALLELISM STRATEGIES (pick based on model size vs VRAM)
+============================================================
+
+STRATEGY            WHEN TO USE                          OVERHEAD
+-----------------------------------------------------------------------
+DDP (torchrun)      Model fits in 1 GPU easily           Lowest (~2%)
+DeepSpeed ZeRO-1    Model fits but optimizer doesn't     Low (~5%)
+DeepSpeed ZeRO-2    8B+ models, gradients don't fit      Medium (~8%)
+DeepSpeed ZeRO-3    24B+ models, need CPU offload        High (~15%)
+Tensor Parallel     Single-sequence latency matters       Medium
+Sequence Parallel   Context > 32K tokens                 Medium
+FSDP                Alternative to ZeRO-2/3              Medium
+
+
+2. DDP VIA TORCHRUN (simplest, used for our 4xB200 runs)
+=========================================================
+
+Launch:
+    torchrun --nproc_per_node=4 train.py
+
+Key code changes from single-GPU:
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    model = model.to(f"cuda:{local_rank}")
+    # Do NOT wrap in DDP manually -- HF Trainer does it
+
+SFTConfig additions:
+    ddp_find_unused_parameters=True   # Required for Mistral3 (unused vision tower)
+
+Effective batch = per_device_batch * grad_accum * num_gpus
+    Single GPU:  3 * 8 * 1 = 24
+    4x GPU:      3 * 2 * 4 = 24   (reduce grad_accum proportionally)
+
+Observed performance (24B Devstral LoRA):
+    1xB200: 69s/step
+    4xB200: 18.1s/step (3.8x speedup, near-linear)
+
+
+3. DEEPSPEED CONFIGS (for larger models / longer sequences)
+============================================================
+
+--- ZeRO-1 (3B models, easiest) ---
+
+ds_config = {
+    "zero_optimization": {
+        "stage": 1,
+        "overlap_comm": True,
+        "contiguous_gradients": True,
+        "reduce_bucket_size": 5e8,
+        "allgather_bucket_size": 5e8
+    },
+    "bf16": {"enabled": True},
+    "gradient_clipping": 1.0,
+    "train_micro_batch_size_per_gpu": 8,
+    "gradient_accumulation_steps": 2
+}
+
+Launch: deepspeed --num_gpus=8 train.py --deepspeed ds_config.json
+
+
+--- ZeRO-2 (8B models, short context) ---
+
+ds_config = {
+    "zero_optimization": {
+        "stage": 2,
+        "overlap_comm": True,
+        "contiguous_gradients": True,
+        "allgather_bucket_size": 5e8
+    },
+    "bf16": {"enabled": True},
+    "gradient_clipping": 1.0,
+    "train_micro_batch_size_per_gpu": 4,
+    "gradient_accumulation_steps": 2
+}
+
+
+--- ZeRO-3 + CPU Offload (8B+ models, long context 32K+) ---
+
+ds_config = {
+    "zero_optimization": {
+        "stage": 3,
+        "offload_optimizer": {"device": "cpu", "pin_memory": True},
+        "sub_group_size": 1e9,
+        "stage3_max_live_parameters": 1e9,
+        "stage3_max_reuse_distance": 1e9,
+        "stage3_gather_16bit_weights_on_model_save": True
+    },
+    "bf16": {"enabled": True},
+    "gradient_clipping": 1.0,
+    "train_micro_batch_size_per_gpu": 1,
+    "gradient_accumulation_steps": 8
+}
+
+
+4. SEQUENCE PARALLELISM (for 64K+ context)
+==========================================
+
+DeepSpeed Ulysses splits sequences across GPUs:
+
+    from accelerate import Accelerator
+    accelerator = Accelerator(
+        deepspeed_plugin=DeepSpeedPlugin(
+            zero_stage=2,
+            gradient_accumulation_steps=8
+        )
+    )
+
+    # In SFTConfig or TrainingArguments:
+    sp_size = 8           # Split 65536-token sequence into 8192 per GPU
+    max_seq_len = 65536   # Total sequence length
+
+This is the only way to train on sequences longer than what fits
+in a single GPU's VRAM. Each GPU processes seq_len/sp_size tokens
+and all-to-all communication handles attention across chunks.
+
+Launch:
+    deepspeed --num_gpus=8 train_8b_256k.py
+
+
+5. MAXIMIZING VRAM UTILIZATION
+==============================
+
+Problem: 24B model in bf16 = 48GB. On B200 (192GB), 144GB is wasted.
+Solution: Fill the remaining VRAM with larger batches and longer sequences.
+
+--- Step 1: Enable gradient checkpointing ---
+Trades compute for memory. Recomputes activations during backward pass.
+~30% VRAM reduction, ~15% speed hit.
+
+    gradient_checkpointing=True,
+    gradient_checkpointing_kwargs={"use_reentrant": False}
+
+--- Step 2: Increase per-device batch size ---
+Each additional batch element uses ~(seq_len * hidden_dim * 4) bytes.
+For 24B model at 16384 seq_len:
+
+    B200 (192GB): batch_size=3-4 fits (with grad checkpointing)
+    H200 (141GB): batch_size=2-3 fits
+    A100 (80GB):  batch_size=1 (tight)
+
+--- Step 3: Enable packing ---
+Concatenates short examples into full seq_len sequences.
+Eliminates padding waste. Can 2-4x throughput on short-example datasets.
+
+    packing=True   # in SFTConfig
+
+--- Step 4: Increase sequence length ---
+If examples are long, increase max_seq_len to use more VRAM.
+16384 is our standard; 32768 possible on B200 with batch_size=1-2.
+
+--- Step 5: Use flash_attention_2 ---
+O(n) memory vs O(n^2) for standard attention. Required for long sequences.
+
+    attn_implementation="flash_attention_2"
+    # On B200 (sm_100): use pre-built from and-y/build-artifacts on HF
+    # On H200/A100 (sm_90): pip install flash-attn works
+
+--- Step 6: PyTorch expandable segments ---
+
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
+Allows CUDA allocator to dynamically expand. Prevents fragmentation
+on long training runs. Set before any torch import.
+
+--- Step 7: Dataloader optimization ---
+
+    dataloader_num_workers=4,
+    dataloader_pin_memory=True,
+
+Overlaps data loading with GPU compute.
+
+
+6. VRAM BUDGET TABLE
+====================
+
+Model   GPU         bf16 Weights  Optimizer(AdamW)  Activations(16K)  Total    Batch
+------  ----------  -----------   ----------------  ----------------  ------   -----
+3B      B200 192GB   6GB           12GB              ~20GB             ~38GB    8
+3B      H200 141GB   6GB           12GB              ~20GB             ~38GB    8
+8B      B200 192GB  16GB           32GB              ~40GB             ~88GB    4
+8B      H200 141GB  16GB           32GB              ~40GB             ~88GB    2-3
+24B     B200 192GB  48GB           96GB*             ~30GB             ~174GB   3**
+24B     H200 141GB  48GB           96GB*             ~30GB             ~174GB   1***
+
+* With LoRA: only ~200MB optimizer state (trainable params only)
+  Full 24B LoRA: 48GB weights + 0.2GB optimizer + 30GB activations = ~78GB
+  This is why LoRA on B200 can do batch_size=3
+
+** With gradient checkpointing + flash_attention_2
+*** Requires ZeRO-2 or gradient checkpointing
+
+
+7. MULTI-JOB GPU SPLITTING
+===========================
+
+Run independent training jobs on GPU subsets of the same machine:
+
+    # Job A: GPUs 0-3
+    deepspeed --include localhost:0,1,2,3 --master_port 29500 train_8b.py
+
+    # Job B: GPUs 4-7 (simultaneously)
+    deepspeed --include localhost:4,5,6,7 --master_port 29501 train_3b.py
+
+Or with torchrun:
+    CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 --master_port 29500 train.py
+    CUDA_VISIBLE_DEVICES=4,5,6,7 torchrun --nproc_per_node=4 --master_port 29501 train.py
+
+Critical: use different --master_port for each job (NCCL collision otherwise).
+
+
+8. INFERENCE: TENSOR PARALLEL vLLM
+====================================
+
+For serving large models across multiple GPUs:
+
+    python3 -m vllm.entrypoints.openai.api_server \
+        --model MODEL_PATH \
+        --tensor-parallel-size 4 \
+        --gpu-memory-utilization 0.90 \
+        --max-model-len 8192 \
+        --enforce-eager
+
+    # 24B on 4xA100: tp=4, each GPU holds ~12GB of model
+    # 24B on 1xB200: tp=1, fits in single GPU (48GB of 192GB)
+
+gpu_memory_utilization=0.90 means 90% of VRAM allocated for KV cache.
+Higher = more concurrent requests. 0.95 is aggressive but works.
+
+For LoRA adapter serving:
+    --enable-lora \
+    --lora-modules "adapter1=hf/repo1" "adapter2=hf/repo2" \
+    --max-lora-rank 64
+
+
+9. NCCL ENVIRONMENT TUNING
+============================
+
+For multi-GPU NCCL communication performance:
+
+    export NCCL_P2P_LEVEL=NVL          # Use NVLink when available
+    export NCCL_IB_DISABLE=0           # Enable InfiniBand (multi-node)
+    export NCCL_SOCKET_IFNAME=eth0     # Network interface for NCCL
+    export NCCL_DEBUG=WARN             # Set to INFO for debugging
+
+On B200/H200 with NVLink:
+    export NCCL_P2P_LEVEL=NVL
+    export NCCL_NET_GDR_LEVEL=SYS     # GPU Direct RDMA
+
+For single-node (most Vast.ai setups):
+    export NCCL_P2P_DISABLE=0
+    export NCCL_SHM_DISABLE=0
+
+
+10. COMPLETE LAUNCH EXAMPLES
+=============================
+
+--- 4xB200 LoRA (what we run for Devstral 24B) ---
+
+    torchrun --nproc_per_node=4 train_lora_multigpu.py \
+        --model "and-y/Devstral-Small-2-24B-Instruct-2512-bf16" \
+        --data /root/dataset/train.jsonl \
+        --output /root/output \
+        --epochs 3 --batch-size 3 --grad-accum 2 --lr 1e-5 \
+        --max-seq-len 16384 --lora-r 16 --lora-alpha 32
+
+    Effective batch: 3 * 2 * 4 = 24
+    Step time: ~18s
+    VRAM per GPU: ~78GB of 192GB
+
+
+--- 8xH200 DeepSpeed ZeRO-2 (8B LoRA) ---
+
+    deepspeed --num_gpus=8 train_8b_128k.py \
+        --model meta-llama/Llama-3.1-8B-Instruct \
+        --dataset train.jsonl \
+        --lora_r 64 --lora_alpha 128 \
+        --phase1_batch 4 --phase1_accum 2 \
+        --phase2_batch 1 --phase2_accum 8 \
+        --phase1_seq 4096 --phase2_seq 32768
+
+    Phase 1: effective batch 64, short context, fast epochs
+    Phase 2: effective batch 64, long context, extends capability
+
+
+--- 8xH200 Sequence Parallel (8B, 256K context) ---
+
+    deepspeed --num_gpus=8 train_8b_256k.py \
+        --sp_size 8 \
+        --phase2_seq 65536
+
+    Each GPU handles 65536/8 = 8192 tokens
+    All-to-all communication for cross-GPU attention
+
+
+--- Parallel eval: 8 models on 8 GPUs simultaneously ---
+
+    for GPU in 0 1 2 3 4 5 6 7; do
+        CUDA_VISIBLE_DEVICES=$GPU python3 eval.py \
+            --model /path/to/model_$GPU \
+            --port $((8900 + GPU)) &
+    done
+    wait
+
+
+11. FILLING UNUSED VRAM (when model is small for the GPU)
+==========================================================
+
+If your model only uses 40% of VRAM, don't waste the rest:
+
+Option A: Increase batch size aggressively
+    Start with batch_size=1, double until OOM, back off one step.
+    More batch = fewer steps = faster training.
+
+Option B: Increase sequence length
+    If dataset has long examples, increase max_seq_len.
+    More context per example = better model quality.
+
+Option C: Disable gradient checkpointing
+    If VRAM allows, disabling grad checkpoint = 15-20% faster.
+    Only recompute when VRAM is tight.
+
+Option D: Run multiple jobs
+    Split 8 GPUs into 2x4 and train two models simultaneously.
+    See section 7 above.
+
+Option E: Use full fine-tuning instead of LoRA
+    LoRA only trains ~0.4% of parameters.
+    Full fine-tune uses 3x more VRAM (optimizer states for all params)
+    but may produce better results for domain-specific tasks.
+
+Option F: Larger LoRA rank
+    r=16 uses ~100M trainable params (24B model)
+    r=64 uses ~400M trainable params
+    r=128 uses ~800M trainable params
+    More trainable params = more VRAM for optimizer states = better VRAM usage
+
+
+12. B200-SPECIFIC NOTES
+========================
+
+- sm_100 architecture: needs pre-built flash-attn (and-y/build-artifacts on HF)
+  or compile from source (~1hr). PyPI wheel does NOT work.
+- PyTorch cu128 nightly required (stable 2.5.x lacks sm_100)
+- Python 3.11 (matches pre-built flash-attn wheel)
+- bitsandbytes does NOT work (no sm_100 kernels). Use bf16 full precision.
+- 192GB HBM3e per GPU = 768GB total on 4xB200
+- Use uv for all package management (not pip)
+- NVLink bandwidth: 1.8 TB/s (4xB200), near-zero DDP overhead
+
+
+13. H200-SPECIFIC NOTES
+========================
+
+- sm_90a architecture: flash-attn from PyPI works
+- 141GB HBM3 per GPU = 1.13TB total on 8xH200
+- Supports INT8/FP8 quantization via bitsandbytes
+- Standard PyTorch stable works (2.4+)
+- NVLink bandwidth varies by provider (check nvidia-smi topo -m)
+
+
+14. QUICK REFERENCE: WHAT TO USE WHEN
+=======================================
+
+| Scenario                      | Strategy              | Launch Command              |
+|-------------------------------|-----------------------|-----------------------------|
+| 24B LoRA, 4xB200              | DDP (torchrun)        | torchrun --nproc=4          |
+| 24B LoRA, 8xH200              | DDP or ZeRO-1         | torchrun --nproc=8          |
+| 8B LoRA, short ctx, 8xH200    | ZeRO-2                | deepspeed --num_gpus=8      |
+| 8B LoRA, 64K ctx, 8xH200      | ZeRO-3 + SP           | deepspeed --num_gpus=8      |
+| 3B LoRA, any ctx, 8xH200      | ZeRO-1                | deepspeed --num_gpus=8      |
+| 2 models simultaneously       | GPU splitting         | --include localhost:0,1,2,3 |
+| 24B inference, 4xA100          | vLLM TP               | --tensor-parallel-size 4    |
+| 24B inference, 1xB200          | vLLM single           | --tensor-parallel-size 1    |
+| Eval: 8 models, 8 GPUs        | 1 model per GPU       | CUDA_VISIBLE_DEVICES loop   |

@@ -10,6 +10,15 @@
 // =========================================================================
 //  CUDA implementation
 // =========================================================================
+/// Output of a forward pass -- either full logits or just argmax token IDs.
+#[derive(Debug, Clone)]
+pub enum ForwardOutput {
+    /// Full logits buffer: [num_tokens * vocab_size] f32.
+    Logits(Vec<f32>),
+    /// GPU-side argmax token IDs: [num_tokens] i32 (greedy fast path).
+    TokenIds(Vec<i32>),
+}
+
 #[cfg(feature = "cuda")]
 mod cuda_impl {
     use std::sync::Arc;
@@ -27,6 +36,8 @@ mod cuda_impl {
     use rvllm_gpu::prelude::CublasHandle;
     use rvllm_kv_cache::engine_cuda::CudaCacheEngine;
     use rvllm_model_loader::gpu_weights::GpuModelWeights;
+
+    use super::ForwardOutput;
 
     pub struct GpuModelRunner {
         weights: GpuModelWeights,
@@ -143,6 +154,23 @@ mod cuda_impl {
             attn_meta: &crate::bridge::AttentionMetadata,
             is_prefill: bool,
         ) -> Result<Vec<f32>> {
+            match self.forward_ex(token_ids, positions, attn_meta, is_prefill, false)? {
+                ForwardOutput::Logits(logits) => Ok(logits),
+                ForwardOutput::TokenIds(_) => unreachable!("greedy_only=false must return Logits"),
+            }
+        }
+
+        /// Extended forward: when `greedy_only` is true, runs argmax on GPU and
+        /// returns only token IDs (num_tokens * 4 bytes DtoH instead of
+        /// num_tokens * vocab_size * 4 bytes).
+        pub fn forward_ex(
+            &self,
+            token_ids: &[u32],
+            positions: &[u32],
+            attn_meta: &crate::bridge::AttentionMetadata,
+            is_prefill: bool,
+            greedy_only: bool,
+        ) -> Result<ForwardOutput> {
             let num_tokens = token_ids.len();
             let num_seqs = attn_meta.context_lens.len();
             let hidden_size = self.config.hidden_size;
@@ -153,7 +181,7 @@ mod cuda_impl {
                 return Err(LLMError::ModelError("empty input".into()));
             }
 
-            debug!(num_tokens, num_seqs, is_prefill, "GpuModelRunner::forward");
+            debug!(num_tokens, num_seqs, is_prefill, greedy_only, "GpuModelRunner::forward_ex");
 
             // Upload positions to GPU as i32 (CUDA kernels expect int*)
             let pos_i32: Vec<i32> = positions.iter().map(|&p| p as i32).collect();
@@ -252,7 +280,22 @@ mod cuda_impl {
                 &self.blas,
             )?;
 
-            // Step 5: DtoH
+            // Step 5: greedy fast path -- argmax on GPU, copy only token IDs
+            if greedy_only {
+                let token_ids_gpu = self.gpu_argmax(&logits_gpu, num_tokens, vocab_size)?;
+                let token_ids_cpu = self
+                    .device
+                    .dtoh_sync_copy(&token_ids_gpu)
+                    .map_err(|e| LLMError::GpuError(format!("argmax token_ids DtoH: {e}")))?;
+                debug!(
+                    num_tokens,
+                    "forward_ex complete (greedy, {} bytes DtoH)",
+                    num_tokens * 4
+                );
+                return Ok(ForwardOutput::TokenIds(token_ids_cpu));
+            }
+
+            // Step 5 (fallback): full logits DtoH for temperature>0 sampling
             let logits_cpu = self
                 .device
                 .dtoh_sync_copy(&logits_gpu)
@@ -261,9 +304,49 @@ mod cuda_impl {
             debug!(
                 logits_len = logits_cpu.len(),
                 expected = num_tokens * vocab_size,
-                "forward complete"
+                "forward_ex complete (full logits)"
             );
-            Ok(logits_cpu)
+            Ok(ForwardOutput::Logits(logits_cpu))
+        }
+
+        /// Launch argmax kernel on GPU, returning [num_tokens] i32 token IDs.
+        fn gpu_argmax(
+            &self,
+            logits_gpu: &CudaSlice<f32>,
+            num_tokens: usize,
+            vocab_size: usize,
+        ) -> Result<CudaSlice<i32>> {
+            let kernel = self
+                .device
+                .get_func("argmax", "argmax_kernel")
+                .ok_or_else(|| LLMError::GpuError("argmax_kernel not loaded".into()))?;
+
+            let output: CudaSlice<i32> = self
+                .device
+                .alloc_zeros::<i32>(num_tokens)
+                .map_err(|e| LLMError::GpuError(format!("argmax alloc: {e}")))?;
+
+            let block_dim = vocab_size.min(1024) as u32;
+            let cfg = cudarc::driver::LaunchConfig {
+                grid_dim: (num_tokens as u32, 1, 1),
+                block_dim: (block_dim, 1, 1),
+                shared_mem_bytes: 0,
+            };
+
+            unsafe {
+                kernel
+                    .launch(
+                        cfg,
+                        (
+                            logits_gpu,
+                            &output,
+                            vocab_size as i32,
+                        ),
+                    )
+                    .map_err(|e| LLMError::GpuError(format!("argmax_kernel launch: {e}")))?;
+            }
+
+            Ok(output)
         }
 
         /// Per-layer weight references into the GPU weight map.
@@ -367,6 +450,7 @@ pub use cuda_impl::GpuModelRunner;
 mod mock_impl {
     use crate::bridge::{LLMError, Result};
     use crate::runner::ModelRunnerConfig;
+    use super::ForwardOutput;
 
     /// Stub GpuModelRunner for non-CUDA builds.
     ///
@@ -385,6 +469,19 @@ mod mock_impl {
             _attn_meta: &crate::bridge::AttentionMetadata,
             _is_prefill: bool,
         ) -> Result<Vec<f32>> {
+            Err(LLMError::GpuError(
+                "GpuModelRunner requires the `cuda` feature".into(),
+            ))
+        }
+
+        pub fn forward_ex(
+            &self,
+            _token_ids: &[u32],
+            _positions: &[u32],
+            _attn_meta: &crate::bridge::AttentionMetadata,
+            _is_prefill: bool,
+            _greedy_only: bool,
+        ) -> Result<ForwardOutput> {
             Err(LLMError::GpuError(
                 "GpuModelRunner requires the `cuda` feature".into(),
             ))
