@@ -849,126 +849,26 @@ impl GpuWorker {
     /// Real GPU forward pass: tries CUDA graph replay for decode steps,
     /// falls back to normal forward, and captures graphs after warmup.
     fn gpu_forward(&mut self, model_input: &ModelInput) -> Result<Vec<f32>> {
-        self.forward_count += 1;
-
-        // Try graph replay for eligible decode steps.
-        if self.graph_runner.can_use_graph(model_input) {
-            let (padded_input, actual_batch) = self.graph_runner.pad_input(model_input)?;
-            let replayed = self
-                .graph_runner
-                .try_replay(&self.compute_stream, actual_batch)?;
-            if replayed {
-                debug!(actual_batch, "CUDA graph replayed, unpadding logits");
-                let padded_logits = self.raw_gpu_forward(&padded_input)?;
-                return Ok(self.graph_runner.unpad_logits(&padded_logits, actual_batch));
-            }
+        match self.gpu_forward_ex(model_input, false)? {
+            ForwardOutput::Logits(logits) => Ok(logits),
+            ForwardOutput::TokenIds(_) => unreachable!("greedy_only=false must return Logits"),
         }
-
-        // Normal forward pass.
-        let logits = self.raw_gpu_forward(model_input)?;
-
-        // After warmup, capture a graph for this decode batch size if not yet captured.
-        if self.forward_count > Self::GRAPH_WARMUP_CALLS
-            && !model_input.is_prefill
-            && self.graph_runner.can_use_graph(model_input)
-        {
-            let (padded_input, _actual_batch) = self.graph_runner.pad_input(model_input)?;
-            let padded_bs = padded_input.num_tokens();
-            if !self.graph_runner.was_capture_attempted(padded_bs) {
-                info!(padded_bs, "capturing CUDA graph after warmup");
-                // Split borrow: take references to disjoint fields so the closure
-                // doesn't conflict with &mut graph_runner.
-                #[cfg(feature = "cuda")]
-                {
-                    let gpu_runner = self.gpu_model_runner.as_ref();
-                    let capture_result =
-                        self.graph_runner
-                            .capture_graph(&self.compute_stream, padded_bs, || {
-                                let runner = gpu_runner.ok_or_else(|| {
-                                    LLMError::GpuError("GPU model runner not initialized".into())
-                                })?;
-                                let _ = runner.forward(
-                                    &padded_input.token_ids,
-                                    &padded_input.position_ids,
-                                    &padded_input.attention_metadata,
-                                    padded_input.is_prefill,
-                                )?;
-                                Ok(())
-                            });
-                    if let Err(e) = capture_result {
-                        warn!(%e, "CUDA graph capture failed, continuing without graph");
-                    }
-                }
-            }
-        }
-
-        Ok(logits)
     }
 
-    /// Extended GPU forward with greedy fast path. When `greedy_only` is true and
-    /// CUDA graphs are not replaying, runs argmax on GPU and returns only token IDs.
-    /// Falls back to full logits when graph replay is active (graph captured with
-    /// full logits path).
+    /// Extended GPU forward with greedy fast path.
+    ///
+    /// CUDA graph capture/replay is disabled: the model runner allocates fresh
+    /// GPU buffers each forward call, so captured graphs write to stale device
+    /// pointers on replay. Fixing this requires persistent buffer management
+    /// throughout the forward pass (pre-allocated hidden states, logits, QKV
+    /// buffers reused across calls). This is the #1 performance gap vs vLLM.
     fn gpu_forward_ex(
         &mut self,
         model_input: &ModelInput,
         greedy_only: bool,
     ) -> Result<ForwardOutput> {
         self.forward_count += 1;
-
-        // Try graph replay for eligible decode steps -- graph path always
-        // returns full logits since it was captured with the standard forward.
-        if self.graph_runner.can_use_graph(model_input) {
-            let (padded_input, actual_batch) = self.graph_runner.pad_input(model_input)?;
-            let replayed = self
-                .graph_runner
-                .try_replay(&self.compute_stream, actual_batch)?;
-            if replayed {
-                debug!(actual_batch, "CUDA graph replayed, unpadding logits");
-                let padded_logits = self.raw_gpu_forward(&padded_input)?;
-                let logits = self.graph_runner.unpad_logits(&padded_logits, actual_batch);
-                return Ok(ForwardOutput::Logits(logits));
-            }
-        }
-
-        // Normal forward pass with optional greedy argmax on GPU.
-        let output = self.raw_gpu_forward_ex(model_input, greedy_only)?;
-
-        // After warmup, capture a graph for this decode batch size if not yet captured.
-        // Graph capture always uses the standard (non-greedy) forward.
-        if self.forward_count > Self::GRAPH_WARMUP_CALLS
-            && !model_input.is_prefill
-            && self.graph_runner.can_use_graph(model_input)
-        {
-            let (padded_input, _actual_batch) = self.graph_runner.pad_input(model_input)?;
-            let padded_bs = padded_input.num_tokens();
-            if !self.graph_runner.was_capture_attempted(padded_bs) {
-                info!(padded_bs, "capturing CUDA graph after warmup");
-                #[cfg(feature = "cuda")]
-                {
-                    let gpu_runner = self.gpu_model_runner.as_ref();
-                    let capture_result =
-                        self.graph_runner
-                            .capture_graph(&self.compute_stream, padded_bs, || {
-                                let runner = gpu_runner.ok_or_else(|| {
-                                    LLMError::GpuError("GPU model runner not initialized".into())
-                                })?;
-                                let _ = runner.forward(
-                                    &padded_input.token_ids,
-                                    &padded_input.position_ids,
-                                    &padded_input.attention_metadata,
-                                    padded_input.is_prefill,
-                                )?;
-                                Ok(())
-                            });
-                    if let Err(e) = capture_result {
-                        warn!(%e, "CUDA graph capture failed, continuing without graph");
-                    }
-                }
-            }
-        }
-
-        Ok(output)
+        self.raw_gpu_forward_ex(model_input, greedy_only)
     }
 
     /// Legacy CPU forward pass (kept for comparison benchmarks only, not used in production).
