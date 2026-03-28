@@ -363,6 +363,15 @@ impl GpuWorker {
 
         info!(device_id, "GpuWorker CUDA resources initialized");
 
+        // Resolve Dtype::Auto based on GPU compute capability
+        let mut config = config;
+        if config.dtype.is_auto() {
+            let devices = rvllm_gpu::device::list_devices();
+            let sm_major = devices.first().map(|d| d.compute_capability.0).unwrap_or(8);
+            config.dtype = config.dtype.resolve(sm_major);
+            info!(dtype = %config.dtype, sm_major, "resolved dtype from Auto");
+        }
+
         let use_fp8_kv = matches!(
             config.kv_cache_dtype.to_lowercase().as_str(),
             "fp8" | "fp8_e4m3"
