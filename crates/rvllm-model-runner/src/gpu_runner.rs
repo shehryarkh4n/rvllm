@@ -112,9 +112,23 @@ mod cuda_impl {
         meta_block_tables: RefCell<ReusableGpuBuf>,
         meta_slot_mapping: RefCell<ReusableGpuBuf>,
         meta_seq_start_pos: RefCell<ReusableGpuBuf>,
+        /// Pre-allocated GPU buffer for token IDs (embedding lookup input).
+        /// Using a persistent buffer ensures the GPU pointer is stable across
+        /// forward calls, which is required for CUDA graph capture/replay.
+        meta_token_ids: RefCell<ReusableGpuBuf>,
+        /// Persistent GPU output buffer for CUDA graph capture/replay.
+        /// Stores the argmax token IDs from the last forward pass. The graph
+        /// writes to this buffer's stable pointer; after replay we DtoH copy
+        /// from here to read updated results.
+        graph_output: RefCell<Option<CudaSlice<i32>>>,
         /// Reusable CPU scratch buffer for packing metadata (avoids per-step
         /// heap allocations for the common small-batch decode case).
         cpu_scratch: RefCell<Vec<i32>>,
+        /// Fixed max blocks per sequence for CUDA graph capture/replay.
+        /// Computed as ceil(max_position / block_size) so the block_tables
+        /// stride is constant across all forward calls, preventing stale
+        /// scalar kernel args when a graph is replayed.
+        graph_max_blocks: usize,
     }
 
     impl GpuModelRunner {
@@ -192,6 +206,11 @@ mod cuda_impl {
                 .map_err(|e| LLMError::GpuError(format!("rope sin HtoD: {e}")))?;
             info!(max_pos, half_dim, "RoPE tables uploaded to GPU");
 
+            let block_size = cache.block_size();
+            let graph_max_blocks = (config.max_position + block_size - 1) / block_size;
+            info!(graph_max_blocks, block_size, max_position = config.max_position,
+                  "fixed block_tables stride for CUDA graph stability");
+
             Ok(Self {
                 weights,
                 cache,
@@ -213,7 +232,10 @@ mod cuda_impl {
                 meta_block_tables: RefCell::new(ReusableGpuBuf::new()),
                 meta_slot_mapping: RefCell::new(ReusableGpuBuf::new()),
                 meta_seq_start_pos: RefCell::new(ReusableGpuBuf::new()),
+                meta_token_ids: RefCell::new(ReusableGpuBuf::new()),
+                graph_output: RefCell::new(None),
                 cpu_scratch: RefCell::new(Vec::with_capacity(4096)),
+                graph_max_blocks,
             })
         }
 
@@ -257,13 +279,9 @@ mod cuda_impl {
             // On the decode hot path, buffer sizes are stable so this is pure
             // memcpy_htod with zero CUDA malloc/free. The CPU scratch vec is
             // also reused to avoid per-step heap allocations.
-            let max_blocks = attn_meta
-                .block_tables
-                .iter()
-                .map(|r| r.len())
-                .max()
-                .unwrap_or(1)
-                .max(1);
+            // Use fixed stride for block_tables so the layout matches what
+            // CUDA graph kernels expect (p_max_blocks is baked as a scalar).
+            let max_blocks = self.graph_max_blocks;
             let max_context_len = attn_meta.max_context_len;
 
             {
@@ -281,7 +299,7 @@ mod cuda_impl {
                 self.meta_context_lens.borrow_mut().upload(&scratch, &self.stream)
                     .map_err(|e| LLMError::GpuError(format!("context_lens HtoD: {e}")))?;
 
-                // block_tables flattened [num_seqs, max_blocks_per_seq] (i32)
+                // block_tables flattened [num_seqs, graph_max_blocks] (i32)
                 scratch.clear();
                 scratch.resize(num_seqs * max_blocks, 0i32);
                 for (s, row) in attn_meta.block_tables.iter().enumerate() {
@@ -440,6 +458,367 @@ mod cuda_impl {
                 "forward_ex complete (full logits)"
             );
             Ok(ForwardOutput::Logits(logits_cpu))
+        }
+
+        /// Upload all per-step metadata into persistent GPU buffers.
+        ///
+        /// This MUST be called before `forward_graph_body` (or before replaying
+        /// a captured CUDA graph). The memcpy_htod calls update the data at
+        /// stable GPU pointers that the graph's kernels will read.
+        pub fn upload_metadata(
+            &self,
+            token_ids: &[u32],
+            positions: &[u32],
+            attn_meta: &crate::bridge::AttentionMetadata,
+        ) -> Result<()> {
+            let num_tokens = token_ids.len();
+            let num_seqs = attn_meta.context_lens.len();
+            // Use the fixed max_blocks stride so that block_tables.len()/num_seqs
+            // is always the same value. This is critical for CUDA graph replay:
+            // the attention kernel receives p_max_blocks as a scalar arg baked
+            // into the graph, and the data layout must match that stride.
+            let max_blocks = self.graph_max_blocks;
+
+            let mut scratch = self.cpu_scratch.borrow_mut();
+
+            // token_ids (i32)
+            scratch.clear();
+            scratch.extend(token_ids.iter().map(|&t| t as i32));
+            self.meta_token_ids.borrow_mut().upload(&scratch, &self.stream)
+                .map_err(|e| LLMError::GpuError(format!("token_ids HtoD: {e}")))?;
+
+            // positions (i32)
+            scratch.clear();
+            scratch.extend(positions.iter().map(|&p| p as i32));
+            self.meta_positions.borrow_mut().upload(&scratch, &self.stream)
+                .map_err(|e| LLMError::GpuError(format!("positions HtoD: {e}")))?;
+
+            // context_lens (i32)
+            scratch.clear();
+            scratch.extend(attn_meta.context_lens.iter().map(|&c| c as i32));
+            self.meta_context_lens.borrow_mut().upload(&scratch, &self.stream)
+                .map_err(|e| LLMError::GpuError(format!("context_lens HtoD: {e}")))?;
+
+            // block_tables flattened [num_seqs, graph_max_blocks] (i32)
+            // Always padded to fixed stride for CUDA graph pointer stability.
+            scratch.clear();
+            scratch.resize(num_seqs * max_blocks, 0i32);
+            for (s, row) in attn_meta.block_tables.iter().enumerate() {
+                for (b, &blk) in row.iter().enumerate() {
+                    scratch[s * max_blocks + b] = blk as i32;
+                }
+            }
+            self.meta_block_tables.borrow_mut().upload(&scratch, &self.stream)
+                .map_err(|e| LLMError::GpuError(format!("block_tables HtoD: {e}")))?;
+
+            // slot_mapping (i32)
+            scratch.clear();
+            scratch.extend(attn_meta.slot_mapping.iter().map(|&s| s as i32));
+            self.meta_slot_mapping.borrow_mut().upload(&scratch, &self.stream)
+                .map_err(|e| LLMError::GpuError(format!("slot_mapping HtoD: {e}")))?;
+
+            // seq_start_pos from query_lens [num_seqs + 1] (i32)
+            scratch.clear();
+            let mut pos = 0i32;
+            for &ql in &attn_meta.query_lens {
+                scratch.push(pos);
+                pos += ql as i32;
+            }
+            scratch.push(num_tokens as i32);
+            self.meta_seq_start_pos.borrow_mut().upload(&scratch, &self.stream)
+                .map_err(|e| LLMError::GpuError(format!("seq_start_pos HtoD: {e}")))?;
+
+            Ok(())
+        }
+
+        /// Run the forward pass using already-uploaded metadata buffers.
+        ///
+        /// Call `upload_metadata()` first. This method does NOT upload metadata --
+        /// it reads from the persistent GPU buffers populated by upload_metadata.
+        /// This separation is required for CUDA graph capture: the uploads happen
+        /// outside the graph, the forward pass is captured into the graph.
+        pub fn forward_graph_body(
+            &self,
+            num_tokens: usize,
+            num_seqs: usize,
+            max_context_len: u32,
+            is_prefill: bool,
+            greedy_only: bool,
+        ) -> Result<ForwardOutput> {
+            let hidden_size = self.config.hidden_size;
+            let vocab_size = self.config.vocab_size;
+            let block_size = self.cache.block_size();
+
+            if num_tokens == 0 {
+                return Err(LLMError::ModelError("empty input".into()));
+            }
+
+            let meta_pos = self.meta_positions.borrow();
+            let meta_cl = self.meta_context_lens.borrow();
+            let meta_bt = self.meta_block_tables.borrow();
+            let meta_sm = self.meta_slot_mapping.borrow();
+            let meta_ssp = self.meta_seq_start_pos.borrow();
+
+            // Step 1: token embedding lookup from persistent buffer
+            let mut hidden_states = self.embedding_lookup_from_meta(num_tokens)?;
+
+            // Step 2: transformer layers
+            let gpu_cache = self.cache.gpu_cache();
+            let num_layers = self.layers.len();
+            for (layer_idx, layer) in self.layers.iter().enumerate() {
+                if layer_idx == 0 || layer_idx == num_layers - 1 {
+                    trace!(layer = layer_idx, use_fp16 = self.use_fp16, "gpu_runner graph body: layer");
+                }
+                let (key_cache, value_cache) = &gpu_cache[layer_idx];
+                let input = GpuLayerInput {
+                    hidden_states: &hidden_states,
+                    positions: meta_pos.slice(),
+                    key_cache,
+                    value_cache,
+                    block_tables: meta_bt.slice(),
+                    context_lens: meta_cl.slice(),
+                    slot_mapping: meta_sm.slice(),
+                    num_tokens,
+                    num_seqs,
+                    max_context_len,
+                    block_size,
+                    is_prefill,
+                    seq_start_pos: meta_ssp.slice(),
+                    rope_cos: &self.rope_cos,
+                    rope_sin: &self.rope_sin,
+                };
+                hidden_states = if self.use_fp16 {
+                    let weights = self.layer_weights_f16(layer_idx)?;
+                    layer.forward_f16(&input, &weights, &self.blas)?
+                } else {
+                    let weights = self.layer_weights(layer_idx)?;
+                    layer.forward(&input, &weights, &self.blas)?
+                };
+            }
+
+            // Step 3: final RMSNorm
+            let normed = CudaRMSNorm::forward(
+                &hidden_states,
+                &self.final_norm_weight,
+                self.rms_norm_eps,
+                hidden_size,
+                &self.loader,
+                &self.stream,
+            )?;
+
+            // Step 4+5: fused LM-head + argmax for single-token greedy decode
+            if num_tokens == 1 && greedy_only {
+                let token_ids_gpu = if self.use_fp16 {
+                    let lm_f16 = self
+                        .weights
+                        .get_f16("lm_head.weight")
+                        .or_else(|| self.weights.get_f16("model.embed_tokens.weight"));
+                    if let Some(lm_w) = lm_f16 {
+                        self.gpu_fused_lm_head_argmax_f16(&normed, lm_w, vocab_size, hidden_size)?
+                    } else {
+                        self.gpu_fused_lm_head_argmax(&normed, &self.lm_head_weight, vocab_size, hidden_size)?
+                    }
+                } else {
+                    self.gpu_fused_lm_head_argmax(&normed, &self.lm_head_weight, vocab_size, hidden_size)?
+                };
+                let token_ids_cpu = self
+                    .stream
+                    .clone_dtoh(&token_ids_gpu)
+                    .map_err(|e| LLMError::GpuError(format!("fused_lm_head token DtoH: {e}")))?;
+                return Ok(ForwardOutput::TokenIds(token_ids_cpu));
+            }
+
+            // Step 4: LM head
+            let logits_gpu = if self.use_fp16 {
+                let lm_f16 = self
+                    .weights
+                    .get_f16("lm_head.weight")
+                    .or_else(|| self.weights.get_f16("model.embed_tokens.weight"));
+                if let Some(lm_w) = lm_f16 {
+                    CudaLinearLayer::forward_once_f16(
+                        &normed, lm_w, num_tokens, vocab_size, hidden_size, &self.blas, &self.loader,
+                    )?
+                } else {
+                    CudaLinearLayer::forward_once(
+                        &normed, &self.lm_head_weight, None,
+                        num_tokens, vocab_size, hidden_size, &self.blas,
+                    )?
+                }
+            } else {
+                CudaLinearLayer::forward_once(
+                    &normed, &self.lm_head_weight, None,
+                    num_tokens, vocab_size, hidden_size, &self.blas,
+                )?
+            };
+
+            // Step 5: greedy fast path
+            if greedy_only {
+                let token_ids_gpu = self.gpu_argmax(&logits_gpu, num_tokens, vocab_size)?;
+                let token_ids_cpu = self
+                    .stream
+                    .clone_dtoh(&token_ids_gpu)
+                    .map_err(|e| LLMError::GpuError(format!("argmax DtoH: {e}")))?;
+                return Ok(ForwardOutput::TokenIds(token_ids_cpu));
+            }
+
+            // Full logits DtoH
+            let logits_cpu = self
+                .stream
+                .clone_dtoh(&logits_gpu)
+                .map_err(|e| LLMError::GpuError(format!("logits DtoH: {e}")))?;
+            Ok(ForwardOutput::Logits(logits_cpu))
+        }
+
+        /// Get a reference to the CUDA stream used by this runner.
+        pub fn cuda_stream(&self) -> &Arc<CudaStream> {
+            &self.stream
+        }
+
+        /// GPU-only forward pass for CUDA graph capture.
+        ///
+        /// Runs the full forward pass (embedding -> layers -> norm -> argmax)
+        /// writing the argmax result into the persistent `graph_output` buffer.
+        /// Does NOT do any DtoH copy, so this is safe to capture in a CUDA graph.
+        ///
+        /// Call `upload_metadata()` first. After this, call `read_graph_output()`
+        /// to get the host-side token IDs.
+        pub fn forward_gpu_only(
+            &self,
+            num_tokens: usize,
+            num_seqs: usize,
+            max_context_len: u32,
+            is_prefill: bool,
+        ) -> Result<()> {
+            let hidden_size = self.config.hidden_size;
+            let vocab_size = self.config.vocab_size;
+            let block_size = self.cache.block_size();
+
+            if num_tokens == 0 {
+                return Err(LLMError::ModelError("empty input".into()));
+            }
+
+            let meta_pos = self.meta_positions.borrow();
+            let meta_cl = self.meta_context_lens.borrow();
+            let meta_bt = self.meta_block_tables.borrow();
+            let meta_sm = self.meta_slot_mapping.borrow();
+            let meta_ssp = self.meta_seq_start_pos.borrow();
+
+            // Step 1: token embedding lookup from persistent buffer
+            let mut hidden_states = self.embedding_lookup_from_meta(num_tokens)?;
+
+            // Step 2: transformer layers
+            let gpu_cache = self.cache.gpu_cache();
+            let num_layers = self.layers.len();
+            for (layer_idx, layer) in self.layers.iter().enumerate() {
+                let (key_cache, value_cache) = &gpu_cache[layer_idx];
+                let input = GpuLayerInput {
+                    hidden_states: &hidden_states,
+                    positions: meta_pos.slice(),
+                    key_cache,
+                    value_cache,
+                    block_tables: meta_bt.slice(),
+                    context_lens: meta_cl.slice(),
+                    slot_mapping: meta_sm.slice(),
+                    num_tokens,
+                    num_seqs,
+                    max_context_len,
+                    block_size,
+                    is_prefill,
+                    seq_start_pos: meta_ssp.slice(),
+                    rope_cos: &self.rope_cos,
+                    rope_sin: &self.rope_sin,
+                };
+                hidden_states = if self.use_fp16 {
+                    let weights = self.layer_weights_f16(layer_idx)?;
+                    layer.forward_f16(&input, &weights, &self.blas)?
+                } else {
+                    let weights = self.layer_weights(layer_idx)?;
+                    layer.forward(&input, &weights, &self.blas)?
+                };
+            }
+
+            // Step 3: final RMSNorm
+            let normed = CudaRMSNorm::forward(
+                &hidden_states,
+                &self.final_norm_weight,
+                self.rms_norm_eps,
+                hidden_size,
+                &self.loader,
+                &self.stream,
+            )?;
+
+            // Step 4+5: fused LM-head + argmax into persistent output buffer
+            let token_ids_gpu = if num_tokens == 1 {
+                if self.use_fp16 {
+                    let lm_f16 = self
+                        .weights
+                        .get_f16("lm_head.weight")
+                        .or_else(|| self.weights.get_f16("model.embed_tokens.weight"));
+                    if let Some(lm_w) = lm_f16 {
+                        self.gpu_fused_lm_head_argmax_f16(&normed, lm_w, vocab_size, hidden_size)?
+                    } else {
+                        self.gpu_fused_lm_head_argmax(&normed, &self.lm_head_weight, vocab_size, hidden_size)?
+                    }
+                } else {
+                    self.gpu_fused_lm_head_argmax(&normed, &self.lm_head_weight, vocab_size, hidden_size)?
+                }
+            } else {
+                // Multi-token: full LM head then argmax
+                let logits_gpu = if self.use_fp16 {
+                    let lm_f16 = self
+                        .weights
+                        .get_f16("lm_head.weight")
+                        .or_else(|| self.weights.get_f16("model.embed_tokens.weight"));
+                    if let Some(lm_w) = lm_f16 {
+                        CudaLinearLayer::forward_once_f16(
+                            &normed, lm_w, num_tokens, vocab_size, hidden_size,
+                            &self.blas, &self.loader,
+                        )?
+                    } else {
+                        CudaLinearLayer::forward_once(
+                            &normed, &self.lm_head_weight, None,
+                            num_tokens, vocab_size, hidden_size, &self.blas,
+                        )?
+                    }
+                } else {
+                    CudaLinearLayer::forward_once(
+                        &normed, &self.lm_head_weight, None,
+                        num_tokens, vocab_size, hidden_size, &self.blas,
+                    )?
+                };
+                self.gpu_argmax(&logits_gpu, num_tokens, vocab_size)?
+            };
+
+            // Copy argmax result into the persistent output buffer.
+            // On first call this allocates; on subsequent calls with the same
+            // num_tokens it reuses the same GPU pointer (crucial for graph replay).
+            let mut out = self.graph_output.borrow_mut();
+            let need = num_tokens;
+            let have = out.as_ref().map_or(0, |b| b.len());
+            if have < need {
+                *out = Some(self.stream.alloc_zeros::<i32>(need)
+                    .map_err(|e| LLMError::GpuError(format!("graph_output alloc: {e}")))?);
+            }
+            let dst = out.as_mut().unwrap();
+            self.stream.memcpy_dtod(&token_ids_gpu, dst)
+                .map_err(|e| LLMError::GpuError(format!("graph_output dtod: {e}")))?;
+
+            Ok(())
+        }
+
+        /// Read the argmax token IDs from the persistent graph output buffer.
+        ///
+        /// Call after `forward_gpu_only()` or after replaying a CUDA graph.
+        /// This performs a DtoH copy (outside the graph).
+        pub fn read_graph_output(&self, num_tokens: usize) -> Result<Vec<i32>> {
+            let out = self.graph_output.borrow();
+            let buf = out.as_ref().ok_or_else(|| {
+                LLMError::GpuError("graph_output not populated -- call forward_gpu_only first".into())
+            })?;
+            // Copy only the needed elements
+            let full = self.stream.clone_dtoh(buf)
+                .map_err(|e| LLMError::GpuError(format!("graph_output DtoH: {e}")))?;
+            Ok(full[..num_tokens].to_vec())
         }
 
         /// Launch argmax kernel on GPU, returning [num_tokens] i32 token IDs.
@@ -651,7 +1030,20 @@ mod cuda_impl {
         }
 
         fn embedding_lookup(&self, token_ids: &[u32]) -> Result<CudaSlice<f32>> {
-            let num_tokens = token_ids.len();
+            // Upload token IDs into persistent buffer (stable pointer for graph replay).
+            {
+                let mut scratch = self.cpu_scratch.borrow_mut();
+                scratch.clear();
+                scratch.extend(token_ids.iter().map(|&t| t as i32));
+                self.meta_token_ids.borrow_mut().upload(&scratch, &self.stream)
+                    .map_err(|e| LLMError::GpuError(format!("token_ids HtoD: {e}")))?;
+            }
+            self.embedding_lookup_from_meta(token_ids.len())
+        }
+
+        /// Embedding lookup using the pre-uploaded token IDs in meta_token_ids.
+        /// Call upload_metadata() first to populate the buffer.
+        fn embedding_lookup_from_meta(&self, num_tokens: usize) -> Result<CudaSlice<f32>> {
             let hidden_size = self.config.hidden_size;
 
             let kernel = self
@@ -663,11 +1055,7 @@ mod cuda_impl {
                 .alloc_zeros::<f32>(num_tokens * hidden_size)
                 .map_err(|e| LLMError::GpuError(format!("embed alloc: {e}")))?;
 
-            let ids_i32: Vec<i32> = token_ids.iter().map(|&t| t as i32).collect();
-            let ids_gpu = self
-                .stream
-                .clone_htod(&ids_i32)
-                .map_err(|e| LLMError::GpuError(format!("token_ids HtoD: {e}")))?;
+            let meta_tid = self.meta_token_ids.borrow();
 
             let block_dim = hidden_size.min(1024) as u32;
             let cfg = LaunchConfig {
@@ -681,7 +1069,7 @@ mod cuda_impl {
                     .launch_builder(&kernel)
                     .arg(&output)
                     .arg(&self.embed_tokens)
-                    .arg(&ids_gpu)
+                    .arg(meta_tid.slice())
                     .arg(&(hidden_size as i32))
                     .arg(&(self.config.vocab_size as i32))
                     .launch(cfg)
@@ -805,6 +1193,48 @@ mod mock_impl {
 
         pub fn config(&self) -> &ModelRunnerConfig {
             &self.config
+        }
+
+        pub fn upload_metadata(
+            &self,
+            _token_ids: &[u32],
+            _positions: &[u32],
+            _attn_meta: &crate::bridge::AttentionMetadata,
+        ) -> Result<()> {
+            Err(LLMError::GpuError(
+                "GpuModelRunner requires the `cuda` feature".into(),
+            ))
+        }
+
+        pub fn forward_graph_body(
+            &self,
+            _num_tokens: usize,
+            _num_seqs: usize,
+            _max_context_len: u32,
+            _is_prefill: bool,
+            _greedy_only: bool,
+        ) -> Result<ForwardOutput> {
+            Err(LLMError::GpuError(
+                "GpuModelRunner requires the `cuda` feature".into(),
+            ))
+        }
+
+        pub fn forward_gpu_only(
+            &self,
+            _num_tokens: usize,
+            _num_seqs: usize,
+            _max_context_len: u32,
+            _is_prefill: bool,
+        ) -> Result<()> {
+            Err(LLMError::GpuError(
+                "GpuModelRunner requires the `cuda` feature".into(),
+            ))
+        }
+
+        pub fn read_graph_output(&self, _num_tokens: usize) -> Result<Vec<i32>> {
+            Err(LLMError::GpuError(
+                "GpuModelRunner requires the `cuda` feature".into(),
+            ))
         }
 
         pub fn enable_fp16(&mut self) {}

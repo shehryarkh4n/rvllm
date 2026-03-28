@@ -362,7 +362,7 @@ mod tests {
     #[test]
     fn pad_input_too_large() {
         let runner = GraphRunner::new(GraphRunnerConfig::default());
-        let input = make_decode_input(64);
+        let input = make_decode_input(512);
         assert!(runner.pad_input(&input).is_err());
     }
 

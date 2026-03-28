@@ -206,6 +206,63 @@ impl CudaGraphPool {
             replay_count: std::sync::atomic::AtomicUsize::new(0),
         })
     }
+
+    /// Begin capturing a CUDA graph on a raw CudaStream (for use from GpuModelRunner).
+    #[cfg(feature = "cuda-graphs")]
+    pub fn begin_capture_on(&self, stream: &std::sync::Arc<cudarc::driver::CudaStream>) -> Result<()> {
+        debug!("beginning CUDA graph capture (raw stream)");
+        stream
+            .begin_capture(
+                cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_GLOBAL,
+            )
+            .map_err(|e| LLMError::GpuError(format!("cuStreamBeginCapture failed: {e}")))?;
+        Ok(())
+    }
+
+    /// End capture on a raw CudaStream and produce a [`CudaGraph`].
+    #[cfg(feature = "cuda-graphs")]
+    pub fn end_capture_on(
+        &mut self,
+        stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+        batch_size: usize,
+    ) -> Result<CudaGraph> {
+        use cudarc::driver::sys::CUgraphInstantiate_flags;
+        debug!(batch_size, "ending CUDA graph capture (raw stream)");
+
+        let inner = stream
+            .end_capture(CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)
+            .map_err(|e| LLMError::GpuError(format!("cuStreamEndCapture failed: {e}")))?
+            .ok_or_else(|| {
+                LLMError::GpuError("cuStreamEndCapture returned null graph".to_string())
+            })?;
+
+        info!(batch_size, "CUDA graph captured and instantiated (raw stream)");
+        Ok(CudaGraph {
+            batch_size,
+            inner,
+        })
+    }
+
+    /// Begin capture (no-op when cuda-graphs feature is off, cuda still available).
+    #[cfg(all(feature = "cuda", not(feature = "cuda-graphs")))]
+    pub fn begin_capture_on(&self, _stream: &std::sync::Arc<cudarc::driver::CudaStream>) -> Result<()> {
+        debug!("beginning CUDA graph capture (raw stream, no-op)");
+        Ok(())
+    }
+
+    /// End capture (no-op): produces a stub CudaGraph.
+    #[cfg(all(feature = "cuda", not(feature = "cuda-graphs")))]
+    pub fn end_capture_on(
+        &mut self,
+        _stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+        batch_size: usize,
+    ) -> Result<CudaGraph> {
+        debug!(batch_size, "ending CUDA graph capture (raw stream, no-op)");
+        Ok(CudaGraph {
+            batch_size,
+            replay_count: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
 }
 
 #[cfg(test)]
