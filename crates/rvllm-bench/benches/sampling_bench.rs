@@ -1,4 +1,4 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId, Throughput};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use rand::prelude::*;
 use rand_chacha::ChaCha8Rng;
 use rayon::prelude::*;
@@ -198,7 +198,9 @@ fn full_sampling_pipeline(logits: &[f32], past: &[u32]) -> u32 {
 
 fn random_logits(vocab_size: usize, seed: u64) -> Vec<f32> {
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
-    (0..vocab_size).map(|_| rng.gen_range(-10.0..10.0f32)).collect()
+    (0..vocab_size)
+        .map(|_| rng.gen_range(-10.0..10.0f32))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -478,11 +480,9 @@ fn bench_batch_sampling_parallel(c: &mut Criterion) {
             &(logits_batch.clone(), past.clone()),
             |b, (lb, pb)| {
                 b.iter(|| {
-                    lb.par_iter()
-                        .zip(pb.par_iter())
-                        .for_each(|(l, p)| {
-                            let _ = full_sampling_pipeline(black_box(l), black_box(p));
-                        });
+                    lb.par_iter().zip(pb.par_iter()).for_each(|(l, p)| {
+                        let _ = full_sampling_pipeline(black_box(l), black_box(p));
+                    });
                 })
             },
         );

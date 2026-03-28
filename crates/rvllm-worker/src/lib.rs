@@ -7,9 +7,9 @@
 //! and returns `WorkerOutput`.
 
 pub mod config;
-pub mod graph_runner;
 #[cfg(feature = "cuda")]
 pub mod gpu_worker;
+pub mod graph_runner;
 pub mod input;
 pub mod metrics;
 pub mod worker;

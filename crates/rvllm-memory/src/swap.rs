@@ -1,7 +1,7 @@
 //! SwapManager: async GPU<->CPU block transfer.
 
-use tracing::{debug, info};
 use rvllm_core::prelude::Result;
+use tracing::{debug, info};
 
 use crate::block::{CpuBlock, PhysicalBlock};
 use crate::cpu_pool::CpuMemoryPool;
@@ -123,14 +123,12 @@ mod tests {
         assert_eq!(gpu_pool.num_free_blocks(), 13);
 
         // Swap out to CPU
-        let cpu_blocks =
-            SwapManager::swap_out(&[b1, b2, b3], &gpu_pool, &cpu_pool).unwrap();
+        let cpu_blocks = SwapManager::swap_out(&[b1, b2, b3], &gpu_pool, &cpu_pool).unwrap();
         assert_eq!(gpu_pool.num_free_blocks(), 16);
         assert_eq!(cpu_pool.num_free_cpu_blocks(), 13);
 
         // Swap back in to GPU
-        let gpu_blocks =
-            SwapManager::swap_in(&cpu_blocks, &gpu_pool, &cpu_pool).unwrap();
+        let gpu_blocks = SwapManager::swap_in(&cpu_blocks, &gpu_pool, &cpu_pool).unwrap();
         assert_eq!(gpu_blocks.len(), 3);
         assert_eq!(gpu_pool.num_free_blocks(), 13);
         assert_eq!(cpu_pool.num_free_cpu_blocks(), 16);

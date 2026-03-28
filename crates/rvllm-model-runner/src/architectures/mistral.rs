@@ -7,9 +7,7 @@
 use half::f16;
 use tracing::trace;
 
-use crate::bridge::{
-    AttentionBackend, CacheEngine, GpuBuffer, ModelWeights, Result,
-};
+use crate::bridge::{AttentionBackend, CacheEngine, GpuBuffer, ModelWeights, Result};
 use crate::input::ModelInput;
 use crate::layers::linear::LinearLayer;
 use crate::layers::mlp::MLP;
@@ -53,15 +51,51 @@ impl MistralForCausalLM {
         for i in 0..config.num_layers {
             let p = format!("model.layers.{}", i);
             layers.push(MistralLayer {
-                input_layernorm: get_or_zeros(&weights, &format!("{p}.input_layernorm.weight"), &[config.hidden_size]),
-                post_attention_layernorm: get_or_zeros(&weights, &format!("{p}.post_attention_layernorm.weight"), &[config.hidden_size]),
-                q_proj: get_or_zeros(&weights, &format!("{p}.self_attn.q_proj.weight"), &[config.num_heads * config.head_dim, config.hidden_size]),
-                k_proj: get_or_zeros(&weights, &format!("{p}.self_attn.k_proj.weight"), &[config.num_kv_heads * config.head_dim, config.hidden_size]),
-                v_proj: get_or_zeros(&weights, &format!("{p}.self_attn.v_proj.weight"), &[config.num_kv_heads * config.head_dim, config.hidden_size]),
-                o_proj: get_or_zeros(&weights, &format!("{p}.self_attn.o_proj.weight"), &[config.hidden_size, config.num_heads * config.head_dim]),
-                gate_proj: get_or_zeros(&weights, &format!("{p}.mlp.gate_proj.weight"), &[config.intermediate_size, config.hidden_size]),
-                up_proj: get_or_zeros(&weights, &format!("{p}.mlp.up_proj.weight"), &[config.intermediate_size, config.hidden_size]),
-                down_proj: get_or_zeros(&weights, &format!("{p}.mlp.down_proj.weight"), &[config.hidden_size, config.intermediate_size]),
+                input_layernorm: get_or_zeros(
+                    &weights,
+                    &format!("{p}.input_layernorm.weight"),
+                    &[config.hidden_size],
+                ),
+                post_attention_layernorm: get_or_zeros(
+                    &weights,
+                    &format!("{p}.post_attention_layernorm.weight"),
+                    &[config.hidden_size],
+                ),
+                q_proj: get_or_zeros(
+                    &weights,
+                    &format!("{p}.self_attn.q_proj.weight"),
+                    &[config.num_heads * config.head_dim, config.hidden_size],
+                ),
+                k_proj: get_or_zeros(
+                    &weights,
+                    &format!("{p}.self_attn.k_proj.weight"),
+                    &[config.num_kv_heads * config.head_dim, config.hidden_size],
+                ),
+                v_proj: get_or_zeros(
+                    &weights,
+                    &format!("{p}.self_attn.v_proj.weight"),
+                    &[config.num_kv_heads * config.head_dim, config.hidden_size],
+                ),
+                o_proj: get_or_zeros(
+                    &weights,
+                    &format!("{p}.self_attn.o_proj.weight"),
+                    &[config.hidden_size, config.num_heads * config.head_dim],
+                ),
+                gate_proj: get_or_zeros(
+                    &weights,
+                    &format!("{p}.mlp.gate_proj.weight"),
+                    &[config.intermediate_size, config.hidden_size],
+                ),
+                up_proj: get_or_zeros(
+                    &weights,
+                    &format!("{p}.mlp.up_proj.weight"),
+                    &[config.intermediate_size, config.hidden_size],
+                ),
+                down_proj: get_or_zeros(
+                    &weights,
+                    &format!("{p}.mlp.down_proj.weight"),
+                    &[config.hidden_size, config.intermediate_size],
+                ),
             });
         }
 
@@ -115,16 +149,17 @@ impl Architecture for MistralForCausalLM {
 
             let normed2 =
                 RMSNorm::forward(&hidden, &layer.post_attention_layernorm, self.rms_norm_eps)?;
-            let mlp_out = MLP::forward(
-                &normed2,
-                &layer.gate_proj,
-                &layer.up_proj,
-                &layer.down_proj,
-            )?;
+            let mlp_out =
+                MLP::forward(&normed2, &layer.gate_proj, &layer.up_proj, &layer.down_proj)?;
             add_inplace(&mut hidden, &mlp_out);
         }
 
         let normed_final = RMSNorm::forward(&hidden, &self.norm_weight, self.rms_norm_eps)?;
-        lm_head(&normed_final, &self.lm_head_weight, num_tokens, self.vocab_size)
+        lm_head(
+            &normed_final,
+            &self.lm_head_weight,
+            num_tokens,
+            self.vocab_size,
+        )
     }
 }

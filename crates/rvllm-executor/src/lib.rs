@@ -83,7 +83,11 @@ pub struct Worker {
 
 impl Worker {
     pub fn new(config: WorkerConfig) -> rvllm_core::prelude::Result<Self> {
-        tracing::info!(rank = config.rank, gpu = config.gpu_id, "worker initialized");
+        tracing::info!(
+            rank = config.rank,
+            gpu = config.gpu_id,
+            "worker initialized"
+        );
         Ok(Self {
             config,
             gpu_blocks: 256,
@@ -91,7 +95,10 @@ impl Worker {
         })
     }
 
-    pub async fn execute_model(&self, input: WorkerInput) -> rvllm_core::prelude::Result<WorkerOutput> {
+    pub async fn execute_model(
+        &self,
+        input: WorkerInput,
+    ) -> rvllm_core::prelude::Result<WorkerOutput> {
         tracing::debug!(
             rank = self.config.rank,
             seqs = input.seq_group_metadata_list.len(),

@@ -2,7 +2,7 @@
 
 A from-scratch Rust rewrite of [vLLM](https://github.com/vllm-project/vllm) -- the most popular open-source LLM serving engine. Drop-in replacement for the OpenAI-compatible API with dramatically better resource efficiency.
 
-**22 Rust crates. CUDA PTX kernels. 15MB binary. Real GPU inference on A100.**
+**22 Rust crates. 14 CUDA PTX kernels. 15MB binary. 72 tok/s on A100. Real GPU inference with coherent output.**
 
 ## Install
 

@@ -90,6 +90,7 @@ pub fn dequantize_fp8(data: &[u8], scales: &[f32], shape: (usize, usize)) -> Vec
 
 /// Convert a single FP8 E4M3 byte to f32 (uses LUT).
 #[inline]
+#[allow(dead_code)]
 fn fp8_e4m3_to_f32(byte: u8) -> f32 {
     FP8_E4M3_LUT[byte as usize]
 }
@@ -211,10 +212,7 @@ mod tests {
         // Just verify they're in the right ballpark
         for (o, r) in original.iter().zip(restored.iter()) {
             let tol = o.abs() * 0.5 + 0.05;
-            assert!(
-                (o - r).abs() < tol,
-                "original={o}, restored={r}",
-            );
+            assert!((o - r).abs() < tol, "original={o}, restored={r}",);
         }
     }
 }

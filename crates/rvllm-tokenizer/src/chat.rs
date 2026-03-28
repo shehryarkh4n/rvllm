@@ -56,7 +56,10 @@ impl ChatMessage {
 
 /// Apply a ChatML-style template to messages.
 /// This is the default fallback when no Jinja2 template is available.
-pub(crate) fn apply_chatml(messages: &[ChatMessage], add_generation_prompt: bool) -> Result<String> {
+pub(crate) fn apply_chatml(
+    messages: &[ChatMessage],
+    add_generation_prompt: bool,
+) -> Result<String> {
     if messages.is_empty() {
         return Err(LLMError::TokenizerError("empty message list".into()));
     }

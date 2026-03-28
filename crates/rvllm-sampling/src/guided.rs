@@ -4,8 +4,8 @@
 //! to a specified format: valid JSON, a JSON schema, or a regex pattern.
 //! Uses a recursive descent approach -- no external dependency on outlines.
 
-use tracing::{debug, trace};
 use rvllm_core::prelude::{ResponseFormat, Result, TokenId};
+use tracing::{debug, trace};
 
 use crate::json_schema::{self, SchemaNode, ValidChars};
 
@@ -88,9 +88,7 @@ impl GuidedDecodingState {
                 debug!("compiled JSON schema constraint");
                 Constraint::JsonSchema(node)
             }
-            ResponseFormat::Regex { pattern } => {
-                Constraint::Regex(pattern.clone())
-            }
+            ResponseFormat::Regex { pattern } => Constraint::Regex(pattern.clone()),
         };
         Ok(Self {
             constraint,
@@ -106,7 +104,10 @@ impl GuidedDecodingState {
     /// Record that a token was selected, updating internal state.
     pub fn advance(&mut self, token_text: &str) {
         self.generated.push_str(token_text);
-        trace!(generated_len = self.generated.len(), "guided state advanced");
+        trace!(
+            generated_len = self.generated.len(),
+            "guided state advanced"
+        );
     }
 
     /// Get the text generated so far.
@@ -157,12 +158,8 @@ impl GuidedDecodingState {
                 let node = SchemaNode::Any;
                 json_schema::valid_next_chars(&self.generated, &node)
             }
-            Constraint::JsonSchema(node) => {
-                json_schema::valid_next_chars(&self.generated, node)
-            }
-            Constraint::Regex(pattern) => {
-                self.compute_regex_valid_chars(pattern)
-            }
+            Constraint::JsonSchema(node) => json_schema::valid_next_chars(&self.generated, node),
+            Constraint::Regex(pattern) => self.compute_regex_valid_chars(pattern),
         }
     }
 
@@ -271,7 +268,11 @@ fn validate_value(val: &serde_json::Value, node: &SchemaNode) -> bool {
         SchemaNode::Number => val.is_number(),
         SchemaNode::Integer => val.is_i64() || val.is_u64(),
         SchemaNode::String(_) => val.is_string(),
-        SchemaNode::Array { items, min_items, max_items } => {
+        SchemaNode::Array {
+            items,
+            min_items,
+            max_items,
+        } => {
             if let Some(arr) = val.as_array() {
                 arr.len() >= *min_items
                     && arr.len() <= *max_items
@@ -280,7 +281,10 @@ fn validate_value(val: &serde_json::Value, node: &SchemaNode) -> bool {
                 false
             }
         }
-        SchemaNode::Object { properties, additional_properties } => {
+        SchemaNode::Object {
+            properties,
+            additional_properties,
+        } => {
             if let Some(obj) = val.as_object() {
                 // Check required properties exist
                 for (key, prop_schema, required) in properties {
@@ -348,7 +352,11 @@ fn simple_regex_full_match(text: &str, pattern: &str) -> bool {
 
 /// Width of a pattern element at position `pi`: 1 for normal chars, 2 for `\x` escapes.
 fn element_width(pattern: &[char], pi: usize) -> usize {
-    if pattern[pi] == '\\' && pi + 1 < pattern.len() { 2 } else { 1 }
+    if pattern[pi] == '\\' && pi + 1 < pattern.len() {
+        2
+    } else {
+        1
+    }
 }
 
 /// Check if there is a quantifier (`*`, `+`, `?`) immediately after the element at `pi`.
@@ -518,11 +526,7 @@ fn char_matches(byte: u8, pc: char, pattern: &[char], pi: usize) -> bool {
 /// This is the main entry point for integrating guided decoding into the
 /// sampling pipeline. Call before temperature scaling and other logit
 /// processing.
-pub fn apply_guided_mask(
-    logits: &mut [f32],
-    state: &GuidedDecodingState,
-    vocab: &VocabTable,
-) {
+pub fn apply_guided_mask(logits: &mut [f32], state: &GuidedDecodingState, vocab: &VocabTable) {
     state.apply_mask(logits, vocab);
 }
 
@@ -573,7 +577,9 @@ mod tests {
             },
             "required": ["name"]
         });
-        let format = ResponseFormat::JsonSchema { json_schema: schema };
+        let format = ResponseFormat::JsonSchema {
+            json_schema: schema,
+        };
         let state = GuidedDecodingState::new(&format).unwrap();
         assert!(!state.is_unconstrained());
 
@@ -619,7 +625,9 @@ mod tests {
             },
             "required": ["name"]
         });
-        let format = ResponseFormat::JsonSchema { json_schema: schema };
+        let format = ResponseFormat::JsonSchema {
+            json_schema: schema,
+        };
         let mut state = GuidedDecodingState::new(&format).unwrap();
         state.advance("{\"name\": \"Alice\"}");
         assert!(state.is_complete());
@@ -634,7 +642,9 @@ mod tests {
             },
             "required": ["name"]
         });
-        let format = ResponseFormat::JsonSchema { json_schema: schema };
+        let format = ResponseFormat::JsonSchema {
+            json_schema: schema,
+        };
         let mut state = GuidedDecodingState::new(&format).unwrap();
         state.advance("{}");
         // Valid JSON but doesn't satisfy schema (missing required "name")
@@ -652,18 +662,14 @@ mod tests {
     #[test]
     fn apply_mask_blocks_invalid_tokens() {
         let schema = json!({"type": "integer"});
-        let format = ResponseFormat::JsonSchema { json_schema: schema };
+        let format = ResponseFormat::JsonSchema {
+            json_schema: schema,
+        };
         let state = GuidedDecodingState::new(&format).unwrap();
 
         let mut logits = vec![1.0, 2.0, 3.0, 4.0, 5.0];
         let vocab = make_vocab(
-            vec![
-                ("1", 0),
-                ("a", 1),
-                ("{", 2),
-                ("-", 3),
-                ("<eos>", 4),
-            ],
+            vec![("1", 0), ("a", 1), ("{", 2), ("-", 3), ("<eos>", 4)],
             4,
         );
         state.apply_mask(&mut logits, &vocab);
@@ -679,7 +685,9 @@ mod tests {
     #[test]
     fn apply_mask_allows_eos_when_complete() {
         let schema = json!({"type": "integer"});
-        let format = ResponseFormat::JsonSchema { json_schema: schema };
+        let format = ResponseFormat::JsonSchema {
+            json_schema: schema,
+        };
         let mut state = GuidedDecodingState::new(&format).unwrap();
         state.advance("42");
 
@@ -705,7 +713,11 @@ mod tests {
     fn validate_value_against_schema() {
         let node = SchemaNode::Object {
             properties: vec![
-                ("name".to_string(), SchemaNode::String(Default::default()), true),
+                (
+                    "name".to_string(),
+                    SchemaNode::String(Default::default()),
+                    true,
+                ),
                 ("age".to_string(), SchemaNode::Integer, false),
             ],
             additional_properties: false,

@@ -4,11 +4,11 @@ use std::sync::Arc;
 
 use tracing::debug;
 
+use crate::architectures::{create_model, Architecture};
 use crate::bridge::{
     AttentionBackend, CacheEngine, GpuAllocator, GpuBuffer, LLMError, ModelWeights, Result,
 };
 use crate::input::ModelInput;
-use crate::architectures::{create_model, Architecture};
 
 /// Static configuration for the model runner, derived from the model config.
 #[derive(Debug, Clone)]

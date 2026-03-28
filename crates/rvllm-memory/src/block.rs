@@ -105,7 +105,11 @@ impl CpuBlock {
 
     pub fn dec_ref(&self) -> usize {
         let prev = self.ref_count.fetch_sub(1, Ordering::AcqRel);
-        assert!(prev > 0, "ref_count underflow on cpu block {}", self.block_id);
+        assert!(
+            prev > 0,
+            "ref_count underflow on cpu block {}",
+            self.block_id
+        );
         prev - 1
     }
 

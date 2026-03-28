@@ -9,10 +9,10 @@
 //! so this crate's `#![forbid(unsafe_code)]` is respected.
 
 use cudarc::driver::{CudaDevice, CudaSlice, DeviceSlice as _};
-use std::sync::Arc;
 use rvllm_core::prelude::{LLMError, Result};
 use rvllm_gpu::cublas::CublasHandle;
 use rvllm_gpu::cublas_ops::CublasOps;
+use std::sync::Arc;
 
 /// GPU-accelerated dense linear projection using cuBLAS SGEMM.
 ///

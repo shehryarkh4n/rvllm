@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use tracing::{debug, info};
 use rvllm_core::error::{LLMError, Result};
+use tracing::{debug, info};
 
 use crate::dtype::DType;
 use crate::weights::{GpuAllocator, ModelWeights, WeightTensor};
@@ -21,9 +21,7 @@ impl SafeTensorsLoader {
         let data = std::fs::read(path)?;
 
         if data.len() < 8 {
-            return Err(LLMError::ModelError(
-                "safetensors file too small".into(),
-            ));
+            return Err(LLMError::ModelError("safetensors file too small".into()));
         }
 
         // First 8 bytes: little-endian u64 header size
@@ -53,9 +51,9 @@ impl SafeTensorsLoader {
                 continue;
             }
 
-            let obj = meta
-                .as_object()
-                .ok_or_else(|| LLMError::ModelError(format!("tensor {} has non-object meta", name)))?;
+            let obj = meta.as_object().ok_or_else(|| {
+                LLMError::ModelError(format!("tensor {} has non-object meta", name))
+            })?;
 
             let dtype_str = obj
                 .get("dtype")
@@ -81,7 +79,9 @@ impl SafeTensorsLoader {
             let offsets = obj
                 .get("data_offsets")
                 .and_then(|v| v.as_array())
-                .ok_or_else(|| LLMError::ModelError(format!("tensor {} missing data_offsets", name)))?;
+                .ok_or_else(|| {
+                    LLMError::ModelError(format!("tensor {} missing data_offsets", name))
+                })?;
 
             if offsets.len() != 2 {
                 return Err(LLMError::ModelError(format!(
@@ -149,7 +149,11 @@ impl SafeTensorsLoader {
             )));
         }
 
-        info!("loading {} safetensors shards from {}", shard_files.len(), dir.display());
+        info!(
+            "loading {} safetensors shards from {}",
+            shard_files.len(),
+            dir.display()
+        );
 
         for shard_path in &shard_files {
             let shard = Self::load(shard_path, gpu)?;
@@ -245,10 +249,8 @@ mod tests {
     fn load_multiple_tensors() {
         let d1 = vec![0u8; 8];
         let d2 = vec![1u8; 4];
-        let file_bytes = build_test_safetensors(&[
-            ("a", &[2], DType::F32, &d1),
-            ("b", &[4], DType::U8, &d2),
-        ]);
+        let file_bytes =
+            build_test_safetensors(&[("a", &[2], DType::F32, &d1), ("b", &[4], DType::U8, &d2)]);
 
         let mut tmp = NamedTempFile::new().unwrap();
         tmp.write_all(&file_bytes).unwrap();

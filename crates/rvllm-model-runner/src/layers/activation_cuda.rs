@@ -13,7 +13,8 @@ mod inner {
     use std::sync::Arc;
 
     use cudarc::driver::{
-        CudaDevice, CudaFunction, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, DeviceSlice as _, LaunchAsync, LaunchConfig,
+        CudaDevice, CudaFunction, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, DeviceSlice as _,
+        LaunchAsync, LaunchConfig,
     };
     use tracing::trace;
 
@@ -45,11 +46,9 @@ mod inner {
         /// `ptx_bytes` should be the compiled PTX of `kernels/activation.cu`.
         pub fn new(device: Arc<CudaDevice>, ptx_bytes: &[u8]) -> Result<Self> {
             load_module_if_needed(&device, ptx_bytes)?;
-            let func = device
-                .get_func(MODULE_NAME, "silu_kernel")
-                .ok_or_else(|| {
-                    LLMError::GpuError("silu_kernel not found in activation module".into())
-                })?;
+            let func = device.get_func(MODULE_NAME, "silu_kernel").ok_or_else(|| {
+                LLMError::GpuError("silu_kernel not found in activation module".into())
+            })?;
             trace!("CudaSiLU: loaded silu_kernel");
             Ok(Self { device, func })
         }
@@ -93,8 +92,8 @@ mod inner {
                 let mut ptr = *DevicePtrMut::device_ptr_mut(data);
                 let mut n_i32 = n as i32;
                 let params: &mut [*mut std::ffi::c_void] = &mut [
-                    &mut ptr as *mut _ as *mut _,  // output
-                    &mut ptr as *mut _ as *mut _,  // input (aliased)
+                    &mut ptr as *mut _ as *mut _, // output
+                    &mut ptr as *mut _ as *mut _, // input (aliased)
                     &mut n_i32 as *mut _ as *mut _,
                 ];
                 self.func
@@ -123,11 +122,9 @@ mod inner {
         /// Load the activation PTX and extract `gelu_kernel`.
         pub fn new(device: Arc<CudaDevice>, ptx_bytes: &[u8]) -> Result<Self> {
             load_module_if_needed(&device, ptx_bytes)?;
-            let func = device
-                .get_func(MODULE_NAME, "gelu_kernel")
-                .ok_or_else(|| {
-                    LLMError::GpuError("gelu_kernel not found in activation module".into())
-                })?;
+            let func = device.get_func(MODULE_NAME, "gelu_kernel").ok_or_else(|| {
+                LLMError::GpuError("gelu_kernel not found in activation module".into())
+            })?;
             trace!("CudaGELU: loaded gelu_kernel");
             Ok(Self { device, func })
         }
@@ -271,9 +268,9 @@ mod inner {
                 let mut up_ptr = *DevicePtr::device_ptr(up);
                 let mut n_i32 = n as i32;
                 let params: &mut [*mut std::ffi::c_void] = &mut [
-                    &mut gate_ptr as *mut _ as *mut _,  // output (aliases gate)
-                    &mut gate_ptr as *mut _ as *mut _,  // gate input
-                    &mut up_ptr as *mut _ as *mut _,     // up input
+                    &mut gate_ptr as *mut _ as *mut _, // output (aliases gate)
+                    &mut gate_ptr as *mut _ as *mut _, // gate input
+                    &mut up_ptr as *mut _ as *mut _,   // up input
                     &mut n_i32 as *mut _ as *mut _,
                 ];
                 self.func
@@ -302,9 +299,8 @@ mod inner {
         if device.has_func(MODULE_NAME, "silu_kernel") {
             return Ok(());
         }
-        let ptx_str = std::str::from_utf8(ptx_bytes).map_err(|e| {
-            LLMError::GpuError(format!("activation PTX is not valid UTF-8: {e}"))
-        })?;
+        let ptx_str = std::str::from_utf8(ptx_bytes)
+            .map_err(|e| LLMError::GpuError(format!("activation PTX is not valid UTF-8: {e}")))?;
         device
             .load_ptx(
                 cudarc::nvrtc::Ptx::from_src(ptx_str),

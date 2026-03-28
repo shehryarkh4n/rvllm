@@ -16,9 +16,9 @@ pub mod weights;
 
 use std::path::Path;
 
-use tracing::info;
 use rvllm_core::config::{ModelConfig, ParallelConfig};
 use rvllm_core::error::{LLMError, Result};
+use tracing::info;
 
 use crate::gguf::GGUFLoader;
 use crate::mapper::WeightMapper;
@@ -44,34 +44,28 @@ pub fn detect_format(path: &Path) -> Result<ModelFormat> {
                 "unknown model file extension: {}",
                 ext
             ))),
-            None => Err(LLMError::ModelError(
-                "model file has no extension".into(),
-            )),
+            None => Err(LLMError::ModelError("model file has no extension".into())),
         };
     }
 
     if path.is_dir() {
         // Check for safetensors files first, then gguf
-        let has_safetensors = std::fs::read_dir(path)?
-            .filter_map(|e| e.ok())
-            .any(|e| {
-                e.path()
-                    .extension()
-                    .map(|ext| ext == "safetensors")
-                    .unwrap_or(false)
-            });
+        let has_safetensors = std::fs::read_dir(path)?.filter_map(|e| e.ok()).any(|e| {
+            e.path()
+                .extension()
+                .map(|ext| ext == "safetensors")
+                .unwrap_or(false)
+        });
         if has_safetensors {
             return Ok(ModelFormat::SafeTensors);
         }
 
-        let has_gguf = std::fs::read_dir(path)?
-            .filter_map(|e| e.ok())
-            .any(|e| {
-                e.path()
-                    .extension()
-                    .map(|ext| ext == "gguf")
-                    .unwrap_or(false)
-            });
+        let has_gguf = std::fs::read_dir(path)?.filter_map(|e| e.ok()).any(|e| {
+            e.path()
+                .extension()
+                .map(|ext| ext == "gguf")
+                .unwrap_or(false)
+        });
         if has_gguf {
             return Ok(ModelFormat::GGUF);
         }
@@ -169,26 +163,44 @@ pub fn load_model_weights(
 mod tests {
     use super::*;
     use crate::weights::MockGpuAllocator;
-    use tempfile::NamedTempFile;
     use std::io::Write;
+    use tempfile::NamedTempFile;
 
     struct TestModelConfig;
     impl ModelConfig for TestModelConfig {
-        fn model_name(&self) -> &str { "llama" }
-        fn hidden_size(&self) -> usize { 256 }
-        fn num_layers(&self) -> usize { 2 }
-        fn num_attention_heads(&self) -> usize { 4 }
-        fn num_kv_heads(&self) -> usize { 4 }
-        fn vocab_size(&self) -> usize { 1000 }
-        fn max_model_len(&self) -> usize { 512 }
+        fn model_name(&self) -> &str {
+            "llama"
+        }
+        fn hidden_size(&self) -> usize {
+            256
+        }
+        fn num_layers(&self) -> usize {
+            2
+        }
+        fn num_attention_heads(&self) -> usize {
+            4
+        }
+        fn num_kv_heads(&self) -> usize {
+            4
+        }
+        fn vocab_size(&self) -> usize {
+            1000
+        }
+        fn max_model_len(&self) -> usize {
+            512
+        }
     }
 
     struct TestParallelConfig {
         tp: usize,
     }
     impl ParallelConfig for TestParallelConfig {
-        fn tensor_parallel_size(&self) -> usize { self.tp }
-        fn pipeline_parallel_size(&self) -> usize { 1 }
+        fn tensor_parallel_size(&self) -> usize {
+            self.tp
+        }
+        fn pipeline_parallel_size(&self) -> usize {
+            1
+        }
     }
 
     #[test]
@@ -227,9 +239,12 @@ mod tests {
         use crate::dtype::DType;
 
         let data = vec![0u8; 16];
-        let file_bytes = crate::safetensors::build_test_safetensors(&[
-            ("model.layers.0.self_attn.q_proj.weight", &[2, 2], DType::F32, &data),
-        ]);
+        let file_bytes = crate::safetensors::build_test_safetensors(&[(
+            "model.layers.0.self_attn.q_proj.weight",
+            &[2, 2],
+            DType::F32,
+            &data,
+        )]);
 
         let mut tmp = NamedTempFile::with_suffix(".safetensors").unwrap();
         tmp.write_all(&file_bytes).unwrap();
@@ -251,9 +266,12 @@ mod tests {
 
         // 4x4 U8 tensor = 16 bytes, will be column-sharded (attn.q) into 2x4
         let data: Vec<u8> = (0..16).collect();
-        let file_bytes = crate::safetensors::build_test_safetensors(&[
-            ("model.layers.0.self_attn.q_proj.weight", &[4, 4], DType::U8, &data),
-        ]);
+        let file_bytes = crate::safetensors::build_test_safetensors(&[(
+            "model.layers.0.self_attn.q_proj.weight",
+            &[4, 4],
+            DType::U8,
+            &data,
+        )]);
 
         let mut tmp = NamedTempFile::with_suffix(".safetensors").unwrap();
         tmp.write_all(&file_bytes).unwrap();

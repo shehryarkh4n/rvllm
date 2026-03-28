@@ -245,7 +245,10 @@ mod tests {
     use super::*;
 
     fn make_buf(vals: &[f32]) -> GpuBuffer<f16> {
-        GpuBuffer::from_vec(vals.iter().map(|&v| f16::from_f32(v)).collect(), vec![vals.len()])
+        GpuBuffer::from_vec(
+            vals.iter().map(|&v| f16::from_f32(v)).collect(),
+            vec![vals.len()],
+        )
     }
 
     #[test]
@@ -286,16 +289,25 @@ mod tests {
     #[test]
     fn fused_silu_mul_matches_separate() {
         let gate_vals: Vec<f16> = [1.0f32, -1.0, 2.0, -2.0, 0.5, -0.5, 3.0, 0.0, 1.5]
-            .iter().map(|&v| f16::from_f32(v)).collect();
+            .iter()
+            .map(|&v| f16::from_f32(v))
+            .collect();
         let up_vals: Vec<f16> = [0.5f32, 1.0, -1.0, 2.0, 0.0, 3.0, -2.0, 1.0, -0.5]
-            .iter().map(|&v| f16::from_f32(v)).collect();
+            .iter()
+            .map(|&v| f16::from_f32(v))
+            .collect();
         let fused = fused_silu_mul(&gate_vals, &up_vals);
         for i in 0..gate_vals.len() {
             let g = gate_vals[i].to_f32();
             let u = up_vals[i].to_f32();
             let expected = silu_scalar(g) * u;
-            assert!((fused[i].to_f32() - expected).abs() < 0.01,
-                "mismatch at {}: got {} expected {}", i, fused[i].to_f32(), expected);
+            assert!(
+                (fused[i].to_f32() - expected).abs() < 0.01,
+                "mismatch at {}: got {} expected {}",
+                i,
+                fused[i].to_f32(),
+                expected
+            );
         }
     }
 

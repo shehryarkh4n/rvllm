@@ -1,8 +1,8 @@
 //! PagedAttention V2 backend -- reference CPU implementation + CUDA placeholder.
 
+use crate::buffer::GpuBuffer;
 use half::f16;
 use rvllm_core::prelude::{LLMError, Result};
-use crate::buffer::GpuBuffer;
 
 use crate::backend::AttentionBackend;
 
@@ -211,7 +211,15 @@ mod tests {
             shape: vec![0],
         };
         let out = pa
-            .forward(&query, &key_cache, &value_cache, &block_tables, &context_lens, 0, 1.0)
+            .forward(
+                &query,
+                &key_cache,
+                &value_cache,
+                &block_tables,
+                &context_lens,
+                0,
+                1.0,
+            )
             .unwrap();
         assert!(out.data.is_empty());
     }

@@ -38,7 +38,10 @@ pub fn register_descriptions() {
     describe_gauge!(RUNNING_REQUESTS, "Number of currently running requests");
     describe_gauge!(WAITING_REQUESTS, "Number of waiting (queued) requests");
     describe_gauge!(GPU_CACHE_USAGE, "GPU KV-cache usage percentage");
-    describe_gauge!(WORKER_TOKENS_PER_SECOND, "Worker-level tokens per second throughput");
+    describe_gauge!(
+        WORKER_TOKENS_PER_SECOND,
+        "Worker-level tokens per second throughput"
+    );
 
     describe_counter!(PREEMPTIONS_TOTAL, "Total number of preemptions");
     describe_counter!(REQUESTS_TOTAL, "Total number of requests received");
@@ -46,6 +49,9 @@ pub fn register_descriptions() {
     describe_counter!(PROMPT_TOKENS_TOTAL, "Total prompt tokens processed");
     describe_counter!(GENERATION_TOKENS_TOTAL, "Total generation tokens produced");
     describe_counter!(FORWARD_PASSES_TOTAL, "Total GPU forward passes executed");
-    describe_counter!(TOKENS_SAMPLED_TOTAL, "Total tokens sampled across all requests");
+    describe_counter!(
+        TOKENS_SAMPLED_TOTAL,
+        "Total tokens sampled across all requests"
+    );
     describe_counter!(STEPS_TOTAL, "Total engine step() invocations");
 }

@@ -12,7 +12,11 @@ pub struct RMSNorm;
 
 impl RMSNorm {
     #[inline]
-    pub fn forward(input: &GpuBuffer<f16>, weight: &GpuBuffer<f16>, eps: f32) -> Result<GpuBuffer<f16>> {
+    pub fn forward(
+        input: &GpuBuffer<f16>,
+        weight: &GpuBuffer<f16>,
+        eps: f32,
+    ) -> Result<GpuBuffer<f16>> {
         let hidden = weight.len();
         let num_tokens = input.len() / hidden;
         let total = num_tokens * hidden;
@@ -39,8 +43,8 @@ impl RMSNorm {
                 let a5 = chunk[5].to_f32();
                 let a6 = chunk[6].to_f32();
                 let a7 = chunk[7].to_f32();
-                sum_sq += a0 * a0 + a1 * a1 + a2 * a2 + a3 * a3
-                        + a4 * a4 + a5 * a5 + a6 * a6 + a7 * a7;
+                sum_sq +=
+                    a0 * a0 + a1 * a1 + a2 * a2 + a3 * a3 + a4 * a4 + a5 * a5 + a6 * a6 + a7 * a7;
             }
             for v in remainder {
                 let f = v.to_f32();
@@ -107,10 +111,14 @@ impl LayerNorm {
             let chunks = row.chunks_exact(8);
             let remainder = chunks.remainder();
             for chunk in chunks {
-                sum += chunk[0].to_f32() + chunk[1].to_f32()
-                     + chunk[2].to_f32() + chunk[3].to_f32()
-                     + chunk[4].to_f32() + chunk[5].to_f32()
-                     + chunk[6].to_f32() + chunk[7].to_f32();
+                sum += chunk[0].to_f32()
+                    + chunk[1].to_f32()
+                    + chunk[2].to_f32()
+                    + chunk[3].to_f32()
+                    + chunk[4].to_f32()
+                    + chunk[5].to_f32()
+                    + chunk[6].to_f32()
+                    + chunk[7].to_f32();
             }
             for v in remainder {
                 sum += v.to_f32();
@@ -130,8 +138,8 @@ impl LayerNorm {
                 let d5 = chunk[5].to_f32() - mean;
                 let d6 = chunk[6].to_f32() - mean;
                 let d7 = chunk[7].to_f32() - mean;
-                var_sum += d0 * d0 + d1 * d1 + d2 * d2 + d3 * d3
-                         + d4 * d4 + d5 * d5 + d6 * d6 + d7 * d7;
+                var_sum +=
+                    d0 * d0 + d1 * d1 + d2 * d2 + d3 * d3 + d4 * d4 + d5 * d5 + d6 * d6 + d7 * d7;
             }
             for v in remainder {
                 let d = v.to_f32() - mean;
@@ -159,7 +167,12 @@ impl LayerNorm {
                 d[7] = f16::from_f32((r[7].to_f32() - mean) * inv_std * w[7] + b[7]);
             }
             let rem_start = hidden - row_rem.len();
-            for (i, ((rv, wv), bv)) in row_rem.iter().zip(w_rem.iter()).zip(b_rem.iter()).enumerate() {
+            for (i, ((rv, wv), bv)) in row_rem
+                .iter()
+                .zip(w_rem.iter())
+                .zip(b_rem.iter())
+                .enumerate()
+            {
                 dst[rem_start + i] = f16::from_f32((rv.to_f32() - mean) * inv_std * wv + bv);
             }
         }
@@ -173,7 +186,10 @@ mod tests {
     use super::*;
 
     fn make_buf(vals: &[f32]) -> GpuBuffer<f16> {
-        GpuBuffer::from_vec(vals.iter().map(|&v| f16::from_f32(v)).collect(), vec![vals.len()])
+        GpuBuffer::from_vec(
+            vals.iter().map(|&v| f16::from_f32(v)).collect(),
+            vec![vals.len()],
+        )
     }
 
     #[test]
@@ -187,7 +203,13 @@ mod tests {
         let expected: Vec<f32> = [1.0, 2.0, 3.0, 4.0].iter().map(|v| v / rms).collect();
         for (i, &e) in expected.iter().enumerate() {
             let got = out.data[i].to_f32();
-            assert!((got - e).abs() < 0.01, "idx {}: got {} expected {}", i, got, e);
+            assert!(
+                (got - e).abs() < 0.01,
+                "idx {}: got {} expected {}",
+                i,
+                got,
+                e
+            );
         }
     }
 

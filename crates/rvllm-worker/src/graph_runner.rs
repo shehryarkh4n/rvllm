@@ -18,7 +18,6 @@ use rvllm_gpu::stream::GpuStream;
 use rvllm_model_runner::bridge::AttentionMetadata;
 use rvllm_model_runner::input::ModelInput;
 
-
 /// Configuration for the graph runner.
 #[derive(Debug, Clone)]
 pub struct GraphRunnerConfig {
@@ -185,7 +184,10 @@ impl GraphRunner {
 
     /// Whether capture has been attempted for this padded batch size.
     pub fn was_capture_attempted(&self, padded_batch_size: usize) -> bool {
-        self.captured.get(&padded_batch_size).copied().unwrap_or(false)
+        self.captured
+            .get(&padded_batch_size)
+            .copied()
+            .unwrap_or(false)
     }
 
     /// Capture a graph by running a forward pass on `stream`, then store it.
@@ -202,7 +204,10 @@ impl GraphRunner {
         F: Fn() -> Result<()>,
     {
         if self.was_capture_attempted(padded_batch_size) {
-            trace!(padded_batch_size, "graph capture already attempted, skipping");
+            trace!(
+                padded_batch_size,
+                "graph capture already attempted, skipping"
+            );
             return Ok(());
         }
 
@@ -227,11 +232,7 @@ impl GraphRunner {
     ///
     /// Returns `true` if a graph was replayed, `false` if the caller should
     /// fall back to the normal forward path.
-    pub fn try_replay(
-        &self,
-        stream: &GpuStream,
-        actual_batch_size: usize,
-    ) -> Result<bool> {
+    pub fn try_replay(&self, stream: &GpuStream, actual_batch_size: usize) -> Result<bool> {
         match self.pool.get(actual_batch_size) {
             Some(graph) => {
                 trace!(
@@ -426,9 +427,7 @@ mod tests {
         let stream = GpuStream::new(0).unwrap();
         let mut runner = GraphRunner::new(GraphRunnerConfig::default());
 
-        runner
-            .capture_graph(&stream, 4, || Ok(()))
-            .unwrap();
+        runner.capture_graph(&stream, 4, || Ok(())).unwrap();
         assert!(runner.has_graph_for(4));
 
         runner.clear();

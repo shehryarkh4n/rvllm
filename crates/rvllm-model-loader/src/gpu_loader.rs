@@ -13,8 +13,8 @@ mod inner {
 
     use cudarc::driver::{CudaDevice, CudaSlice};
     use memmap2::Mmap;
-    use tracing::{debug, info, warn};
     use rvllm_core::error::{LLMError, Result};
+    use tracing::{debug, info, warn};
 
     /// Load all safetensors weights from `path` directly into GPU memory.
     ///
@@ -129,7 +129,10 @@ mod inner {
             if abs_end > data.len() {
                 return Err(LLMError::ModelError(format!(
                     "tensor {} data range [{}, {}) exceeds file size {}",
-                    name, abs_start, abs_end, data.len()
+                    name,
+                    abs_start,
+                    abs_end,
+                    data.len()
                 )));
             }
 
@@ -233,9 +236,8 @@ mod inner {
                 let mut out = vec![0f32; numel];
                 // SAFETY: f32 is Pod, we verified the byte count matches.
                 // The source slice is valid u8 data from the mmap.
-                let src = unsafe {
-                    std::slice::from_raw_parts(bytes.as_ptr() as *const f32, numel)
-                };
+                let src =
+                    unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const f32, numel) };
                 out.copy_from_slice(src);
                 Ok(out)
             }

@@ -1,8 +1,8 @@
 //! In-place logit processors: temperature, top-k, top-p, min-p,
 //! repetition penalty, and frequency/presence penalty.
 
-use std::collections::HashMap;
 use rvllm_core::prelude::TokenId;
+use std::collections::HashMap;
 
 /// Scale logits by temperature. temperature=0 is handled upstream as greedy.
 #[inline]

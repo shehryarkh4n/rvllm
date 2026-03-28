@@ -174,10 +174,7 @@ mod tests {
 
         assert_eq!(restored.len(), 64);
         for (o, r) in original.iter().zip(restored.iter()) {
-            assert!(
-                (o - r).abs() < 0.5,
-                "original={o}, restored={r}",
-            );
+            assert!((o - r).abs() < 0.5, "original={o}, restored={r}",);
         }
     }
 }

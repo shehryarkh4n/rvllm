@@ -1,8 +1,8 @@
 use metrics_exporter_prometheus::PrometheusHandle;
+use rvllm_core::prelude::*;
 use tracing_subscriber::fmt;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
-use rvllm_core::prelude::*;
 
 use crate::config::{LogFormat, TelemetryConfig};
 
@@ -21,9 +21,7 @@ impl Drop for TelemetryGuard {
 /// Initialise telemetry: structured logging, Prometheus metrics, optional OTLP stub.
 pub fn init_telemetry(config: &TelemetryConfig) -> Result<TelemetryGuard> {
     if !config.enabled {
-        return Ok(TelemetryGuard {
-            _prom_handle: None,
-        });
+        return Ok(TelemetryGuard { _prom_handle: None });
     }
 
     // -- Tracing / logging --

@@ -3,8 +3,8 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tokio::sync::{mpsc, oneshot};
 use rvllm_core::prelude::{LLMError, Result};
+use tokio::sync::{mpsc, oneshot};
 
 use crate::config::ExecutorConfig;
 use crate::executor::{Executor, ExecutorInput};
@@ -44,7 +44,10 @@ impl MultiGpuExecutor {
         }
 
         // TODO: Initialize NCCL communicator across ranks
-        tracing::info!(num_gpus = config.num_gpus, "setting up NCCL communicator (stub)");
+        tracing::info!(
+            num_gpus = config.num_gpus,
+            "setting up NCCL communicator (stub)"
+        );
 
         let mut handles = Vec::with_capacity(config.num_gpus);
 
@@ -87,10 +90,7 @@ impl MultiGpuExecutor {
             });
         }
 
-        tracing::info!(
-            num_workers = handles.len(),
-            "multi-gpu executor ready"
-        );
+        tracing::info!(num_workers = handles.len(), "multi-gpu executor ready");
 
         Ok(Self {
             handles,
@@ -149,9 +149,7 @@ impl Executor for MultiGpuExecutor {
                 .tx
                 .send(WorkerCommand::HealthCheck { reply: reply_tx })
                 .await
-                .map_err(|_| {
-                    LLMError::GpuError(format!("worker rank {rank} unresponsive"))
-                })?;
+                .map_err(|_| LLMError::GpuError(format!("worker rank {rank} unresponsive")))?;
 
             reply_rx
                 .await

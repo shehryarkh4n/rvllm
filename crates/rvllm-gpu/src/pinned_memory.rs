@@ -55,9 +55,7 @@ impl<T: Pod + Send> PinnedBuffer<T> {
 
             // SAFETY: cuMemAllocHost allocates page-locked memory on the host.
             // The pointer is valid until cuMemFreeHost is called (in Drop).
-            let result = unsafe {
-                cudarc::driver::sys::lib().cuMemAllocHost_v2(&mut ptr, bytes)
-            };
+            let result = unsafe { cudarc::driver::sys::lib().cuMemAllocHost_v2(&mut ptr, bytes) };
 
             if result != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
                 return Err(crate::LLMError::MemoryError(format!(
@@ -90,9 +88,13 @@ impl<T: Pod + Send> PinnedBuffer<T> {
 
     pub fn len(&self) -> usize {
         #[cfg(feature = "cuda")]
-        { self.len }
+        {
+            self.len
+        }
         #[cfg(all(feature = "mock-gpu", not(feature = "cuda")))]
-        { self.data.len() }
+        {
+            self.data.len()
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -113,7 +115,9 @@ impl<T: Pod + Send> PinnedBuffer<T> {
             unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
         }
         #[cfg(all(feature = "mock-gpu", not(feature = "cuda")))]
-        { &self.data }
+        {
+            &self.data
+        }
     }
 
     pub fn as_mut_slice(&mut self) -> &mut [T] {
@@ -126,21 +130,31 @@ impl<T: Pod + Send> PinnedBuffer<T> {
             unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
         }
         #[cfg(all(feature = "mock-gpu", not(feature = "cuda")))]
-        { &mut self.data }
+        {
+            &mut self.data
+        }
     }
 
     pub fn as_ptr(&self) -> *const T {
         #[cfg(feature = "cuda")]
-        { self.ptr as *const T }
+        {
+            self.ptr as *const T
+        }
         #[cfg(all(feature = "mock-gpu", not(feature = "cuda")))]
-        { self.data.as_ptr() }
+        {
+            self.data.as_ptr()
+        }
     }
 
     pub fn as_mut_ptr(&mut self) -> *mut T {
         #[cfg(feature = "cuda")]
-        { self.ptr }
+        {
+            self.ptr
+        }
         #[cfg(all(feature = "mock-gpu", not(feature = "cuda")))]
-        { self.data.as_mut_ptr() }
+        {
+            self.data.as_mut_ptr()
+        }
     }
 
     /// Copy from a host slice into this pinned buffer.
@@ -169,7 +183,8 @@ impl<T: Pod + Send> Drop for PinnedBuffer<T> {
             if !self.ptr.is_null() && self.len > 0 {
                 // SAFETY: ptr was allocated with cuMemAllocHost.
                 unsafe {
-                    let _ = cudarc::driver::sys::lib().cuMemFreeHost(self.ptr as *mut std::ffi::c_void);
+                    let _ =
+                        cudarc::driver::sys::lib().cuMemFreeHost(self.ptr as *mut std::ffi::c_void);
                 }
             }
         }

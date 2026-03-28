@@ -10,9 +10,7 @@
 use half::f16;
 use tracing::trace;
 
-use crate::bridge::{
-    AttentionBackend, CacheEngine, GpuBuffer, ModelWeights, Result,
-};
+use crate::bridge::{AttentionBackend, CacheEngine, GpuBuffer, ModelWeights, Result};
 use crate::input::ModelInput;
 use crate::layers::linear::LinearLayer;
 use crate::layers::rotary::RotaryEmbedding;
@@ -30,7 +28,11 @@ struct GemmaRMSNorm;
 
 impl GemmaRMSNorm {
     #[inline]
-    fn forward(input: &GpuBuffer<f16>, weight: &GpuBuffer<f16>, eps: f32) -> crate::bridge::Result<GpuBuffer<f16>> {
+    fn forward(
+        input: &GpuBuffer<f16>,
+        weight: &GpuBuffer<f16>,
+        eps: f32,
+    ) -> crate::bridge::Result<GpuBuffer<f16>> {
         let hidden = weight.len();
         let num_tokens = input.len() / hidden;
         let total = num_tokens * hidden;
@@ -55,8 +57,8 @@ impl GemmaRMSNorm {
                 let a5 = chunk[5].to_f32();
                 let a6 = chunk[6].to_f32();
                 let a7 = chunk[7].to_f32();
-                sum_sq += a0 * a0 + a1 * a1 + a2 * a2 + a3 * a3
-                        + a4 * a4 + a5 * a5 + a6 * a6 + a7 * a7;
+                sum_sq +=
+                    a0 * a0 + a1 * a1 + a2 * a2 + a3 * a3 + a4 * a4 + a5 * a5 + a6 * a6 + a7 * a7;
             }
             for v in remainder {
                 let f = v.to_f32();
@@ -205,15 +207,51 @@ impl GemmaForCausalLM {
         for i in 0..config.num_layers {
             let p = format!("model.layers.{}", i);
             layers.push(GemmaLayer {
-                input_layernorm: get_or_zeros(&weights, &format!("{p}.input_layernorm.weight"), &[config.hidden_size]),
-                post_attention_layernorm: get_or_zeros(&weights, &format!("{p}.post_attention_layernorm.weight"), &[config.hidden_size]),
-                q_proj: get_or_zeros(&weights, &format!("{p}.self_attn.q_proj.weight"), &[config.num_heads * config.head_dim, config.hidden_size]),
-                k_proj: get_or_zeros(&weights, &format!("{p}.self_attn.k_proj.weight"), &[config.num_kv_heads * config.head_dim, config.hidden_size]),
-                v_proj: get_or_zeros(&weights, &format!("{p}.self_attn.v_proj.weight"), &[config.num_kv_heads * config.head_dim, config.hidden_size]),
-                o_proj: get_or_zeros(&weights, &format!("{p}.self_attn.o_proj.weight"), &[config.hidden_size, config.num_heads * config.head_dim]),
-                gate_proj: get_or_zeros(&weights, &format!("{p}.mlp.gate_proj.weight"), &[config.intermediate_size, config.hidden_size]),
-                up_proj: get_or_zeros(&weights, &format!("{p}.mlp.up_proj.weight"), &[config.intermediate_size, config.hidden_size]),
-                down_proj: get_or_zeros(&weights, &format!("{p}.mlp.down_proj.weight"), &[config.hidden_size, config.intermediate_size]),
+                input_layernorm: get_or_zeros(
+                    &weights,
+                    &format!("{p}.input_layernorm.weight"),
+                    &[config.hidden_size],
+                ),
+                post_attention_layernorm: get_or_zeros(
+                    &weights,
+                    &format!("{p}.post_attention_layernorm.weight"),
+                    &[config.hidden_size],
+                ),
+                q_proj: get_or_zeros(
+                    &weights,
+                    &format!("{p}.self_attn.q_proj.weight"),
+                    &[config.num_heads * config.head_dim, config.hidden_size],
+                ),
+                k_proj: get_or_zeros(
+                    &weights,
+                    &format!("{p}.self_attn.k_proj.weight"),
+                    &[config.num_kv_heads * config.head_dim, config.hidden_size],
+                ),
+                v_proj: get_or_zeros(
+                    &weights,
+                    &format!("{p}.self_attn.v_proj.weight"),
+                    &[config.num_kv_heads * config.head_dim, config.hidden_size],
+                ),
+                o_proj: get_or_zeros(
+                    &weights,
+                    &format!("{p}.self_attn.o_proj.weight"),
+                    &[config.hidden_size, config.num_heads * config.head_dim],
+                ),
+                gate_proj: get_or_zeros(
+                    &weights,
+                    &format!("{p}.mlp.gate_proj.weight"),
+                    &[config.intermediate_size, config.hidden_size],
+                ),
+                up_proj: get_or_zeros(
+                    &weights,
+                    &format!("{p}.mlp.up_proj.weight"),
+                    &[config.intermediate_size, config.hidden_size],
+                ),
+                down_proj: get_or_zeros(
+                    &weights,
+                    &format!("{p}.mlp.down_proj.weight"),
+                    &[config.hidden_size, config.intermediate_size],
+                ),
             });
         }
 
@@ -271,18 +309,20 @@ impl Architecture for GemmaForCausalLM {
             add_inplace(&mut hidden, &attn_proj);
 
             // Post-attention RMSNorm with +1 offset + GeGLU MLP.
-            let normed2 = GemmaRMSNorm::forward(&hidden, &layer.post_attention_layernorm, self.rms_norm_eps)?;
-            let mlp_out = geglu_mlp_forward(
-                &normed2,
-                &layer.gate_proj,
-                &layer.up_proj,
-                &layer.down_proj,
-            )?;
+            let normed2 =
+                GemmaRMSNorm::forward(&hidden, &layer.post_attention_layernorm, self.rms_norm_eps)?;
+            let mlp_out =
+                geglu_mlp_forward(&normed2, &layer.gate_proj, &layer.up_proj, &layer.down_proj)?;
             add_inplace(&mut hidden, &mlp_out);
         }
 
         let normed_final = GemmaRMSNorm::forward(&hidden, &self.norm_weight, self.rms_norm_eps)?;
-        lm_head(&normed_final, &self.lm_head_weight, num_tokens, self.vocab_size)
+        lm_head(
+            &normed_final,
+            &self.lm_head_weight,
+            num_tokens,
+            self.vocab_size,
+        )
     }
 }
 
@@ -338,17 +378,61 @@ impl Gemma2ForCausalLM {
         for i in 0..config.num_layers {
             let p = format!("model.layers.{}", i);
             layers.push(Gemma2Layer {
-                input_layernorm: get_or_zeros(&weights, &format!("{p}.input_layernorm.weight"), &[config.hidden_size]),
-                post_attention_layernorm: get_or_zeros(&weights, &format!("{p}.post_attention_layernorm.weight"), &[config.hidden_size]),
-                pre_feedforward_layernorm: get_or_zeros(&weights, &format!("{p}.pre_feedforward_layernorm.weight"), &[config.hidden_size]),
-                post_feedforward_layernorm: get_or_zeros(&weights, &format!("{p}.post_feedforward_layernorm.weight"), &[config.hidden_size]),
-                q_proj: get_or_zeros(&weights, &format!("{p}.self_attn.q_proj.weight"), &[config.num_heads * config.head_dim, config.hidden_size]),
-                k_proj: get_or_zeros(&weights, &format!("{p}.self_attn.k_proj.weight"), &[config.num_kv_heads * config.head_dim, config.hidden_size]),
-                v_proj: get_or_zeros(&weights, &format!("{p}.self_attn.v_proj.weight"), &[config.num_kv_heads * config.head_dim, config.hidden_size]),
-                o_proj: get_or_zeros(&weights, &format!("{p}.self_attn.o_proj.weight"), &[config.hidden_size, config.num_heads * config.head_dim]),
-                gate_proj: get_or_zeros(&weights, &format!("{p}.mlp.gate_proj.weight"), &[config.intermediate_size, config.hidden_size]),
-                up_proj: get_or_zeros(&weights, &format!("{p}.mlp.up_proj.weight"), &[config.intermediate_size, config.hidden_size]),
-                down_proj: get_or_zeros(&weights, &format!("{p}.mlp.down_proj.weight"), &[config.hidden_size, config.intermediate_size]),
+                input_layernorm: get_or_zeros(
+                    &weights,
+                    &format!("{p}.input_layernorm.weight"),
+                    &[config.hidden_size],
+                ),
+                post_attention_layernorm: get_or_zeros(
+                    &weights,
+                    &format!("{p}.post_attention_layernorm.weight"),
+                    &[config.hidden_size],
+                ),
+                pre_feedforward_layernorm: get_or_zeros(
+                    &weights,
+                    &format!("{p}.pre_feedforward_layernorm.weight"),
+                    &[config.hidden_size],
+                ),
+                post_feedforward_layernorm: get_or_zeros(
+                    &weights,
+                    &format!("{p}.post_feedforward_layernorm.weight"),
+                    &[config.hidden_size],
+                ),
+                q_proj: get_or_zeros(
+                    &weights,
+                    &format!("{p}.self_attn.q_proj.weight"),
+                    &[config.num_heads * config.head_dim, config.hidden_size],
+                ),
+                k_proj: get_or_zeros(
+                    &weights,
+                    &format!("{p}.self_attn.k_proj.weight"),
+                    &[config.num_kv_heads * config.head_dim, config.hidden_size],
+                ),
+                v_proj: get_or_zeros(
+                    &weights,
+                    &format!("{p}.self_attn.v_proj.weight"),
+                    &[config.num_kv_heads * config.head_dim, config.hidden_size],
+                ),
+                o_proj: get_or_zeros(
+                    &weights,
+                    &format!("{p}.self_attn.o_proj.weight"),
+                    &[config.hidden_size, config.num_heads * config.head_dim],
+                ),
+                gate_proj: get_or_zeros(
+                    &weights,
+                    &format!("{p}.mlp.gate_proj.weight"),
+                    &[config.intermediate_size, config.hidden_size],
+                ),
+                up_proj: get_or_zeros(
+                    &weights,
+                    &format!("{p}.mlp.up_proj.weight"),
+                    &[config.intermediate_size, config.hidden_size],
+                ),
+                down_proj: get_or_zeros(
+                    &weights,
+                    &format!("{p}.mlp.down_proj.weight"),
+                    &[config.hidden_size, config.intermediate_size],
+                ),
             });
         }
 
@@ -418,11 +502,19 @@ impl Architecture for Gemma2ForCausalLM {
             let attn_proj = LinearLayer::forward(&attn_out, &layer.o_proj, None)?;
 
             // Post-attention RMSNorm with +1 offset.
-            let attn_normed = GemmaRMSNorm::forward(&attn_proj, &layer.post_attention_layernorm, self.rms_norm_eps)?;
+            let attn_normed = GemmaRMSNorm::forward(
+                &attn_proj,
+                &layer.post_attention_layernorm,
+                self.rms_norm_eps,
+            )?;
             add_inplace(&mut hidden, &attn_normed);
 
             // Pre-feedforward RMSNorm with +1 offset.
-            let ff_normed = GemmaRMSNorm::forward(&hidden, &layer.pre_feedforward_layernorm, self.rms_norm_eps)?;
+            let ff_normed = GemmaRMSNorm::forward(
+                &hidden,
+                &layer.pre_feedforward_layernorm,
+                self.rms_norm_eps,
+            )?;
 
             let mlp_out = geglu_mlp_forward(
                 &ff_normed,
@@ -432,12 +524,21 @@ impl Architecture for Gemma2ForCausalLM {
             )?;
 
             // Post-feedforward RMSNorm with +1 offset.
-            let mlp_normed = GemmaRMSNorm::forward(&mlp_out, &layer.post_feedforward_layernorm, self.rms_norm_eps)?;
+            let mlp_normed = GemmaRMSNorm::forward(
+                &mlp_out,
+                &layer.post_feedforward_layernorm,
+                self.rms_norm_eps,
+            )?;
             add_inplace(&mut hidden, &mlp_normed);
         }
 
         let normed_final = GemmaRMSNorm::forward(&hidden, &self.norm_weight, self.rms_norm_eps)?;
-        let mut logits = lm_head(&normed_final, &self.lm_head_weight, num_tokens, self.vocab_size)?;
+        let mut logits = lm_head(
+            &normed_final,
+            &self.lm_head_weight,
+            num_tokens,
+            self.vocab_size,
+        )?;
 
         // Final logit soft-capping.
         if self.final_logit_softcap > 0.0 {
@@ -554,10 +655,7 @@ mod tests {
 
     #[test]
     fn softcap_f32_bounds() {
-        let mut buf = GpuBuffer::from_vec(
-            vec![-500.0, -10.0, 0.0, 10.0, 500.0],
-            vec![5],
-        );
+        let mut buf = GpuBuffer::from_vec(vec![-500.0, -10.0, 0.0, 10.0, 500.0], vec![5]);
         softcap_inplace_f32(&mut buf, 50.0);
         for v in &buf.data {
             assert!(*v >= -50.0 && *v <= 50.0, "value {} out of [-50, 50]", v);

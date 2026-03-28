@@ -3,8 +3,8 @@
 use std::collections::HashMap;
 
 use rand::Rng;
-use tracing::trace;
 use rvllm_core::prelude::{LLMError, Result, SamplingParams, TokenId};
+use tracing::trace;
 
 use crate::logit_processors;
 use crate::math;
@@ -183,8 +183,12 @@ mod tests {
 
         let mut same = true;
         for _ in 0..20 {
-            let o1 = sampler.sample(&logits, 1000, &params, &[], &mut rng1).unwrap();
-            let o2 = sampler.sample(&logits, 1000, &params, &[], &mut rng2).unwrap();
+            let o1 = sampler
+                .sample(&logits, 1000, &params, &[], &mut rng1)
+                .unwrap();
+            let o2 = sampler
+                .sample(&logits, 1000, &params, &[], &mut rng2)
+                .unwrap();
             if o1.token_id != o2.token_id {
                 same = false;
                 break;

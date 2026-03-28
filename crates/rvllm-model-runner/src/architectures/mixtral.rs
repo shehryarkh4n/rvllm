@@ -8,9 +8,7 @@
 use half::f16;
 use tracing::trace;
 
-use crate::bridge::{
-    AttentionBackend, CacheEngine, GpuBuffer, ModelWeights, Result,
-};
+use crate::bridge::{AttentionBackend, CacheEngine, GpuBuffer, ModelWeights, Result};
 use crate::input::ModelInput;
 use crate::layers::linear::LinearLayer;
 use crate::layers::moe::{ExpertFFN, MoELayer};
@@ -173,8 +171,7 @@ impl Architecture for MixtralForCausalLM {
             trace!(layer = layer_idx, "mixtral layer forward");
 
             // Pre-attention RMSNorm.
-            let normed =
-                RMSNorm::forward(&hidden, &layer.input_layernorm, self.rms_norm_eps)?;
+            let normed = RMSNorm::forward(&hidden, &layer.input_layernorm, self.rms_norm_eps)?;
 
             // QKV projections.
             let q = LinearLayer::forward(&normed, &layer.q_proj, None)?;
@@ -194,11 +191,8 @@ impl Architecture for MixtralForCausalLM {
             add_inplace(&mut hidden, &attn_proj);
 
             // Post-attention RMSNorm.
-            let normed2 = RMSNorm::forward(
-                &hidden,
-                &layer.post_attention_layernorm,
-                self.rms_norm_eps,
-            )?;
+            let normed2 =
+                RMSNorm::forward(&hidden, &layer.post_attention_layernorm, self.rms_norm_eps)?;
 
             // Sparse MoE FFN replaces the dense MLP.
             let moe_out = layer.moe.forward(&normed2)?;
@@ -207,16 +201,19 @@ impl Architecture for MixtralForCausalLM {
 
         // Final RMSNorm + LM head.
         let normed_final = RMSNorm::forward(&hidden, &self.norm_weight, self.rms_norm_eps)?;
-        lm_head(&normed_final, &self.lm_head_weight, num_tokens, self.vocab_size)
+        lm_head(
+            &normed_final,
+            &self.lm_head_weight,
+            num_tokens,
+            self.vocab_size,
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bridge::{
-        AttentionMetadata, CacheEngine, MockAttentionBackend, ModelWeights,
-    };
+    use crate::bridge::{AttentionMetadata, CacheEngine, MockAttentionBackend, ModelWeights};
     use crate::input::ModelInput;
     use crate::runner::ModelRunnerConfig;
 
@@ -266,8 +263,7 @@ mod tests {
     fn mixtral_via_factory() {
         let config = test_config();
         let weights = ModelWeights::default();
-        let model =
-            super::super::create_model("MixtralForCausalLM", weights, &config).unwrap();
+        let model = super::super::create_model("MixtralForCausalLM", weights, &config).unwrap();
         let input = test_input();
         let cache = CacheEngine::new(1, 64);
         let attention = MockAttentionBackend;

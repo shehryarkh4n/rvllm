@@ -12,8 +12,8 @@ mod inner {
 
     use cudarc::driver::{CudaDevice, CudaSlice, CudaStream, LaunchAsync, LaunchConfig};
     use half::f16;
-    use tracing::debug;
     use rvllm_core::prelude::{LLMError, Result};
+    use tracing::debug;
 
     const COPY_BLOCKS_MODULE: &str = "copy_blocks";
     const COPY_BLOCKS_FN: &str = "copy_blocks_kernel";
@@ -44,9 +44,8 @@ mod inner {
             ))
         })?;
 
-        let ptx = cudarc::nvrtc::compile_ptx(ptx_src).map_err(|e| {
-            LLMError::GpuError(format!("failed to compile copy_blocks PTX: {e}"))
-        })?;
+        let ptx = cudarc::nvrtc::compile_ptx(ptx_src)
+            .map_err(|e| LLMError::GpuError(format!("failed to compile copy_blocks PTX: {e}")))?;
 
         device
             .load_ptx(ptx, COPY_BLOCKS_MODULE, &[COPY_BLOCKS_FN])
@@ -102,9 +101,7 @@ mod inner {
         let func = device
             .get_func(COPY_BLOCKS_MODULE, COPY_BLOCKS_FN)
             .ok_or_else(|| {
-                LLMError::GpuError(
-                    "copy_blocks_kernel not found after module load".into(),
-                )
+                LLMError::GpuError("copy_blocks_kernel not found after module load".into())
             })?;
 
         // SAFETY: kernel signature matches copy_blocks_kernel(float*, float*, long*, int, int, int, int).

@@ -143,7 +143,10 @@ mod tests {
             ApiError::InvalidRequest("".into()).error_type(),
             "invalid_request_error"
         );
-        assert_eq!(ApiError::EngineError("".into()).error_type(), "server_error");
+        assert_eq!(
+            ApiError::EngineError("".into()).error_type(),
+            "server_error"
+        );
     }
 
     #[test]

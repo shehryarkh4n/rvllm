@@ -15,10 +15,10 @@
 //! pending that crate's API alignment with `rvllm_sequence` types.
 
 pub mod async_engine;
-pub mod beam_search;
-pub mod best_of_n;
 #[cfg(feature = "cuda")]
 pub mod async_gpu_engine;
+pub mod beam_search;
+pub mod best_of_n;
 pub mod engine;
 #[cfg(feature = "cuda")]
 pub mod gpu_engine;

@@ -11,9 +11,7 @@
 use half::f16;
 use tracing::trace;
 
-use crate::bridge::{
-    AttentionBackend, CacheEngine, GpuBuffer, ModelWeights, Result,
-};
+use crate::bridge::{AttentionBackend, CacheEngine, GpuBuffer, ModelWeights, Result};
 use crate::input::ModelInput;
 use crate::layers::linear::LinearLayer;
 use crate::layers::mlp::MLP;
@@ -324,23 +322,11 @@ impl Architecture for PhiForCausalLM {
             match layer {
                 PhiLayer::V2(l) => {
                     trace!(layer = layer_idx, "phi2 layer forward");
-                    self.forward_phi2_layer(
-                        &mut hidden,
-                        l,
-                        input,
-                        attention,
-                        layer_idx,
-                    )?;
+                    self.forward_phi2_layer(&mut hidden, l, input, attention, layer_idx)?;
                 }
                 PhiLayer::V3(l) => {
                     trace!(layer = layer_idx, "phi3 layer forward");
-                    self.forward_phi3_layer(
-                        &mut hidden,
-                        l,
-                        input,
-                        attention,
-                        layer_idx,
-                    )?;
+                    self.forward_phi3_layer(&mut hidden, l, input, attention, layer_idx)?;
                 }
             }
         }
@@ -400,22 +386,12 @@ impl PhiForCausalLM {
             self.config.rotary_dim,
         )?;
 
-        let attn_out = attention.forward(
-            &q_rot,
-            &k_rot,
-            &v,
-            &input.attention_metadata,
-            layer_idx,
-        )?;
+        let attn_out =
+            attention.forward(&q_rot, &k_rot, &v, &input.attention_metadata, layer_idx)?;
         let attn_proj = LinearLayer::forward(&attn_out, &layer.o_proj, layer.o_bias.as_ref())?;
 
         // --- MLP path (parallel with attention) ---
-        let mlp_out = MLP::forward(
-            &normed,
-            &layer.gate_proj,
-            &layer.up_proj,
-            &layer.down_proj,
-        )?;
+        let mlp_out = MLP::forward(&normed, &layer.gate_proj, &layer.up_proj, &layer.down_proj)?;
 
         // Both residuals added simultaneously.
         add_inplace(hidden, &attn_proj);
@@ -434,25 +410,17 @@ impl PhiForCausalLM {
         layer_idx: usize,
     ) -> Result<()> {
         // Pre-attention RMSNorm.
-        let normed = RMSNorm::forward(
-            hidden,
-            &layer.input_layernorm,
-            self.config.norm_eps,
-        )?;
+        let normed = RMSNorm::forward(hidden, &layer.input_layernorm, self.config.norm_eps)?;
 
         let mut q = LinearLayer::forward(&normed, &layer.q_proj, None)?;
         let mut k = LinearLayer::forward(&normed, &layer.k_proj, None)?;
         let v = LinearLayer::forward(&normed, &layer.v_proj, None)?;
 
         // Optional QK layernorm (Phi-3 specific).
-        if let (Some(qw), Some(qb)) =
-            (&layer.q_layernorm_weight, &layer.q_layernorm_bias)
-        {
+        if let (Some(qw), Some(qb)) = (&layer.q_layernorm_weight, &layer.q_layernorm_bias) {
             q = LayerNorm::forward(&q, qw, qb, self.config.norm_eps)?;
         }
-        if let (Some(kw), Some(kb)) =
-            (&layer.k_layernorm_weight, &layer.k_layernorm_bias)
-        {
+        if let (Some(kw), Some(kb)) = (&layer.k_layernorm_weight, &layer.k_layernorm_bias) {
             k = LayerNorm::forward(&k, kw, kb, self.config.norm_eps)?;
         }
 
@@ -465,13 +433,8 @@ impl PhiForCausalLM {
             self.config.rotary_dim,
         )?;
 
-        let attn_out = attention.forward(
-            &q_rot,
-            &k_rot,
-            &v,
-            &input.attention_metadata,
-            layer_idx,
-        )?;
+        let attn_out =
+            attention.forward(&q_rot, &k_rot, &v, &input.attention_metadata, layer_idx)?;
         let attn_proj = LinearLayer::forward(&attn_out, &layer.o_proj, None)?;
         add_inplace(hidden, &attn_proj);
 
@@ -484,11 +447,8 @@ impl PhiForCausalLM {
 
         // Phi-3 uses fused gate_up_proj: split output in half for gate and up.
         let fused = LinearLayer::forward(&normed2, &layer.gate_up_proj, None)?;
-        let mlp_out = split_gate_up_and_silu_down(
-            &fused,
-            &layer.down_proj,
-            self.config.intermediate_size,
-        )?;
+        let mlp_out =
+            split_gate_up_and_silu_down(&fused, &layer.down_proj, self.config.intermediate_size)?;
         add_inplace(hidden, &mlp_out);
 
         Ok(())
@@ -540,14 +500,8 @@ fn partial_rotary_forward(
     }
 
     // Apply standard RoPE to the rotary portions (using rotary_dim as head_dim).
-    let q_rot_buf = GpuBuffer::from_vec(
-        q_rot_part,
-        vec![num_tokens, num_q_heads * rotary_dim],
-    );
-    let k_rot_buf = GpuBuffer::from_vec(
-        k_rot_part,
-        vec![num_tokens, num_k_heads * rotary_dim],
-    );
+    let q_rot_buf = GpuBuffer::from_vec(q_rot_part, vec![num_tokens, num_q_heads * rotary_dim]);
+    let k_rot_buf = GpuBuffer::from_vec(k_rot_part, vec![num_tokens, num_k_heads * rotary_dim]);
     let (q_rotated, k_rotated) =
         RotaryEmbedding::forward(positions, &q_rot_buf, &k_rot_buf, rotary_dim)?;
 
@@ -599,14 +553,12 @@ fn split_gate_up_and_silu_down(
     for t in 0..num_tokens {
         let base = t * 2 * intermediate_size;
         gate_data.extend_from_slice(&fused.data[base..base + intermediate_size]);
-        up_data.extend_from_slice(
-            &fused.data[base + intermediate_size..base + 2 * intermediate_size],
-        );
+        up_data
+            .extend_from_slice(&fused.data[base + intermediate_size..base + 2 * intermediate_size]);
     }
 
     let activated = fused_silu_mul(&gate_data, &up_data);
-    let activated_buf =
-        GpuBuffer::from_vec(activated, vec![num_tokens, intermediate_size]);
+    let activated_buf = GpuBuffer::from_vec(activated, vec![num_tokens, intermediate_size]);
     LinearLayer::forward(&activated_buf, down_weight, None)
 }
 
@@ -626,10 +578,7 @@ mod tests {
     use super::*;
 
     fn make_buf(vals: &[f32], shape: Vec<usize>) -> GpuBuffer<f16> {
-        GpuBuffer::from_vec(
-            vals.iter().map(|&v| f16::from_f32(v)).collect(),
-            shape,
-        )
+        GpuBuffer::from_vec(vals.iter().map(|&v| f16::from_f32(v)).collect(), shape)
     }
 
     #[test]
@@ -637,13 +586,10 @@ mod tests {
         // At position 0, cos=1, sin=0 so the rotary part is identity.
         let head_dim = 8;
         let rotary_dim = 4;
-        let vals: Vec<f16> = (1..=8)
-            .map(|i| f16::from_f32(i as f32))
-            .collect();
+        let vals: Vec<f16> = (1..=8).map(|i| f16::from_f32(i as f32)).collect();
         let q = GpuBuffer::from_vec(vals.clone(), vec![1, head_dim]);
         let k = GpuBuffer::from_vec(vals.clone(), vec![1, head_dim]);
-        let (qr, kr) =
-            partial_rotary_forward(&[0], &q, &k, head_dim, rotary_dim).unwrap();
+        let (qr, kr) = partial_rotary_forward(&[0], &q, &k, head_dim, rotary_dim).unwrap();
         // All values should be unchanged at position 0.
         for i in 0..head_dim {
             assert!(
@@ -668,13 +614,10 @@ mod tests {
         // The pass-through portion (last half of head) must stay exactly the same.
         let head_dim = 8;
         let rotary_dim = 4;
-        let vals: Vec<f16> = (1..=8)
-            .map(|i| f16::from_f32(i as f32))
-            .collect();
+        let vals: Vec<f16> = (1..=8).map(|i| f16::from_f32(i as f32)).collect();
         let q = GpuBuffer::from_vec(vals.clone(), vec![1, head_dim]);
         let k = GpuBuffer::from_vec(vals.clone(), vec![1, head_dim]);
-        let (qr, kr) =
-            partial_rotary_forward(&[50], &q, &k, head_dim, rotary_dim).unwrap();
+        let (qr, kr) = partial_rotary_forward(&[50], &q, &k, head_dim, rotary_dim).unwrap();
         // Pass-through dims (indices 4..8) should be unchanged.
         for i in rotary_dim..head_dim {
             assert!(
@@ -693,8 +636,8 @@ mod tests {
             );
         }
         // Rotary dims (indices 0..4) should have changed at pos=50.
-        let q_changed = (0..rotary_dim)
-            .any(|i| (qr.data[i].to_f32() - q.data[i].to_f32()).abs() > 0.01);
+        let q_changed =
+            (0..rotary_dim).any(|i| (qr.data[i].to_f32() - q.data[i].to_f32()).abs() > 0.01);
         assert!(q_changed, "rotary dims should change at nonzero position");
     }
 
@@ -710,17 +653,10 @@ mod tests {
         let k = GpuBuffer::from_vec(vals.clone(), vec![1, head_dim]);
         let (qr_partial, kr_partial) =
             partial_rotary_forward(&[10], &q, &k, head_dim, head_dim).unwrap();
-        let (qr_standard, kr_standard) =
-            RotaryEmbedding::forward(&[10], &q, &k, head_dim).unwrap();
+        let (qr_standard, kr_standard) = RotaryEmbedding::forward(&[10], &q, &k, head_dim).unwrap();
         for i in 0..head_dim {
-            assert!(
-                (qr_partial.data[i].to_f32() - qr_standard.data[i].to_f32()).abs()
-                    < 0.01,
-            );
-            assert!(
-                (kr_partial.data[i].to_f32() - kr_standard.data[i].to_f32()).abs()
-                    < 0.01,
-            );
+            assert!((qr_partial.data[i].to_f32() - qr_standard.data[i].to_f32()).abs() < 0.01,);
+            assert!((kr_partial.data[i].to_f32() - kr_standard.data[i].to_f32()).abs() < 0.01,);
         }
     }
 

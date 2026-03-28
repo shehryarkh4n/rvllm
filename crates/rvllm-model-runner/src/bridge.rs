@@ -23,9 +23,7 @@ pub use rvllm_core::error::{LLMError, Result};
 // callers can migrate incrementally.
 pub mod upstream_gpu {
     pub use rvllm_gpu::prelude::{
-        GpuAllocator as RealGpuAllocator,
-        GpuBuffer as RealGpuBuffer,
-        GpuStream as RealGpuStream,
+        GpuAllocator as RealGpuAllocator, GpuBuffer as RealGpuBuffer, GpuStream as RealGpuStream,
         MemoryInfo,
     };
     // MockGpuAllocator is available when rvllm-gpu has mock-gpu (its default) and cuda is off.
@@ -38,8 +36,7 @@ pub mod upstream_gpu {
 // ---------------------------------------------------------------------------
 pub mod upstream_attention {
     pub use rvllm_attention::{
-        AttentionBackend as RealAttentionBackend,
-        AttentionMetadata as RealAttentionMetadata,
+        AttentionBackend as RealAttentionBackend, AttentionMetadata as RealAttentionMetadata,
         MockAttentionBackend as RealMockAttentionBackend,
     };
 }
@@ -57,8 +54,7 @@ pub mod upstream_attention {
 // ---------------------------------------------------------------------------
 pub mod upstream_model_loader {
     pub use rvllm_model_loader::weights::{
-        ModelWeights as RealModelWeights,
-        WeightTensor as RealWeightTensor,
+        ModelWeights as RealModelWeights, WeightTensor as RealWeightTensor,
     };
 }
 

@@ -100,7 +100,11 @@ impl OutputProcessor {
         seq_states: &[SequenceOutputState],
     ) -> RequestOutput {
         Self::build_request_output_with_prompt_logprobs(
-            request_id, prompt, prompt_token_ids, seq_states, None,
+            request_id,
+            prompt,
+            prompt_token_ids,
+            seq_states,
+            None,
         )
     }
 
@@ -242,12 +246,7 @@ mod tests {
     #[test]
     fn build_request_output_not_finished() {
         let s1 = SequenceOutputState::new();
-        let ro = OutputProcessor::build_request_output(
-            RequestId(1),
-            "prompt",
-            &[10, 20],
-            &[s1],
-        );
+        let ro = OutputProcessor::build_request_output(RequestId(1), "prompt", &[10, 20], &[s1]);
         assert_eq!(ro.request_id, RequestId(1));
         assert_eq!(ro.prompt, "prompt");
         assert_eq!(ro.prompt_token_ids, vec![10, 20]);
@@ -261,12 +260,7 @@ mod tests {
         s1.finish_reason = Some(FinishReason::Stop);
         s1.text = "done".into();
 
-        let ro = OutputProcessor::build_request_output(
-            RequestId(2),
-            "test",
-            &[5],
-            &[s1],
-        );
+        let ro = OutputProcessor::build_request_output(RequestId(2), "test", &[5], &[s1]);
         assert!(ro.finished);
     }
 
@@ -276,12 +270,7 @@ mod tests {
         s1.finish_reason = Some(FinishReason::Stop);
         let s2 = SequenceOutputState::new(); // not finished
 
-        let ro = OutputProcessor::build_request_output(
-            RequestId(3),
-            "multi",
-            &[1],
-            &[s1, s2],
-        );
+        let ro = OutputProcessor::build_request_output(RequestId(3), "multi", &[1], &[s1, s2]);
         assert!(!ro.finished); // one is not finished
         assert_eq!(ro.outputs.len(), 2);
         assert_eq!(ro.outputs[0].index, 0);

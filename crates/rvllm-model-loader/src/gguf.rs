@@ -1,7 +1,7 @@
 use std::path::Path;
 
-use tracing::{debug, info, warn};
 use rvllm_core::error::{LLMError, Result};
+use tracing::{debug, info, warn};
 
 use crate::dtype::DType;
 use crate::weights::{GpuAllocator, ModelWeights, WeightTensor};
@@ -57,7 +57,10 @@ impl GGUFLoader {
             if tensor_end > data.len() {
                 return Err(LLMError::ModelError(format!(
                     "tensor {} data [{}, {}) exceeds file size {}",
-                    info.name, tensor_start, tensor_end, data.len()
+                    info.name,
+                    tensor_start,
+                    tensor_end,
+                    data.len()
                 )));
             }
 
@@ -263,7 +266,11 @@ fn parse_tensor_info(data: &[u8], offset: usize) -> Result<(TensorInfo, usize)> 
     pos += 8;
 
     // Compute size in bytes from shape and dtype
-    let numel: usize = if shape.is_empty() { 1 } else { shape.iter().product() };
+    let numel: usize = if shape.is_empty() {
+        1
+    } else {
+        shape.iter().product()
+    };
     let dtype = DType::from_gguf_type(dtype_code).unwrap_or(DType::U8);
     let size_bytes = numel * dtype.size_of();
 
@@ -356,8 +363,8 @@ mod tests {
         let d1 = vec![0u8; 8];
         let d2 = vec![1u8; 4];
         let file_bytes = build_test_gguf(&[
-            ("a", &[2], 0, &d1),   // F32
-            ("b", &[4], 8, &d2),   // U8 (type 8)
+            ("a", &[2], 0, &d1), // F32
+            ("b", &[4], 8, &d2), // U8 (type 8)
         ]);
 
         let mut tmp = NamedTempFile::new().unwrap();

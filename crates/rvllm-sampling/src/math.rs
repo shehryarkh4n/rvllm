@@ -1,9 +1,9 @@
 //! Numerical primitives: softmax, log-softmax, top-logprobs extraction.
 //! Optimized for aarch64 NEON autovectorization via chunk-based processing.
 
-use std::collections::BinaryHeap;
-use std::cmp::Reverse;
 use rvllm_core::prelude::TokenId;
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 
 const CHUNK: usize = 8;
 
@@ -223,7 +223,9 @@ impl PartialOrd for OrdF32 {
 impl Ord for OrdF32 {
     #[inline]
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.0.partial_cmp(&other.0).unwrap_or(std::cmp::Ordering::Equal)
+        self.0
+            .partial_cmp(&other.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
     }
 }
 
@@ -243,8 +245,7 @@ pub fn top_logprobs(logits: &[f32], n: usize) -> Vec<(TokenId, f32)> {
 
     // Min-heap of size n: keep the n largest values
     // BinaryHeap is a max-heap, so we use Reverse to get a min-heap
-    let mut heap: BinaryHeap<Reverse<(OrdF32, u32)>> =
-        BinaryHeap::with_capacity(actual_n + 1);
+    let mut heap: BinaryHeap<Reverse<(OrdF32, u32)>> = BinaryHeap::with_capacity(actual_n + 1);
 
     for (i, &lp) in log_probs.iter().enumerate() {
         if heap.len() < actual_n {

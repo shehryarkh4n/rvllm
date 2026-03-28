@@ -1,8 +1,8 @@
 //! AttentionBackend trait definition and backend selection.
 
+use crate::buffer::GpuBuffer;
 use half::f16;
 use rvllm_core::prelude::Result;
-use crate::buffer::GpuBuffer;
 
 use crate::flash_attention_impl::FlashAttention2;
 use crate::paged_attention::PagedAttentionV2;

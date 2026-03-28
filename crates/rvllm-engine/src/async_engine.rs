@@ -177,11 +177,7 @@ impl AsyncLLMEngine {
                 match gen_rx.try_recv() {
                     Ok(req) => {
                         let rid = req.request_id;
-                        if let Err(e) = engine.add_request(
-                            rid,
-                            req.prompt,
-                            req.sampling_params,
-                        ) {
+                        if let Err(e) = engine.add_request(rid, req.prompt, req.sampling_params) {
                             error!(%rid, %e, "failed to add generate request");
                             continue;
                         }
@@ -286,7 +282,9 @@ fn rand_id() -> u64 {
     // Mix in thread id for uniqueness across concurrent callers
     let tid = std::thread::current().id();
     let tid_hash = format!("{:?}", tid).len() as u64;
-    (nanos as u64).wrapping_mul(6364136223846793005).wrapping_add(tid_hash)
+    (nanos as u64)
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(tid_hash)
 }
 
 #[cfg(test)]
@@ -405,8 +403,7 @@ mod tests {
         let scheduler = Box::new(MockScheduler::new());
         let executor = Box::new(MockExecutor::new());
 
-        let engine =
-            AsyncLLMEngine::new(config, executor, scheduler, tokenizer).unwrap();
+        let engine = AsyncLLMEngine::new(config, executor, scheduler, tokenizer).unwrap();
         assert!(engine.shutdown().is_ok());
     }
 
@@ -417,8 +414,7 @@ mod tests {
         let scheduler = Box::new(MockScheduler::new());
         let executor = Box::new(MockExecutor::new());
 
-        let engine =
-            AsyncLLMEngine::new(config, executor, scheduler, tokenizer).unwrap();
+        let engine = AsyncLLMEngine::new(config, executor, scheduler, tokenizer).unwrap();
 
         let mut params = SamplingParams::default();
         params.max_tokens = 2;

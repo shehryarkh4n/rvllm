@@ -195,7 +195,9 @@ impl AttentionBackend for CudaPagedAttention {
                     max_blocks as i32,
                 ),
             )
-            .map_err(|e| LLMError::GpuError(format!("paged_attention kernel launch failed: {e}")))?;
+            .map_err(|e| {
+                LLMError::GpuError(format!("paged_attention kernel launch failed: {e}"))
+            })?;
         }
 
         // -- synchronize and download -----------------------------------------

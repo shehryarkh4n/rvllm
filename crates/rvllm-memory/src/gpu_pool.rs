@@ -3,9 +3,9 @@
 use std::collections::VecDeque;
 
 use parking_lot::Mutex;
-use tracing::{debug, warn};
 use rvllm_core::prelude::{BlockId, LLMError, Result};
 use rvllm_gpu::prelude::{CpuBuffer, GpuAllocator, GpuBuffer};
+use tracing::{debug, warn};
 
 use crate::block::{CpuBlock, DeviceType, PhysicalBlock};
 use crate::pool::MemoryPool;

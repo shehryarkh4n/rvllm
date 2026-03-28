@@ -3,9 +3,9 @@
 use std::path::Path;
 
 use hf_hub::api::sync::Api;
+use rvllm_core::prelude::{LLMError, Result, TokenId};
 use tokenizers::Tokenizer as HfTokenizer;
 use tracing::{debug, info};
-use rvllm_core::prelude::{LLMError, Result, TokenId};
 
 use crate::chat::{apply_chatml, ChatMessage};
 use crate::incremental::IncrementalDecoder;
@@ -28,7 +28,10 @@ impl Tokenizer {
         // Check HF cache first (avoids network round-trip when model is already downloaded)
         {
             let hf_home = std::env::var("HF_HOME").unwrap_or_else(|_| {
-                format!("{}/.cache/huggingface", std::env::var("HOME").unwrap_or_default())
+                format!(
+                    "{}/.cache/huggingface",
+                    std::env::var("HOME").unwrap_or_default()
+                )
             });
             let cache_snap = std::path::Path::new(&hf_home)
                 .join("hub")
@@ -63,9 +66,8 @@ impl Tokenizer {
         }
 
         // Download tokenizer.json from HuggingFace hub
-        let api = Api::new().map_err(|e| {
-            LLMError::TokenizerError(format!("failed to init hf-hub API: {}", e))
-        })?;
+        let api = Api::new()
+            .map_err(|e| LLMError::TokenizerError(format!("failed to init hf-hub API: {}", e)))?;
         let repo = api.model(model_name_or_path.to_string());
         let tokenizer_path = repo.get("tokenizer.json").map_err(|e| {
             LLMError::TokenizerError(format!(
@@ -107,7 +109,11 @@ impl Tokenizer {
             if token.special {
                 special_tokens.push(id);
                 let content = token.content.to_lowercase();
-                if content.contains("eos") || content == "</s>" || content == "<|endoftext|>" || content == "<|im_end|>" {
+                if content.contains("eos")
+                    || content == "</s>"
+                    || content == "<|endoftext|>"
+                    || content == "<|im_end|>"
+                {
                     eos_token_id = Some(id);
                 }
                 if content.contains("bos") || content == "<s>" || content == "<|begin_of_text|>" {
@@ -143,25 +149,27 @@ impl Tokenizer {
 
     /// Encode text into token IDs.
     pub fn encode(&self, text: &str) -> Result<Vec<TokenId>> {
-        let encoding = self.inner.encode(text, false).map_err(|e| {
-            LLMError::TokenizerError(format!("encode failed: {}", e))
-        })?;
+        let encoding = self
+            .inner
+            .encode(text, false)
+            .map_err(|e| LLMError::TokenizerError(format!("encode failed: {}", e)))?;
         Ok(encoding.get_ids().to_vec())
     }
 
     /// Encode a batch of texts into token IDs.
     pub fn encode_batch(&self, texts: &[&str]) -> Result<Vec<Vec<TokenId>>> {
-        let encodings = self.inner.encode_batch(texts.to_vec(), false).map_err(|e| {
-            LLMError::TokenizerError(format!("encode_batch failed: {}", e))
-        })?;
+        let encodings = self
+            .inner
+            .encode_batch(texts.to_vec(), false)
+            .map_err(|e| LLMError::TokenizerError(format!("encode_batch failed: {}", e)))?;
         Ok(encodings.iter().map(|e| e.get_ids().to_vec()).collect())
     }
 
     /// Decode token IDs back to text.
     pub fn decode(&self, tokens: &[TokenId]) -> Result<String> {
-        self.inner.decode(tokens, true).map_err(|e| {
-            LLMError::TokenizerError(format!("decode failed: {}", e))
-        })
+        self.inner
+            .decode(tokens, true)
+            .map_err(|e| LLMError::TokenizerError(format!("decode failed: {}", e)))
     }
 
     /// Streaming decode: feed one token at a time, get text back when a

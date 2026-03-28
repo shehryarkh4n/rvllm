@@ -95,8 +95,7 @@ impl MoELayer {
                 let w = weights[rank];
                 for h in 0..hidden_size {
                     let cur = output[out_offset + h].to_f32();
-                    output[out_offset + h] =
-                        f16::from_f32(cur + expert_out.data[h].to_f32() * w);
+                    output[out_offset + h] = f16::from_f32(cur + expert_out.data[h].to_f32() * w);
                 }
             }
 
@@ -105,8 +104,7 @@ impl MoELayer {
                 let shared_out = shared.forward(&tok_buf)?;
                 for h in 0..hidden_size {
                     let cur = output[out_offset + h].to_f32();
-                    output[out_offset + h] =
-                        f16::from_f32(cur + shared_out.data[h].to_f32());
+                    output[out_offset + h] = f16::from_f32(cur + shared_out.data[h].to_f32());
                 }
             }
         }

@@ -68,10 +68,7 @@ pub fn quantize_q4_0(values: &[f32], group_size: usize) -> (Vec<u8>, Vec<f32>) {
         let group = &values[start..end];
 
         // Find max absolute value after centering
-        let max_abs = group
-            .iter()
-            .map(|v| v.abs())
-            .fold(0.0f32, f32::max);
+        let max_abs = group.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
 
         let scale = if max_abs == 0.0 { 1.0 } else { max_abs / 7.0 };
         scales.push(scale);
@@ -179,10 +176,7 @@ mod tests {
         let restored = dequantize_q4_0(&data, &scales, (2, 32));
         assert_eq!(restored.len(), 64);
         for (o, r) in original.iter().zip(restored.iter()) {
-            assert!(
-                (o - r).abs() < 0.3,
-                "original={o}, restored={r}",
-            );
+            assert!((o - r).abs() < 0.3, "original={o}, restored={r}",);
         }
     }
 }

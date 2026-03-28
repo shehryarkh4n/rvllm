@@ -20,13 +20,13 @@ mod cuda_impl {
     use crate::bridge::{LLMError, Result};
     use crate::runner::ModelRunnerConfig;
 
-    use rvllm_gpu::kernel_loader::KernelLoader;
-    use rvllm_model_loader::gpu_weights::GpuModelWeights;
-    use rvllm_kv_cache::engine_cuda::CudaCacheEngine;
+    use crate::gpu_layer::{GpuLayerConfig, GpuLayerInput, GpuLayerWeights, GpuTransformerLayer};
     use crate::layers::linear_cuda::CudaLinearLayer;
     use crate::layers::norm_cuda::CudaRMSNorm;
-    use crate::gpu_layer::{GpuLayerConfig, GpuLayerInput, GpuLayerWeights, GpuTransformerLayer};
+    use rvllm_gpu::kernel_loader::KernelLoader;
     use rvllm_gpu::prelude::CublasHandle;
+    use rvllm_kv_cache::engine_cuda::CudaCacheEngine;
+    use rvllm_model_loader::gpu_weights::GpuModelWeights;
 
     pub struct GpuModelRunner {
         weights: GpuModelWeights,
@@ -75,7 +75,11 @@ mod cuda_impl {
             let lm_head_weight = weights
                 .get("lm_head.weight")
                 .or_else(|| weights.get("model.embed_tokens.weight"))
-                .ok_or_else(|| LLMError::GpuError("missing lm_head.weight and model.embed_tokens.weight".into()))?
+                .ok_or_else(|| {
+                    LLMError::GpuError(
+                        "missing lm_head.weight and model.embed_tokens.weight".into(),
+                    )
+                })?
                 .clone();
 
             let mut layers = Vec::with_capacity(config.num_layers);
@@ -107,9 +111,11 @@ mod cuda_impl {
                     sin_table[pos * half_dim + i] = theta.sin();
                 }
             }
-            let rope_cos = device.htod_sync_copy(&cos_table)
+            let rope_cos = device
+                .htod_sync_copy(&cos_table)
                 .map_err(|e| LLMError::GpuError(format!("rope cos HtoD: {e}")))?;
-            let rope_sin = device.htod_sync_copy(&sin_table)
+            let rope_sin = device
+                .htod_sync_copy(&sin_table)
                 .map_err(|e| LLMError::GpuError(format!("rope sin HtoD: {e}")))?;
             info!(max_pos, half_dim, "RoPE tables uploaded to GPU");
 
@@ -151,31 +157,41 @@ mod cuda_impl {
 
             // Upload positions to GPU as i32 (CUDA kernels expect int*)
             let pos_i32: Vec<i32> = positions.iter().map(|&p| p as i32).collect();
-            let positions_gpu: CudaSlice<i32> = self.device
+            let positions_gpu: CudaSlice<i32> = self
+                .device
                 .htod_sync_copy(&pos_i32)
                 .map_err(|e| LLMError::GpuError(format!("positions HtoD: {e}")))?;
 
             // Upload context_lens as i32
             let cl_i32: Vec<i32> = attn_meta.context_lens.iter().map(|&c| c as i32).collect();
-            let context_lens_gpu: CudaSlice<i32> = self.device
+            let context_lens_gpu: CudaSlice<i32> = self
+                .device
                 .htod_sync_copy(&cl_i32)
                 .map_err(|e| LLMError::GpuError(format!("context_lens HtoD: {e}")))?;
 
             // Flatten block_tables to [num_seqs, max_blocks_per_seq] row-major as i32
-            let max_blocks = attn_meta.block_tables.iter().map(|r| r.len()).max().unwrap_or(1).max(1);
+            let max_blocks = attn_meta
+                .block_tables
+                .iter()
+                .map(|r| r.len())
+                .max()
+                .unwrap_or(1)
+                .max(1);
             let mut flat_bt = vec![0i32; num_seqs * max_blocks];
             for (s, row) in attn_meta.block_tables.iter().enumerate() {
                 for (b, &blk) in row.iter().enumerate() {
                     flat_bt[s * max_blocks + b] = blk as i32;
                 }
             }
-            let block_tables_gpu: CudaSlice<i32> = self.device
+            let block_tables_gpu: CudaSlice<i32> = self
+                .device
                 .htod_sync_copy(&flat_bt)
                 .map_err(|e| LLMError::GpuError(format!("block_tables HtoD: {e}")))?;
 
             // Upload slot_mapping as i32
             let sm_i32: Vec<i32> = attn_meta.slot_mapping.iter().map(|&s| s as i32).collect();
-            let slot_mapping_gpu: CudaSlice<i32> = self.device
+            let slot_mapping_gpu: CudaSlice<i32> = self
+                .device
                 .htod_sync_copy(&sm_i32)
                 .map_err(|e| LLMError::GpuError(format!("slot_mapping HtoD: {e}")))?;
 
@@ -186,17 +202,27 @@ mod cuda_impl {
             let call_num = CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let probe = false; // disabled -- stream race fixed
             if probe {
-                eprintln!("STEP {} prefill={} toks={:?} pos={:?} slots={:?} ctx={:?} maxctx={}",
-                    call_num, is_prefill, token_ids, positions,
+                eprintln!(
+                    "STEP {} prefill={} toks={:?} pos={:?} slots={:?} ctx={:?} maxctx={}",
+                    call_num,
+                    is_prefill,
+                    token_ids,
+                    positions,
                     &attn_meta.slot_mapping[..8.min(attn_meta.slot_mapping.len())],
-                    &attn_meta.context_lens, max_context_len);
+                    &attn_meta.context_lens,
+                    max_context_len
+                );
             }
 
             // Decode-specific probe (first decode call only)
-            static DECODE_PROBED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-            let decode_probe = !is_prefill && !DECODE_PROBED.swap(true, std::sync::atomic::Ordering::Relaxed);
+            static DECODE_PROBED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            let decode_probe =
+                !is_prefill && !DECODE_PROBED.swap(true, std::sync::atomic::Ordering::Relaxed);
             // Reset if this was a prefill call (only arm on actual decode)
-            if is_prefill { DECODE_PROBED.store(false, std::sync::atomic::Ordering::Relaxed); }
+            if is_prefill {
+                DECODE_PROBED.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
             if probe {
                 info!(
                     ?token_ids,
@@ -228,11 +254,17 @@ mod cuda_impl {
             info!("gpu_runner: embedding lookup");
             let mut hidden_states = self.embedding_lookup(token_ids)?;
             if probe {
-                let h: Vec<f32> = self.device.dtoh_sync_copy(&hidden_states).map_err(|e| LLMError::GpuError(format!("probe DtoH: {e}")))?;
+                let h: Vec<f32> = self
+                    .device
+                    .dtoh_sync_copy(&hidden_states)
+                    .map_err(|e| LLMError::GpuError(format!("probe DtoH: {e}")))?;
                 info!(len = h.len(), first5 = ?&h[..5.min(h.len())], "PROBE embed");
             }
             if decode_probe {
-                let h: Vec<f32> = self.device.dtoh_sync_copy(&hidden_states).map_err(|e| LLMError::GpuError(format!("decode probe DtoH: {e}")))?;
+                let h: Vec<f32> = self
+                    .device
+                    .dtoh_sync_copy(&hidden_states)
+                    .map_err(|e| LLMError::GpuError(format!("decode probe DtoH: {e}")))?;
                 info!(len = h.len(), first5 = ?&h[..5.min(h.len())], "DECODE_PROBE embed");
             }
 
@@ -263,15 +295,24 @@ mod cuda_impl {
                 };
                 hidden_states = layer.forward(&input, &weights, &self.blas)?;
                 if probe && layer_idx == 0 {
-                    let h: Vec<f32> = self.device.dtoh_sync_copy(&hidden_states).map_err(|e| LLMError::GpuError(format!("probe DtoH: {e}")))?;
+                    let h: Vec<f32> = self
+                        .device
+                        .dtoh_sync_copy(&hidden_states)
+                        .map_err(|e| LLMError::GpuError(format!("probe DtoH: {e}")))?;
                     let nan = h.iter().any(|v| v.is_nan());
                     let mx = h.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                     info!(nan, max = mx, first5 = ?&h[..5.min(h.len())], "PROBE layer0 output");
 
                     // Read back cache block 0 for layer 0 to verify reshape_and_cache
                     let (kc, vc) = &gpu_cache[0];
-                    let kc_host: Vec<f32> = self.device.dtoh_sync_copy(kc).map_err(|e| LLMError::GpuError(format!("probe DtoH: {e}")))?;
-                    let vc_host: Vec<f32> = self.device.dtoh_sync_copy(vc).map_err(|e| LLMError::GpuError(format!("probe DtoH: {e}")))?;
+                    let kc_host: Vec<f32> = self
+                        .device
+                        .dtoh_sync_copy(kc)
+                        .map_err(|e| LLMError::GpuError(format!("probe DtoH: {e}")))?;
+                    let vc_host: Vec<f32> = self
+                        .device
+                        .dtoh_sync_copy(vc)
+                        .map_err(|e| LLMError::GpuError(format!("probe DtoH: {e}")))?;
                     // Cache layout: [num_blocks, block_size, num_kv_heads, head_dim]
                     // Block 0, offset 0, kv_head 0: first head_dim elements
                     let head_dim = self.config.head_dim;
@@ -285,14 +326,20 @@ mod cuda_impl {
                     );
                 }
                 if decode_probe && layer_idx == 0 {
-                    let h: Vec<f32> = self.device.dtoh_sync_copy(&hidden_states).map_err(|e| LLMError::GpuError(format!("decode probe DtoH: {e}")))?;
+                    let h: Vec<f32> = self
+                        .device
+                        .dtoh_sync_copy(&hidden_states)
+                        .map_err(|e| LLMError::GpuError(format!("decode probe DtoH: {e}")))?;
                     let nan = h.iter().any(|v| v.is_nan());
                     let mx = h.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                     info!(nan, max = mx, first5 = ?&h[..5.min(h.len())], "DECODE_PROBE layer0 output");
                 }
                 if probe && layer_idx == num_layers - 1 {
                     // Dump last token's hidden state after final layer
-                    let h: Vec<f32> = self.device.dtoh_sync_copy(&hidden_states).map_err(|e| LLMError::GpuError(format!("probe DtoH: {e}")))?;
+                    let h: Vec<f32> = self
+                        .device
+                        .dtoh_sync_copy(&hidden_states)
+                        .map_err(|e| LLMError::GpuError(format!("probe DtoH: {e}")))?;
                     let last_start = (num_tokens - 1) * hidden_size;
                     let last_h = &h[last_start..last_start + hidden_size];
                     let mx = last_h.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
@@ -304,7 +351,10 @@ mod cuda_impl {
                 }
             }
             if decode_probe {
-                let h: Vec<f32> = self.device.dtoh_sync_copy(&hidden_states).map_err(|e| LLMError::GpuError(format!("decode probe DtoH: {e}")))?;
+                let h: Vec<f32> = self
+                    .device
+                    .dtoh_sync_copy(&hidden_states)
+                    .map_err(|e| LLMError::GpuError(format!("decode probe DtoH: {e}")))?;
                 info!(first5 = ?&h[..5.min(h.len())], "DECODE_PROBE final hidden state");
             }
 
@@ -329,13 +379,23 @@ mod cuda_impl {
             )?;
 
             // Step 5: DtoH
-            let logits_cpu = self.device
+            let logits_cpu = self
+                .device
                 .dtoh_sync_copy(&logits_gpu)
                 .map_err(|e| LLMError::GpuError(format!("logits DtoH: {e}")))?;
 
             if decode_probe {
-                let argmax = logits_cpu.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).map(|(i, _)| i).unwrap_or(0);
-                let mut top5: Vec<(usize, f32)> = logits_cpu.iter().enumerate().map(|(i, &v)| (i, v)).collect();
+                let argmax = logits_cpu
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+                let mut top5: Vec<(usize, f32)> = logits_cpu
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &v)| (i, v))
+                    .collect();
                 top5.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
                 top5.truncate(5);
                 info!(
@@ -350,39 +410,63 @@ mod cuda_impl {
                 // Last token's logits (what sampler uses)
                 let last_start = (num_tokens - 1) * vocab_size;
                 let last_logits = &logits_cpu[last_start..last_start + vocab_size];
-                let local_argmax = last_logits.iter().enumerate()
+                let local_argmax = last_logits
+                    .iter()
+                    .enumerate()
                     .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-                    .map(|(i, _)| i).unwrap_or(0);
-                let mut top5: Vec<(usize, f32)> = last_logits.iter().enumerate().map(|(i, &v)| (i, v)).collect();
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+                let mut top5: Vec<(usize, f32)> = last_logits
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &v)| (i, v))
+                    .collect();
                 top5.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
                 top5.truncate(5);
-                let last_max = last_logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let last_max = last_logits
+                    .iter()
+                    .cloned()
+                    .fold(f32::NEG_INFINITY, f32::max);
                 let last_min = last_logits.iter().cloned().fold(f32::INFINITY, f32::min);
                 let nan = last_logits.iter().any(|v| v.is_nan());
                 info!(num_tokens, vocab_size, local_argmax, nan, last_min, last_max, top5 = ?top5, "PROBE prefill last-token logits");
             }
-            debug!(logits_len = logits_cpu.len(), expected = num_tokens * vocab_size, "forward complete");
+            debug!(
+                logits_len = logits_cpu.len(),
+                expected = num_tokens * vocab_size,
+                "forward complete"
+            );
             Ok(logits_cpu)
         }
 
         /// Per-layer weight references into the GPU weight map.
         fn layer_weights(&self, i: usize) -> Result<GpuLayerWeights<'_>> {
             let g = |name: &str| -> Result<&CudaSlice<f32>> {
-                self.weights.get(name).ok_or_else(|| LLMError::GpuError(format!("missing weight: {name}")))
+                self.weights
+                    .get(name)
+                    .ok_or_else(|| LLMError::GpuError(format!("missing weight: {name}")))
             };
             Ok(GpuLayerWeights {
-                input_layernorm:           g(&format!("model.layers.{i}.input_layernorm.weight"))?,
-                q_proj:                    g(&format!("model.layers.{i}.self_attn.q_proj.weight"))?,
-                k_proj:                    g(&format!("model.layers.{i}.self_attn.k_proj.weight"))?,
-                v_proj:                    g(&format!("model.layers.{i}.self_attn.v_proj.weight"))?,
-                o_proj:                    g(&format!("model.layers.{i}.self_attn.o_proj.weight"))?,
-                q_proj_bias:               self.weights.get(&format!("model.layers.{i}.self_attn.q_proj.bias")),
-                k_proj_bias:               self.weights.get(&format!("model.layers.{i}.self_attn.k_proj.bias")),
-                v_proj_bias:               self.weights.get(&format!("model.layers.{i}.self_attn.v_proj.bias")),
-                post_attention_layernorm:  g(&format!("model.layers.{i}.post_attention_layernorm.weight"))?,
-                gate_proj:                 g(&format!("model.layers.{i}.mlp.gate_proj.weight"))?,
-                up_proj:                   g(&format!("model.layers.{i}.mlp.up_proj.weight"))?,
-                down_proj:                 g(&format!("model.layers.{i}.mlp.down_proj.weight"))?,
+                input_layernorm: g(&format!("model.layers.{i}.input_layernorm.weight"))?,
+                q_proj: g(&format!("model.layers.{i}.self_attn.q_proj.weight"))?,
+                k_proj: g(&format!("model.layers.{i}.self_attn.k_proj.weight"))?,
+                v_proj: g(&format!("model.layers.{i}.self_attn.v_proj.weight"))?,
+                o_proj: g(&format!("model.layers.{i}.self_attn.o_proj.weight"))?,
+                q_proj_bias: self
+                    .weights
+                    .get(&format!("model.layers.{i}.self_attn.q_proj.bias")),
+                k_proj_bias: self
+                    .weights
+                    .get(&format!("model.layers.{i}.self_attn.k_proj.bias")),
+                v_proj_bias: self
+                    .weights
+                    .get(&format!("model.layers.{i}.self_attn.v_proj.bias")),
+                post_attention_layernorm: g(&format!(
+                    "model.layers.{i}.post_attention_layernorm.weight"
+                ))?,
+                gate_proj: g(&format!("model.layers.{i}.mlp.gate_proj.weight"))?,
+                up_proj: g(&format!("model.layers.{i}.mlp.up_proj.weight"))?,
+                down_proj: g(&format!("model.layers.{i}.mlp.down_proj.weight"))?,
             })
         }
 
@@ -390,16 +474,19 @@ mod cuda_impl {
             let num_tokens = token_ids.len();
             let hidden_size = self.config.hidden_size;
 
-            let kernel = self.device
+            let kernel = self
+                .device
                 .get_func("embedding_gather", "embedding_gather_kernel")
                 .ok_or_else(|| LLMError::GpuError("embedding_gather_kernel not loaded".into()))?;
 
-            let output = self.device
+            let output = self
+                .device
                 .alloc_zeros::<f32>(num_tokens * hidden_size)
                 .map_err(|e| LLMError::GpuError(format!("embed alloc: {e}")))?;
 
             let ids_i32: Vec<i32> = token_ids.iter().map(|&t| t as i32).collect();
-            let ids_gpu = self.device
+            let ids_gpu = self
+                .device
                 .htod_sync_copy(&ids_i32)
                 .map_err(|e| LLMError::GpuError(format!("token_ids HtoD: {e}")))?;
 
@@ -411,13 +498,18 @@ mod cuda_impl {
             };
 
             unsafe {
-                kernel.launch(cfg, (
-                    &output,
-                    &self.embed_tokens,
-                    &ids_gpu,
-                    hidden_size as i32,
-                    self.config.vocab_size as i32,
-                )).map_err(|e| LLMError::GpuError(format!("embedding_gather launch: {e}")))?;
+                kernel
+                    .launch(
+                        cfg,
+                        (
+                            &output,
+                            &self.embed_tokens,
+                            &ids_gpu,
+                            hidden_size as i32,
+                            self.config.vocab_size as i32,
+                        ),
+                    )
+                    .map_err(|e| LLMError::GpuError(format!("embedding_gather launch: {e}")))?;
             }
 
             Ok(output)

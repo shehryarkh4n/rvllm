@@ -3,6 +3,8 @@
 pub mod activation;
 #[cfg(feature = "cuda")]
 pub mod activation_cuda;
+#[cfg(feature = "cuda")]
+pub mod fused_ops;
 pub mod linear;
 #[cfg(feature = "cuda")]
 pub mod linear_cuda;
@@ -16,5 +18,3 @@ pub mod rotary;
 pub mod rotary_cuda;
 #[cfg(feature = "cuda")]
 pub mod softmax_cuda;
-#[cfg(feature = "cuda")]
-pub mod fused_ops;

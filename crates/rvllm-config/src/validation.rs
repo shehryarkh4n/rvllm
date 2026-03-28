@@ -109,10 +109,14 @@ mod tests {
     fn bad_gpu_mem_utilization() {
         let mut cfg = valid_config();
         cfg.cache.gpu_memory_utilization = 0.0;
-        assert!(validate(&cfg).unwrap_err().contains("gpu_memory_utilization"));
+        assert!(validate(&cfg)
+            .unwrap_err()
+            .contains("gpu_memory_utilization"));
 
         cfg.cache.gpu_memory_utilization = 1.5;
-        assert!(validate(&cfg).unwrap_err().contains("gpu_memory_utilization"));
+        assert!(validate(&cfg)
+            .unwrap_err()
+            .contains("gpu_memory_utilization"));
     }
 
     #[test]

@@ -59,7 +59,9 @@ impl CublasHandle {
                         beta,
                         ldc: n as i32,
                     },
-                    b, a, c,
+                    b,
+                    a,
+                    c,
                 )
                 .map_err(|e| crate::LLMError::GpuError(format!("cuBLAS sgemm failed: {e}")))?;
         }
@@ -102,7 +104,9 @@ impl CublasHandle {
                         beta,
                         ldc: n as i32,
                     },
-                    b, a, c,
+                    b,
+                    a,
+                    c,
                 )
                 .map_err(|e| crate::LLMError::GpuError(format!("cuBLAS hgemm failed: {e}")))?;
         }
@@ -144,7 +148,9 @@ impl CublasHandle {
                         beta,
                         ldc: n as i32,
                     },
-                    b, a, c,
+                    b,
+                    a,
+                    c,
                 )
                 .map_err(|e| crate::LLMError::GpuError(format!("cuBLAS sgemm_nn failed: {e}")))?;
         }
@@ -205,7 +211,9 @@ impl CublasHandle {
                         beta,
                         incy: 1,
                     },
-                    a, x, y,
+                    a,
+                    x,
+                    y,
                 )
                 .map_err(|e| crate::LLMError::GpuError(format!("cuBLAS sgemv failed: {e}")))?;
         }
@@ -225,16 +233,10 @@ mod tests {
         let handle = CublasHandle::new(dev.clone()).unwrap();
 
         // A[2,3] row-major (activations)
-        let a_host: Vec<f32> = vec![
-            1.0, 2.0, 3.0,
-            4.0, 5.0, 6.0,
-        ];
+        let a_host: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
         // B[4,3] row-major (weights in PyTorch [out, in] layout)
         let b_host: Vec<f32> = vec![
-            1.0, 2.0, 3.0,
-            4.0, 5.0, 6.0,
-            7.0, 8.0, 9.0,
-            10.0, 11.0, 12.0,
+            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
         ];
 
         let a_gpu = dev.htod_sync_copy(&a_host).unwrap();
@@ -242,7 +244,9 @@ mod tests {
         let mut c_gpu = dev.alloc_zeros::<f32>(2 * 4).unwrap();
 
         // sgemm(m=2, n=4, k=3): C[2,4] = A[2,3] @ B[4,3]^T
-        handle.sgemm(2, 4, 3, 1.0, &a_gpu, &b_gpu, 0.0, &mut c_gpu).unwrap();
+        handle
+            .sgemm(2, 4, 3, 1.0, &a_gpu, &b_gpu, 0.0, &mut c_gpu)
+            .unwrap();
 
         let c_host = dev.dtoh_sync_copy(&c_gpu).unwrap();
 

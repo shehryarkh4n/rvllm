@@ -21,7 +21,10 @@ impl ExecutorFactory {
             let exec = SingleGpuExecutor::new(config)?;
             Ok(Box::new(exec))
         } else {
-            tracing::info!(num_gpus = config.num_gpus, "factory: selecting multi-gpu executor");
+            tracing::info!(
+                num_gpus = config.num_gpus,
+                "factory: selecting multi-gpu executor"
+            );
             let exec = MultiGpuExecutor::new(config)?;
             Ok(Box::new(exec))
         }
@@ -31,9 +34,9 @@ impl ExecutorFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
     use rvllm_core::prelude::{RequestId, SamplingParams, SequenceId};
     use rvllm_sequence::SequenceData;
+    use std::collections::HashMap;
 
     fn make_test_metadata(request_id: u64, is_prompt: bool) -> crate::SequenceGroupMetadata {
         let mut seq_data = HashMap::new();

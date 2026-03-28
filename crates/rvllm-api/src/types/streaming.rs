@@ -60,7 +60,13 @@ pub const SSE_DONE: &str = "data: [DONE]\n\n";
 
 impl CompletionStreamChunk {
     /// Create a chunk with incremental text for a single choice.
-    pub fn new(id: &str, model: &str, index: usize, text: &str, finish_reason: Option<String>) -> Self {
+    pub fn new(
+        id: &str,
+        model: &str,
+        index: usize,
+        text: &str,
+        finish_reason: Option<String>,
+    ) -> Self {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()

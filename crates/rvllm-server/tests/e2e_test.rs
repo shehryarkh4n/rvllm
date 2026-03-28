@@ -85,7 +85,10 @@ impl MockExecutor {
 }
 
 impl rvllm_engine::Executor for MockExecutor {
-    fn execute_model(&mut self, input: ExecutorInput) -> rvllm_core::prelude::Result<Vec<SamplerOutput>> {
+    fn execute_model(
+        &mut self,
+        input: ExecutorInput,
+    ) -> rvllm_core::prelude::Result<Vec<SamplerOutput>> {
         self.calls += 1;
         let mut outputs = Vec::new();
         for meta in &input.seq_group_metadata {
@@ -296,10 +299,7 @@ fn e2e_abort_request() {
     // that were scheduled, so we call step twice to ensure the bookkeeping
     // settles.
     let out = engine.step().unwrap();
-    assert!(
-        out.is_empty(),
-        "step after abort should produce no output"
-    );
+    assert!(out.is_empty(), "step after abort should produce no output");
 }
 
 /// Empty engine returns empty output on step().

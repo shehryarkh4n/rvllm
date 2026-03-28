@@ -40,7 +40,12 @@ pub fn verify_tokens(
     target_probs: &[Vec<f32>],
     draft_tokens: &[TokenId],
 ) -> VerificationResult {
-    verify_tokens_with_rng(draft_probs, target_probs, draft_tokens, &mut rand::thread_rng())
+    verify_tokens_with_rng(
+        draft_probs,
+        target_probs,
+        draft_tokens,
+        &mut rand::thread_rng(),
+    )
 }
 
 /// Deterministic version for testing: accepts an explicit RNG.
@@ -63,7 +68,11 @@ pub fn verify_tokens_with_rng<R: Rng>(
 
         // Modified rejection sampling: accept if r < min(1, tp/dp)
         let accept_prob = if dp <= 0.0 {
-            if tp > 0.0 { 1.0 } else { 0.0 }
+            if tp > 0.0 {
+                1.0
+            } else {
+                0.0
+            }
         } else {
             (tp / dp).min(1.0)
         };
@@ -73,11 +82,7 @@ pub fn verify_tokens_with_rng<R: Rng>(
             accepted_tokens.push(draft_tokens[i]);
         } else {
             // Rejection: resample from adjusted distribution max(0, target - draft)
-            let bonus = sample_adjusted_distribution(
-                &target_probs[i],
-                &draft_probs[i],
-                rng,
-            );
+            let bonus = sample_adjusted_distribution(&target_probs[i], &draft_probs[i], rng);
             let num_accepted = accepted_tokens.len();
             return VerificationResult {
                 accepted_tokens,
@@ -187,12 +192,8 @@ mod tests {
                 draft_tokens.push(token);
             }
 
-            let result = verify_tokens_with_rng(
-                &draft_probs,
-                &target_probs,
-                &draft_tokens,
-                &mut rng,
-            );
+            let result =
+                verify_tokens_with_rng(&draft_probs, &target_probs, &draft_tokens, &mut rng);
 
             assert_eq!(
                 result.num_accepted, k,
@@ -229,12 +230,7 @@ mod tests {
             draft_tokens.push(draft_tok);
         }
 
-        let result = verify_tokens_with_rng(
-            &draft_probs,
-            &target_probs,
-            &draft_tokens,
-            &mut rng,
-        );
+        let result = verify_tokens_with_rng(&draft_probs, &target_probs, &draft_tokens, &mut rng);
 
         // First token should be rejected since target_prob[draft_token] == 0
         assert_eq!(result.num_accepted, 0);
@@ -262,12 +258,7 @@ mod tests {
         let target_probs = vec![tp0, tp1];
         let draft_tokens = vec![1, 0];
 
-        let result = verify_tokens_with_rng(
-            &draft_probs,
-            &target_probs,
-            &draft_tokens,
-            &mut rng,
-        );
+        let result = verify_tokens_with_rng(&draft_probs, &target_probs, &draft_tokens, &mut rng);
 
         // First should be accepted, second rejected
         assert_eq!(result.num_accepted, 1);
@@ -298,12 +289,8 @@ mod tests {
                 draft_tokens.push(tok);
             }
 
-            let result = verify_tokens_with_rng(
-                &draft_probs,
-                &target_probs,
-                &draft_tokens,
-                &mut rng,
-            );
+            let result =
+                verify_tokens_with_rng(&draft_probs, &target_probs, &draft_tokens, &mut rng);
 
             assert_eq!(result.num_accepted, k);
             assert!(result.bonus_token.is_some());

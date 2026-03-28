@@ -204,20 +204,22 @@ mod tests {
         let draft_runner_ref = &engine.draft_runner;
         let vocab_size = draft_runner_ref.vocab_size();
 
-        let result = engine.step_with_probs(&[100, 200], |_input| {
-            // Reconstruct what the draft model would produce
-            let mut probs_vec = Vec::new();
-            let mut ctx = vec![100u32, 200];
-            for i in 0..3 {
-                let mut probs = vec![0.0f32; vocab_size];
-                let last = *ctx.last().unwrap();
-                let selected = ((last as usize + i + 1) % vocab_size) as u32;
-                probs[selected as usize] = 1.0;
-                ctx.push(selected);
-                probs_vec.push(probs);
-            }
-            probs_vec
-        }).unwrap();
+        let result = engine
+            .step_with_probs(&[100, 200], |_input| {
+                // Reconstruct what the draft model would produce
+                let mut probs_vec = Vec::new();
+                let mut ctx = vec![100u32, 200];
+                for i in 0..3 {
+                    let mut probs = vec![0.0f32; vocab_size];
+                    let last = *ctx.last().unwrap();
+                    let selected = ((last as usize + i + 1) % vocab_size) as u32;
+                    probs[selected as usize] = 1.0;
+                    ctx.push(selected);
+                    probs_vec.push(probs);
+                }
+                probs_vec
+            })
+            .unwrap();
 
         assert_eq!(result.num_accepted, k);
         assert_eq!(engine.metrics().total_steps, 1);

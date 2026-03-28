@@ -98,14 +98,29 @@ impl AppState {
 /// Build the axum router with all API routes.
 pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
-        .route("/v1/completions", post(routes::completions::create_completion))
-        .route("/v1/chat/completions", post(routes::chat::create_chat_completion))
-        .route("/v1/embeddings", post(routes::embeddings::create_embeddings))
+        .route(
+            "/v1/completions",
+            post(routes::completions::create_completion),
+        )
+        .route(
+            "/v1/chat/completions",
+            post(routes::chat::create_chat_completion),
+        )
+        .route(
+            "/v1/embeddings",
+            post(routes::embeddings::create_embeddings),
+        )
         .route("/v1/models", get(routes::models::list_models))
         .route("/v1/batches", post(routes::batch::create_batch))
         .route("/v1/batches/{batch_id}", get(routes::batch::get_batch))
-        .route("/v1/batches/{batch_id}/output", get(routes::batch::get_batch_output))
-        .route("/v1/batches/{batch_id}/cancel", post(routes::batch::cancel_batch))
+        .route(
+            "/v1/batches/{batch_id}/output",
+            get(routes::batch::get_batch_output),
+        )
+        .route(
+            "/v1/batches/{batch_id}/cancel",
+            post(routes::batch::cancel_batch),
+        )
         .route(
             "/v1/chat/completions/tools",
             post(routes::tools::create_chat_completion_with_tools),
@@ -139,12 +154,17 @@ fn cuda_gpu_available() -> bool {
         true
     }
     #[cfg(not(feature = "cuda"))]
-    { false }
+    {
+        false
+    }
 }
 
 pub async fn serve(config: EngineConfig) -> rvllm_core::prelude::Result<()> {
     let model_name = config.model.model_path.clone();
-    let tokenizer_path = config.model.tokenizer_path.clone()
+    let tokenizer_path = config
+        .model
+        .tokenizer_path
+        .clone()
         .unwrap_or_else(|| config.model.model_path.clone());
 
     info!(model = %model_name, "initializing engine");
@@ -163,13 +183,15 @@ pub async fn serve(config: EngineConfig) -> rvllm_core::prelude::Result<()> {
     let app = build_router(state);
 
     let host = std::env::var("VLLM_HOST").unwrap_or_else(|_| "0.0.0.0".into());
-    let port = std::env::var("VLLM_PORT").ok()
+    let port = std::env::var("VLLM_PORT")
+        .ok()
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(8000);
     let addr = format!("{host}:{port}");
     info!(addr = %addr, "starting API server");
 
-    let listener = tokio::net::TcpListener::bind(&addr).await
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
         .map_err(rvllm_core::prelude::LLMError::IoError)?;
 
     axum::serve(listener, app)
@@ -194,7 +216,9 @@ async fn create_gpu_engine(
 async fn create_gpu_engine(
     _config: EngineConfig,
 ) -> rvllm_core::prelude::Result<Arc<dyn InferenceEngine>> {
-    Err(rvllm_core::prelude::LLMError::GpuError("CUDA not available".into()))
+    Err(rvllm_core::prelude::LLMError::GpuError(
+        "CUDA not available".into(),
+    ))
 }
 
 fn create_engine(
@@ -212,10 +236,9 @@ fn create_engine(
         pipeline_parallel_size: config.parallel.pipeline_parallel_size,
     };
     let rt = tokio::runtime::Handle::current();
-    let executor = ExecutorAdapter::from_config(executor_config, rt)
-        .map_err(|e| rvllm_core::prelude::LLMError::ConfigError(format!(
-            "failed to create executor: {}", e
-        )))?;
+    let executor = ExecutorAdapter::from_config(executor_config, rt).map_err(|e| {
+        rvllm_core::prelude::LLMError::ConfigError(format!("failed to create executor: {}", e))
+    })?;
 
     let scheduler = Box::new(PlaceholderScheduler::new());
 
@@ -228,7 +251,9 @@ struct PlaceholderScheduler {
 }
 
 impl PlaceholderScheduler {
-    fn new() -> Self { Self { groups: Vec::new() } }
+    fn new() -> Self {
+        Self { groups: Vec::new() }
+    }
 }
 
 impl rvllm_engine::Scheduler for PlaceholderScheduler {
@@ -243,7 +268,8 @@ impl rvllm_engine::Scheduler for PlaceholderScheduler {
     fn schedule(&mut self) -> rvllm_engine::SchedulerOutputs {
         let groups = self.groups.clone();
         self.groups.retain(|g| !g.is_finished());
-        let num_tokens = groups.iter()
+        let num_tokens = groups
+            .iter()
             .flat_map(|g| g.get_seqs())
             .map(|s| s.num_new_tokens().max(1))
             .sum();
@@ -254,13 +280,19 @@ impl rvllm_engine::Scheduler for PlaceholderScheduler {
         }
     }
 
-    fn has_unfinished_seqs(&self) -> bool { !self.groups.is_empty() }
-    fn get_num_unfinished_seq_groups(&self) -> usize { self.groups.len() }
+    fn has_unfinished_seqs(&self) -> bool {
+        !self.groups.is_empty()
+    }
+    fn get_num_unfinished_seq_groups(&self) -> usize {
+        self.groups.len()
+    }
 }
 
 async fn shutdown_signal() {
     let ctrl_c = async {
-        tokio::signal::ctrl_c().await.expect("failed to install Ctrl+C handler");
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
     };
     #[cfg(unix)]
     let terminate = async {

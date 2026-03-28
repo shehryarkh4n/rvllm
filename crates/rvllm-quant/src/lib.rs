@@ -12,8 +12,8 @@ pub use linear::QuantizedLinear;
 pub use method::QuantMethod;
 pub use weight::QuantizedWeight;
 
-use std::path::Path;
 use rvllm_core::prelude::*;
+use std::path::Path;
 
 /// Inspect a model directory/config to detect the quantization method used.
 /// Looks for `config.json` or `quantize_config.json` in the model path.
@@ -30,7 +30,10 @@ pub fn detect_quant_method(model_path: &Path) -> Result<QuantMethod> {
                     "squeezellm" => Ok(QuantMethod::SqueezeLLM),
                     "fp8" => Ok(QuantMethod::FP8),
                     other => {
-                        tracing::warn!(method = other, "unknown quant_method in quantize_config.json");
+                        tracing::warn!(
+                            method = other,
+                            "unknown quant_method in quantize_config.json"
+                        );
                         Ok(QuantMethod::None)
                     }
                 };
@@ -66,18 +69,12 @@ pub fn detect_quant_method(model_path: &Path) -> Result<QuantMethod> {
         Some(model_path.to_path_buf())
     } else {
         // Look for any .gguf file in the directory
-        std::fs::read_dir(model_path)
-            .ok()
-            .and_then(|entries| {
-                entries
-                    .filter_map(|e| e.ok())
-                    .find(|e| {
-                        e.path()
-                            .extension()
-                            .map_or(false, |ext| ext == "gguf")
-                    })
-                    .map(|e| e.path())
-            })
+        std::fs::read_dir(model_path).ok().and_then(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .find(|e| e.path().extension().map_or(false, |ext| ext == "gguf"))
+                .map(|e| e.path())
+        })
     };
 
     if let Some(path) = gguf_path {

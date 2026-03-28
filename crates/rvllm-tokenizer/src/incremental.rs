@@ -1,7 +1,7 @@
 //! Stateful incremental decoder for streaming token-by-token output.
 
-use tokenizers::Tokenizer as HfTokenizer;
 use rvllm_core::prelude::TokenId;
+use tokenizers::Tokenizer as HfTokenizer;
 
 /// Stateful decoder that buffers tokens and emits text only when
 /// complete UTF-8 characters are available.
@@ -25,9 +25,7 @@ impl IncrementalDecoder {
         self.buffer.push(token);
 
         // Decode everything so far
-        let full = tokenizer
-            .decode(&self.buffer, true)
-            .ok()?;
+        let full = tokenizer.decode(&self.buffer, true).ok()?;
 
         // Decode only the previously-emitted prefix
         let prefix = if self.emitted_up_to > 0 {
@@ -59,9 +57,7 @@ impl IncrementalDecoder {
             return String::new();
         }
 
-        let full = tokenizer
-            .decode(&self.buffer, true)
-            .unwrap_or_default();
+        let full = tokenizer.decode(&self.buffer, true).unwrap_or_default();
 
         let prefix = if self.emitted_up_to > 0 {
             tokenizer

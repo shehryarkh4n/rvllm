@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use rvllm_core::prelude::LLMError;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SequenceStatus {

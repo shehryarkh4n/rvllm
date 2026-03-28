@@ -1,8 +1,8 @@
 //! Input preparation: converts sequence metadata into batched model tensors.
 
 use rvllm_core::prelude::{Result, TokenId};
-use rvllm_model_runner::input::ModelInput;
 use rvllm_model_runner::bridge::AttentionMetadata;
+use rvllm_model_runner::input::ModelInput;
 
 // Wire to real types from rvllm-sequence.
 pub use rvllm_sequence::{SequenceData, SequenceGroupMetadata};
@@ -57,7 +57,9 @@ fn prepare_prefill(metadata: &[SequenceGroupMetadata]) -> Result<ModelInput> {
             context_lens.push(seq_len as u32);
 
             // Build slot mapping from block table
-            let bt = group.block_tables.get(seq_id)
+            let bt = group
+                .block_tables
+                .get(seq_id)
                 .map(|t| t.as_slice())
                 .unwrap_or(&[]);
 
@@ -115,7 +117,9 @@ fn prepare_decode(metadata: &[SequenceGroupMetadata]) -> Result<ModelInput> {
             position_ids.push((seq_len - 1) as u32);
             context_lens.push(seq_len as u32);
 
-            let bt = group.block_tables.get(seq_id)
+            let bt = group
+                .block_tables
+                .get(seq_id)
                 .map(|t| t.as_slice())
                 .unwrap_or(&[]);
 
@@ -195,7 +199,12 @@ mod tests {
     fn prefill_single_sequence() {
         let sd = make_seq_data(vec![10, 20, 30, 40], vec![]);
         let blocks = vec![BlockId(0), BlockId(1)];
-        let group = make_group(1, true, vec![(SequenceId(100), sd)], vec![(SequenceId(100), blocks)]);
+        let group = make_group(
+            1,
+            true,
+            vec![(SequenceId(100), sd)],
+            vec![(SequenceId(100), blocks)],
+        );
 
         let input = prepare_input(&[group]).unwrap();
         assert!(input.is_prefill);
@@ -210,8 +219,18 @@ mod tests {
     fn prefill_multiple_sequences() {
         let sd1 = make_seq_data(vec![1, 2, 3], vec![]);
         let sd2 = make_seq_data(vec![4, 5], vec![]);
-        let g1 = make_group(1, true, vec![(SequenceId(10), sd1)], vec![(SequenceId(10), vec![BlockId(0)])]);
-        let g2 = make_group(2, true, vec![(SequenceId(20), sd2)], vec![(SequenceId(20), vec![BlockId(1)])]);
+        let g1 = make_group(
+            1,
+            true,
+            vec![(SequenceId(10), sd1)],
+            vec![(SequenceId(10), vec![BlockId(0)])],
+        );
+        let g2 = make_group(
+            2,
+            true,
+            vec![(SequenceId(20), sd2)],
+            vec![(SequenceId(20), vec![BlockId(1)])],
+        );
 
         let input = prepare_input(&[g1, g2]).unwrap();
         assert!(input.is_prefill);
@@ -226,7 +245,12 @@ mod tests {
         // Sequence with 4 prompt tokens + 1 generated token
         let sd = make_seq_data(vec![10, 20, 30, 40], vec![50]);
         let blocks = vec![BlockId(0), BlockId(1)];
-        let group = make_group(1, false, vec![(SequenceId(100), sd)], vec![(SequenceId(100), blocks)]);
+        let group = make_group(
+            1,
+            false,
+            vec![(SequenceId(100), sd)],
+            vec![(SequenceId(100), blocks)],
+        );
 
         let input = prepare_input(&[group]).unwrap();
         assert!(!input.is_prefill);
@@ -242,8 +266,18 @@ mod tests {
     fn decode_multiple_sequences() {
         let sd1 = make_seq_data(vec![1, 2, 3], vec![100]);
         let sd2 = make_seq_data(vec![4, 5], vec![200]);
-        let g1 = make_group(1, false, vec![(SequenceId(10), sd1)], vec![(SequenceId(10), vec![BlockId(0)])]);
-        let g2 = make_group(2, false, vec![(SequenceId(20), sd2)], vec![(SequenceId(20), vec![BlockId(1)])]);
+        let g1 = make_group(
+            1,
+            false,
+            vec![(SequenceId(10), sd1)],
+            vec![(SequenceId(10), vec![BlockId(0)])],
+        );
+        let g2 = make_group(
+            2,
+            false,
+            vec![(SequenceId(20), sd2)],
+            vec![(SequenceId(20), vec![BlockId(1)])],
+        );
 
         let input = prepare_input(&[g1, g2]).unwrap();
         assert!(!input.is_prefill);
@@ -274,7 +308,12 @@ mod tests {
     fn slot_mapping_computed_correctly_prefill() {
         // 3 tokens, block_size=16, one block at physical id 5
         let sd = make_seq_data(vec![1, 2, 3], vec![]);
-        let group = make_group(1, true, vec![(SequenceId(10), sd)], vec![(SequenceId(10), vec![BlockId(5)])]);
+        let group = make_group(
+            1,
+            true,
+            vec![(SequenceId(10), sd)],
+            vec![(SequenceId(10), vec![BlockId(5)])],
+        );
 
         let input = prepare_input(&[group]).unwrap();
         // slots: 5*16+0=80, 5*16+1=81, 5*16+2=82
@@ -285,7 +324,12 @@ mod tests {
     fn slot_mapping_computed_correctly_decode() {
         // 5 tokens total (4 prompt + 1 gen), block_size=16, one block at physical id 3
         let sd = make_seq_data(vec![1, 2, 3, 4], vec![5]);
-        let group = make_group(1, false, vec![(SequenceId(10), sd)], vec![(SequenceId(10), vec![BlockId(3)])]);
+        let group = make_group(
+            1,
+            false,
+            vec![(SequenceId(10), sd)],
+            vec![(SequenceId(10), vec![BlockId(3)])],
+        );
 
         let input = prepare_input(&[group]).unwrap();
         // position 4, block_idx=4/16=0, offset=4, slot=3*16+4=52
@@ -296,9 +340,17 @@ mod tests {
     fn block_tables_passed_through() {
         let sd = make_seq_data(vec![1, 2, 3], vec![]);
         let blocks = vec![BlockId(10), BlockId(20), BlockId(30)];
-        let group = make_group(1, true, vec![(SequenceId(5), sd)], vec![(SequenceId(5), blocks)]);
+        let group = make_group(
+            1,
+            true,
+            vec![(SequenceId(5), sd)],
+            vec![(SequenceId(5), blocks)],
+        );
 
         let input = prepare_input(&[group]).unwrap();
-        assert_eq!(input.attention_metadata.block_tables, vec![vec![10, 20, 30]]);
+        assert_eq!(
+            input.attention_metadata.block_tables,
+            vec![vec![10, 20, 30]]
+        );
     }
 }

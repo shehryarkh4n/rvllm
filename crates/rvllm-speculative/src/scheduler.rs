@@ -34,14 +34,9 @@ impl SpeculativeScheduler {
 
     /// Run the draft model K steps for each sequence, then prepare the
     /// combined input for the target model to verify all K+1 positions.
-    pub fn prepare_draft_and_target(
-        &self,
-        sequences: &[Sequence],
-    ) -> Result<SpeculativeStep> {
+    pub fn prepare_draft_and_target(&self, sequences: &[Sequence]) -> Result<SpeculativeStep> {
         if sequences.is_empty() {
-            return Err(LLMError::SchedulerError(
-                "no sequences to schedule".into(),
-            ));
+            return Err(LLMError::SchedulerError("no sequences to schedule".into()));
         }
 
         let k = self.config.num_speculative_tokens;
@@ -51,9 +46,7 @@ impl SpeculativeScheduler {
         for seq in sequences {
             let tokens = seq.get_token_ids();
             if tokens.is_empty() {
-                return Err(LLMError::SchedulerError(
-                    "sequence has no tokens".into(),
-                ));
+                return Err(LLMError::SchedulerError("sequence has no tokens".into()));
             }
 
             tracing::debug!(
@@ -120,10 +113,7 @@ mod tests {
     #[test]
     fn prepare_multiple_sequences() {
         let scheduler = SpeculativeScheduler::new(test_config()).unwrap();
-        let seqs = vec![
-            make_seq(1, vec![10, 20]),
-            make_seq(2, vec![30, 40, 50]),
-        ];
+        let seqs = vec![make_seq(1, vec![10, 20]), make_seq(2, vec![30, 40, 50])];
         let step = scheduler.prepare_draft_and_target(&seqs).unwrap();
         assert_eq!(step.draft_tokens.len(), 2);
         assert_eq!(step.draft_tokens[0].len(), 3);

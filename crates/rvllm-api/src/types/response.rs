@@ -78,10 +78,7 @@ fn finish_reason_string(reason: Option<rvllm_core::prelude::FinishReason>) -> Op
 
 impl CompletionResponse {
     /// Build a CompletionResponse from engine output.
-    pub fn from_request_output(
-        output: &rvllm_core::prelude::RequestOutput,
-        model: &str,
-    ) -> Self {
+    pub fn from_request_output(output: &rvllm_core::prelude::RequestOutput, model: &str) -> Self {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -132,10 +129,7 @@ impl CompletionResponse {
 
 impl ChatCompletionResponse {
     /// Build a ChatCompletionResponse from engine output.
-    pub fn from_request_output(
-        output: &rvllm_core::prelude::RequestOutput,
-        model: &str,
-    ) -> Self {
+    pub fn from_request_output(output: &rvllm_core::prelude::RequestOutput, model: &str) -> Self {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()

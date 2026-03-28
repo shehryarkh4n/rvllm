@@ -3,8 +3,8 @@
 use std::collections::VecDeque;
 
 use parking_lot::Mutex;
-use tracing::debug;
 use rvllm_core::prelude::{BlockId, LLMError, Result};
+use tracing::debug;
 
 use crate::block::{CpuBlock, DeviceType, PhysicalBlock};
 use crate::pool::MemoryPool;

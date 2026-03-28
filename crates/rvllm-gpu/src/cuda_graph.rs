@@ -12,9 +12,9 @@ use std::collections::HashMap;
 
 use tracing::{debug, info, trace, warn};
 
-use crate::Result;
 #[cfg(feature = "cuda-graphs")]
 use crate::LLMError;
+use crate::Result;
 
 /// Supported batch sizes for which we pre-capture CUDA graphs.
 pub const GRAPH_BATCH_SIZES: &[usize] = &[1, 2, 4, 8, 16, 32];
@@ -78,8 +78,7 @@ impl CudaGraph {
     /// Number of times this graph has been replayed (no-op builds only, for testing).
     #[cfg(not(feature = "cuda-graphs"))]
     pub fn replay_count(&self) -> usize {
-        self.replay_count
-            .load(std::sync::atomic::Ordering::Relaxed)
+        self.replay_count.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -165,10 +164,7 @@ impl CudaGraphPool {
 
     /// Begin capturing a CUDA graph on the given stream.
     #[cfg(feature = "cuda-graphs")]
-    pub fn begin_capture(
-        &self,
-        stream: &crate::stream::GpuStream,
-    ) -> Result<()> {
+    pub fn begin_capture(&self, stream: &crate::stream::GpuStream) -> Result<()> {
         debug!("beginning CUDA graph capture");
         let result = unsafe {
             cudarc::driver::sys::cuStreamBeginCapture(
@@ -238,10 +234,7 @@ impl CudaGraphPool {
 
     /// Begin capture (no-op when cuda-graphs feature is off).
     #[cfg(not(feature = "cuda-graphs"))]
-    pub fn begin_capture(
-        &self,
-        _stream: &crate::stream::GpuStream,
-    ) -> Result<()> {
+    pub fn begin_capture(&self, _stream: &crate::stream::GpuStream) -> Result<()> {
         debug!("beginning CUDA graph capture (no-op)");
         Ok(())
     }

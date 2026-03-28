@@ -179,9 +179,8 @@ pub async fn create_embeddings(
             last_output = Some(output);
         }
 
-        let output = last_output.ok_or_else(|| {
-            ApiError::Internal("engine produced no output for embedding".into())
-        })?;
+        let output = last_output
+            .ok_or_else(|| ApiError::Internal("engine produced no output for embedding".into()))?;
 
         total_prompt_tokens += output.prompt_token_ids.len();
 

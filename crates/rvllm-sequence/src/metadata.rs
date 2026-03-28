@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
-use serde::{Deserialize, Serialize};
 use rvllm_core::prelude::{BlockId, RequestId, SamplingParams, SequenceId, TokenId};
+use serde::{Deserialize, Serialize};
 
 /// Serializable subset of sequence data sent to workers.
 #[derive(Debug, Clone, Serialize, Deserialize)]

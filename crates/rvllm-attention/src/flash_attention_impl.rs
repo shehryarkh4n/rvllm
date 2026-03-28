@@ -9,10 +9,10 @@
 //! The CPU path is the default when `cfg(not(feature = "cuda"))`.
 
 use half::f16;
+use rvllm_core::prelude::{LLMError, Result};
 use tracing::debug;
 #[cfg(feature = "cuda")]
 use tracing::trace;
-use rvllm_core::prelude::{LLMError, Result};
 
 use crate::backend::AttentionBackend;
 use crate::buffer::GpuBuffer;
@@ -233,8 +233,7 @@ impl FlashAttention2 {
                                 continue;
                             }
                             let phys_block =
-                                block_tables.data[seq_idx * max_blocks_per_seq + page_idx]
-                                    as usize;
+                                block_tables.data[seq_idx * max_blocks_per_seq + page_idx] as usize;
                             let k_base = ((phys_block * block_size + page_off) * num_kv_heads
                                 + kv_h)
                                 * head_dim;
@@ -256,10 +255,7 @@ impl FlashAttention2 {
                         }
 
                         // Online softmax: update running max
-                        let tile_max = scores
-                            .iter()
-                            .cloned()
-                            .fold(f32::NEG_INFINITY, f32::max);
+                        let tile_max = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
 
                         let new_max = row_max.max(tile_max);
                         if new_max > row_max && row_max > f32::NEG_INFINITY {
@@ -298,8 +294,7 @@ impl FlashAttention2 {
                                 continue;
                             }
                             let phys_block =
-                                block_tables.data[seq_idx * max_blocks_per_seq + page_idx]
-                                    as usize;
+                                block_tables.data[seq_idx * max_blocks_per_seq + page_idx] as usize;
                             let v_base = ((phys_block * block_size + page_off) * num_kv_heads
                                 + kv_h)
                                 * head_dim;
@@ -416,7 +411,8 @@ impl FlashAttention2 {
             .map_err(|e| LLMError::GpuError(format!("output alloc: {e}")))?;
 
         // Shared memory: 2 * TILE_BC * head_dim + TILE_BC + (128/32) floats
-        let smem_bytes = ((2 * TILE_BC * head_dim + TILE_BC + 4) * std::mem::size_of::<f32>()) as u32;
+        let smem_bytes =
+            ((2 * TILE_BC * head_dim + TILE_BC + 4) * std::mem::size_of::<f32>()) as u32;
 
         let is_decode = num_tokens == num_seqs; // one token per sequence
 
@@ -463,7 +459,11 @@ impl FlashAttention2 {
             for i in 0..num_seqs {
                 seq_starts.push(pos);
                 let ctx = context_lens.data[i];
-                pos += if i + 1 < num_seqs { 1 } else { (num_tokens as i32) - pos };
+                pos += if i + 1 < num_seqs {
+                    1
+                } else {
+                    (num_tokens as i32) - pos
+                };
             }
             let d_seq_starts = dev
                 .htod_sync_copy(&seq_starts)
@@ -471,9 +471,7 @@ impl FlashAttention2 {
 
             let func = dev
                 .get_func("flash_attention", "flash_attention_2_kernel")
-                .ok_or_else(|| {
-                    LLMError::GpuError("flash_attention_2_kernel not found".into())
-                })?;
+                .ok_or_else(|| LLMError::GpuError("flash_attention_2_kernel not found".into()))?;
 
             let cfg = LaunchConfig {
                 grid_dim: (num_seqs as u32, num_heads as u32, 1),
@@ -620,30 +618,60 @@ mod tests {
         let query = make_const_buf(1.0, vec![1, 4, 32]);
         let kc = make_const_buf(1.0, vec![1, 16, 4, 32]);
         let vc = make_const_buf(1.0, vec![1, 16, 4, 32]);
-        let bt = GpuBuffer { data: vec![0], shape: vec![1, 1] };
-        let cl: GpuBuffer<i32> = GpuBuffer { data: vec![1], shape: vec![1] };
+        let bt = GpuBuffer {
+            data: vec![0],
+            shape: vec![1, 1],
+        };
+        let cl: GpuBuffer<i32> = GpuBuffer {
+            data: vec![1],
+            shape: vec![1],
+        };
         assert!(fa.forward(&query, &kc, &vc, &bt, &cl, 1, 0.125).is_err());
     }
 
     #[test]
     fn rejects_bad_query_dims() {
         let fa = FlashAttention2::new();
-        let query = GpuBuffer { data: vec![make_f16(1.0); 16], shape: vec![4, 4] };
+        let query = GpuBuffer {
+            data: vec![make_f16(1.0); 16],
+            shape: vec![4, 4],
+        };
         let kc = make_const_buf(1.0, vec![1, 1, 1, 64]);
         let vc = make_const_buf(1.0, vec![1, 1, 1, 64]);
-        let bt = GpuBuffer { data: vec![0], shape: vec![1, 1] };
-        let cl: GpuBuffer<i32> = GpuBuffer { data: vec![1], shape: vec![1] };
+        let bt = GpuBuffer {
+            data: vec![0],
+            shape: vec![1, 1],
+        };
+        let cl: GpuBuffer<i32> = GpuBuffer {
+            data: vec![1],
+            shape: vec![1],
+        };
         assert!(fa.forward(&query, &kc, &vc, &bt, &cl, 1, 0.125).is_err());
     }
 
     #[test]
     fn empty_batch_returns_empty() {
         let fa = FlashAttention2::new();
-        let query = GpuBuffer { data: Vec::new(), shape: vec![0, 4, 64] };
-        let kc = GpuBuffer { data: Vec::new(), shape: vec![0, 16, 4, 64] };
-        let vc = GpuBuffer { data: Vec::new(), shape: vec![0, 16, 4, 64] };
-        let bt = GpuBuffer { data: Vec::new(), shape: vec![0, 0] };
-        let cl: GpuBuffer<i32> = GpuBuffer { data: Vec::new(), shape: vec![0] };
+        let query = GpuBuffer {
+            data: Vec::new(),
+            shape: vec![0, 4, 64],
+        };
+        let kc = GpuBuffer {
+            data: Vec::new(),
+            shape: vec![0, 16, 4, 64],
+        };
+        let vc = GpuBuffer {
+            data: Vec::new(),
+            shape: vec![0, 16, 4, 64],
+        };
+        let bt = GpuBuffer {
+            data: Vec::new(),
+            shape: vec![0, 0],
+        };
+        let cl: GpuBuffer<i32> = GpuBuffer {
+            data: Vec::new(),
+            shape: vec![0],
+        };
         let out = fa.forward(&query, &kc, &vc, &bt, &cl, 0, 0.125).unwrap();
         assert!(out.data.is_empty());
     }
@@ -670,8 +698,14 @@ mod tests {
 
         // KV cache: [num_blocks, block_size, num_heads, head_dim]
         // Fill the first block with 1s (ctx_len=4 tokens used)
-        let kc = make_const_buf(1.0, vec![num_blocks_needed, block_size, num_heads, head_dim]);
-        let vc = make_const_buf(1.0, vec![num_blocks_needed, block_size, num_heads, head_dim]);
+        let kc = make_const_buf(
+            1.0,
+            vec![num_blocks_needed, block_size, num_heads, head_dim],
+        );
+        let vc = make_const_buf(
+            1.0,
+            vec![num_blocks_needed, block_size, num_heads, head_dim],
+        );
 
         // Block tables: seq 0 uses physical block 0
         let bt = GpuBuffer {
@@ -690,10 +724,7 @@ mod tests {
         assert_eq!(out.shape, vec![1, num_heads, head_dim]);
         for &v in &out.data {
             let f = v.to_f32();
-            assert!(
-                (f - 1.0).abs() < 0.02,
-                "expected ~1.0, got {f}"
-            );
+            assert!((f - 1.0).abs() < 0.02, "expected ~1.0, got {f}");
         }
     }
 
@@ -730,8 +761,14 @@ mod tests {
             shape: vec![1, block_size, num_heads, head_dim],
         };
 
-        let bt = GpuBuffer { data: vec![0i32], shape: vec![1, 1] };
-        let cl: GpuBuffer<i32> = GpuBuffer { data: vec![ctx_len as i32], shape: vec![1] };
+        let bt = GpuBuffer {
+            data: vec![0i32],
+            shape: vec![1, 1],
+        };
+        let cl: GpuBuffer<i32> = GpuBuffer {
+            data: vec![ctx_len as i32],
+            shape: vec![1],
+        };
 
         let out = fa
             .forward(&query, &kc, &vc, &bt, &cl, ctx_len, scale)
@@ -797,10 +834,7 @@ mod tests {
         // Uniform K and V => output should be ~1.0
         for &v in &out.data {
             let f = v.to_f32();
-            assert!(
-                (f - 1.0).abs() < 0.02,
-                "expected ~1.0, got {f}"
-            );
+            assert!((f - 1.0).abs() < 0.02, "expected ~1.0, got {f}");
         }
     }
 
@@ -824,8 +858,14 @@ mod tests {
         let kc = make_const_buf(1.0, vec![1, block_size, num_kv_heads, head_dim]);
         let vc = make_const_buf(1.0, vec![1, block_size, num_kv_heads, head_dim]);
 
-        let bt = GpuBuffer { data: vec![0i32], shape: vec![1, 1] };
-        let cl: GpuBuffer<i32> = GpuBuffer { data: vec![ctx_len as i32], shape: vec![1] };
+        let bt = GpuBuffer {
+            data: vec![0i32],
+            shape: vec![1, 1],
+        };
+        let cl: GpuBuffer<i32> = GpuBuffer {
+            data: vec![ctx_len as i32],
+            shape: vec![1],
+        };
 
         let out = fa
             .forward(&query, &kc, &vc, &bt, &cl, ctx_len, scale)
@@ -834,10 +874,7 @@ mod tests {
         assert_eq!(out.shape, vec![1, num_heads, head_dim]);
         for &v in &out.data {
             let f = v.to_f32();
-            assert!(
-                (f - 1.0).abs() < 0.02,
-                "expected ~1.0, got {f}"
-            );
+            assert!((f - 1.0).abs() < 0.02, "expected ~1.0, got {f}");
         }
     }
 
@@ -852,8 +889,14 @@ mod tests {
         let query = make_const_buf(1.0, vec![1, 1, head_dim]);
         let kc = make_const_buf(1.0, vec![1, 16, 1, head_dim]);
         let vc = make_const_buf(1.0, vec![1, 16, 1, head_dim]);
-        let bt = GpuBuffer { data: vec![0i32], shape: vec![1, 1] };
-        let cl: GpuBuffer<i32> = GpuBuffer { data: vec![2], shape: vec![1] };
+        let bt = GpuBuffer {
+            data: vec![0i32],
+            shape: vec![1, 1],
+        };
+        let cl: GpuBuffer<i32> = GpuBuffer {
+            data: vec![2],
+            shape: vec![1],
+        };
 
         let out = fa.forward(&query, &kc, &vc, &bt, &cl, 2, scale).unwrap();
         assert_eq!(out.shape, vec![1, 1, 96]);
@@ -870,8 +913,14 @@ mod tests {
         let query = make_const_buf(1.0, vec![1, 1, head_dim]);
         let kc = make_const_buf(1.0, vec![1, 16, 1, head_dim]);
         let vc = make_const_buf(1.0, vec![1, 16, 1, head_dim]);
-        let bt = GpuBuffer { data: vec![0i32], shape: vec![1, 1] };
-        let cl: GpuBuffer<i32> = GpuBuffer { data: vec![3], shape: vec![1] };
+        let bt = GpuBuffer {
+            data: vec![0i32],
+            shape: vec![1, 1],
+        };
+        let cl: GpuBuffer<i32> = GpuBuffer {
+            data: vec![3],
+            shape: vec![1],
+        };
 
         let out = fa.forward(&query, &kc, &vc, &bt, &cl, 3, scale).unwrap();
         assert_eq!(out.shape, vec![1, 1, 128]);
@@ -915,10 +964,7 @@ mod tests {
         assert_eq!(out.shape, vec![1, num_heads, head_dim]);
         for &v in &out.data {
             let f = v.to_f32();
-            assert!(
-                (f - 1.0).abs() < 0.02,
-                "expected ~1.0, got {f}"
-            );
+            assert!((f - 1.0).abs() < 0.02, "expected ~1.0, got {f}");
         }
     }
 
@@ -960,18 +1006,13 @@ mod tests {
             shape: vec![3],
         };
 
-        let out = fa
-            .forward(&query, &kc, &vc, &bt, &cl, 8, scale)
-            .unwrap();
+        let out = fa.forward(&query, &kc, &vc, &bt, &cl, 8, scale).unwrap();
 
         assert_eq!(out.shape, vec![3, num_heads, head_dim]);
         // Uniform KV => all outputs ~1.0
         for &v in &out.data {
             let f = v.to_f32();
-            assert!(
-                (f - 1.0).abs() < 0.02,
-                "expected ~1.0, got {f}"
-            );
+            assert!((f - 1.0).abs() < 0.02, "expected ~1.0, got {f}");
         }
     }
 }

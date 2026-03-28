@@ -136,7 +136,9 @@ pub fn quantize_gptq(
             let scale = scales[group_idx];
             let zero = zeros[group_idx];
 
-            let q = ((values[idx] / scale) + zero).round().clamp(0.0, max_val as f32) as u32;
+            let q = ((values[idx] / scale) + zero)
+                .round()
+                .clamp(0.0, max_val as f32) as u32;
 
             let bit_offset = idx as u64 * bits as u64;
             let byte_offset = (bit_offset / 8) as usize;

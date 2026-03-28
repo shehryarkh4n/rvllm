@@ -43,14 +43,9 @@ impl QuantizedLinear {
             QuantMethod::None => Err(LLMError::ModelError(
                 "dequantize called on unquantized weight".into(),
             )),
-            QuantMethod::GgufQ4_0 => {
-                Ok(dequant::dequantize_q4_0(&w.data, &w.scales, w.shape))
-            }
+            QuantMethod::GgufQ4_0 => Ok(dequant::dequantize_q4_0(&w.data, &w.scales, w.shape)),
             QuantMethod::GgufQ4KM => Ok(dequant::dequantize_q4_k_m(
-                &w.data,
-                &w.scales,
-                zeros,
-                w.shape,
+                &w.data, &w.scales, zeros, w.shape,
             )),
             QuantMethod::GPTQ | QuantMethod::SqueezeLLM => Ok(dequant::dequantize_gptq(
                 &w.data,
@@ -67,9 +62,7 @@ impl QuantizedLinear {
                 w.quant_config.group_size,
                 w.shape,
             )),
-            QuantMethod::FP8 => {
-                Ok(dequant::dequantize_fp8(&w.data, &w.scales, w.shape))
-            }
+            QuantMethod::FP8 => Ok(dequant::dequantize_fp8(&w.data, &w.scales, w.shape)),
             QuantMethod::GgufQ5_0 | QuantMethod::GgufQ5KM | QuantMethod::GgufQ8_0 => {
                 Err(LLMError::ModelError(format!(
                     "dequantization not yet implemented for {}",

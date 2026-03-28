@@ -175,8 +175,7 @@ impl BeamSearchState {
             for &(token_id, logprob, ref decoded, is_eos) in tokens {
                 let cum_lp = beam.cumulative_logprob + logprob;
                 let new_len = beam.token_ids.len() + 1;
-                let is_terminal =
-                    is_eos || new_len >= self.max_tokens;
+                let is_terminal = is_eos || new_len >= self.max_tokens;
                 let finish_reason = if is_eos {
                     Some(FinishReason::Stop)
                 } else if new_len >= self.max_tokens {
@@ -376,14 +375,9 @@ pub struct ForkOp {
 ///
 /// Given per-sequence logprobs (from the sampling layer), returns the top K
 /// (token_id, logprob) pairs sorted by logprob descending.
-pub fn top_k_from_logprobs(
-    logprobs: &[(TokenId, LogProb)],
-    k: usize,
-) -> Vec<(TokenId, LogProb)> {
+pub fn top_k_from_logprobs(logprobs: &[(TokenId, LogProb)], k: usize) -> Vec<(TokenId, LogProb)> {
     let mut sorted: Vec<(TokenId, LogProb)> = logprobs.to_vec();
-    sorted.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-    });
+    sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     sorted.truncate(k);
     sorted
 }
@@ -415,17 +409,8 @@ mod tests {
     use super::*;
 
     fn make_state(num_beams: usize) -> BeamSearchState {
-        let seq_ids: Vec<SequenceId> = (0..num_beams)
-            .map(|i| SequenceId(i as u64))
-            .collect();
-        BeamSearchState::new(
-            RequestId(1),
-            num_beams,
-            10,
-            1.0,
-            false,
-            &seq_ids,
-        )
+        let seq_ids: Vec<SequenceId> = (0..num_beams).map(|i| SequenceId(i as u64)).collect();
+        BeamSearchState::new(RequestId(1), num_beams, 10, 1.0, false, &seq_ids)
     }
 
     #[test]
@@ -483,12 +468,8 @@ mod tests {
         // Should keep only 2 beams (the best 2 out of 4 candidates).
         assert_eq!(state.active_beams.len(), 2);
         // Best candidates: beam1+token20 (-0.3), beam0+token10 (-0.5)
-        assert_eq!(
-            state.active_beams[0].cumulative_logprob, -0.3,
-        );
-        assert_eq!(
-            state.active_beams[1].cumulative_logprob, -0.5,
-        );
+        assert_eq!(state.active_beams[0].cumulative_logprob, -0.3,);
+        assert_eq!(state.active_beams[1].cumulative_logprob, -0.5,);
 
         // Both parents were reused exactly once -- no forks or frees needed.
         assert!(result.seqs_to_free.is_empty());
@@ -552,10 +533,7 @@ mod tests {
         // The EOS candidate should be in completed.
         assert!(!state.completed.is_empty());
         assert_eq!(state.completed[0].token_ids, vec![10]);
-        assert_eq!(
-            state.completed[0].finish_reason,
-            Some(FinishReason::Stop)
-        );
+        assert_eq!(state.completed[0].finish_reason, Some(FinishReason::Stop));
     }
 
     #[test]
@@ -702,17 +680,11 @@ mod tests {
         // Step 2: reaches max_tokens
         let sid = state.active_beams[0].seq_id;
         let mut exp2 = HashMap::new();
-        exp2.insert(
-            sid,
-            vec![(11u32, -0.3f32, "b".to_string(), false)],
-        );
+        exp2.insert(sid, vec![(11u32, -0.3f32, "b".to_string(), false)]);
         state.step(&exp2);
         // Should be finished via max_tokens.
         assert!(state.active_beams.is_empty());
         assert_eq!(state.completed.len(), 1);
-        assert_eq!(
-            state.completed[0].finish_reason,
-            Some(FinishReason::Length)
-        );
+        assert_eq!(state.completed[0].finish_reason, Some(FinishReason::Length));
     }
 }

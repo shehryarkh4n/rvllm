@@ -35,9 +35,9 @@ impl GpuAllocator for CudaGpuAllocator {
         trace!(bytes, count, "CUDA alloc");
 
         let slice = unsafe {
-            self.device.bind_to_thread().map_err(|e| {
-                crate::LLMError::MemoryError(format!("CUDA bind failed: {e}"))
-            })?;
+            self.device
+                .bind_to_thread()
+                .map_err(|e| crate::LLMError::MemoryError(format!("CUDA bind failed: {e}")))?;
             let cu_ptr = cudarc::driver::result::malloc_sync(bytes).map_err(|e| {
                 crate::LLMError::MemoryError(format!("CUDA alloc failed ({bytes} bytes): {e}"))
             })?;
@@ -61,9 +61,8 @@ impl GpuAllocator for CudaGpuAllocator {
     }
 
     fn device_memory_info(&self) -> Result<MemoryInfo> {
-        let (free, total) = cudarc::driver::result::mem_get_info().map_err(|e| {
-            crate::LLMError::MemoryError(format!("CUDA mem_get_info failed: {e}"))
-        })?;
+        let (free, total) = cudarc::driver::result::mem_get_info()
+            .map_err(|e| crate::LLMError::MemoryError(format!("CUDA mem_get_info failed: {e}")))?;
         Ok(MemoryInfo {
             total,
             free,

@@ -10,9 +10,7 @@
 use half::f16;
 use tracing::trace;
 
-use crate::bridge::{
-    AttentionBackend, CacheEngine, GpuBuffer, ModelWeights, Result,
-};
+use crate::bridge::{AttentionBackend, CacheEngine, GpuBuffer, ModelWeights, Result};
 use crate::input::ModelInput;
 use crate::layers::linear::LinearLayer;
 use crate::layers::mlp::MLP;
@@ -323,21 +321,12 @@ impl DeepSeekV2ForCausalLM {
         let v = GpuBuffer::from_vec(v_data, vec![num_tokens, kv_dim]);
 
         // RoPE on Q and K.
-        let (q_rot, k_rot) = RotaryEmbedding::forward(
-            &input.position_ids,
-            &q,
-            &k,
-            self.config.head_dim,
-        )?;
+        let (q_rot, k_rot) =
+            RotaryEmbedding::forward(&input.position_ids, &q, &k, self.config.head_dim)?;
 
         // Attention.
-        let attn_out = attention.forward(
-            &q_rot,
-            &k_rot,
-            &v,
-            &input.attention_metadata,
-            layer_idx,
-        )?;
+        let attn_out =
+            attention.forward(&q_rot, &k_rot, &v, &input.attention_metadata, layer_idx)?;
 
         // Output projection.
         LinearLayer::forward(&attn_out, &layer.attn.o_proj, None)
@@ -354,27 +343,22 @@ impl Architecture for DeepSeekV2ForCausalLM {
         let num_tokens = input.num_tokens();
 
         // Embedding lookup.
-        let mut hidden = embed_tokens(&self.embed_tokens, &input.token_ids, self.config.hidden_size);
+        let mut hidden = embed_tokens(
+            &self.embed_tokens,
+            &input.token_ids,
+            self.config.hidden_size,
+        );
 
         // Transformer layers.
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             trace!(layer = layer_idx, "deepseek layer forward");
 
             // Pre-attention RMSNorm.
-            let normed = RMSNorm::forward(
-                &hidden,
-                &layer.input_layernorm,
-                self.config.rms_norm_eps,
-            )?;
+            let normed =
+                RMSNorm::forward(&hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
 
             // MLA attention.
-            let attn_proj = self.mla_attention(
-                &normed,
-                layer,
-                input,
-                attention,
-                layer_idx,
-            )?;
+            let attn_proj = self.mla_attention(&normed, layer, input, attention, layer_idx)?;
 
             // Residual.
             add_inplace(&mut hidden, &attn_proj);
@@ -401,23 +385,22 @@ impl Architecture for DeepSeekV2ForCausalLM {
         }
 
         // Final RMSNorm.
-        let normed_final = RMSNorm::forward(
-            &hidden,
-            &self.norm_weight,
-            self.config.rms_norm_eps,
-        )?;
+        let normed_final = RMSNorm::forward(&hidden, &self.norm_weight, self.config.rms_norm_eps)?;
 
         // LM head -> logits.
-        lm_head(&normed_final, &self.lm_head_weight, num_tokens, self.config.vocab_size)
+        lm_head(
+            &normed_final,
+            &self.lm_head_weight,
+            num_tokens,
+            self.config.vocab_size,
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bridge::{
-        AttentionMetadata, CacheEngine, MockAttentionBackend, ModelWeights,
-    };
+    use crate::bridge::{AttentionMetadata, CacheEngine, MockAttentionBackend, ModelWeights};
     use crate::input::ModelInput;
     use crate::runner::ModelRunnerConfig;
 

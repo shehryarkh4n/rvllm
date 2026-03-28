@@ -48,7 +48,8 @@ impl TensorParallelConfig {
         }
         if rank >= tp_size {
             return Err(LLMError::ConfigError(format!(
-                "rank {} >= tensor_parallel_size {}", rank, tp_size
+                "rank {} >= tensor_parallel_size {}",
+                rank, tp_size
             )));
         }
         Ok(Self { tp_size, rank })
@@ -63,7 +64,8 @@ impl TensorParallelConfig {
     pub fn shard_size(&self, total: usize) -> Result<usize> {
         if total % self.tp_size != 0 {
             return Err(LLMError::ConfigError(format!(
-                "dimension {} not divisible by tp_size {}", total, self.tp_size
+                "dimension {} not divisible by tp_size {}",
+                total, self.tp_size
             )));
         }
         Ok(total / self.tp_size)
@@ -142,7 +144,8 @@ impl ColumnParallelLinear {
         if x.len() % in_f != 0 {
             return Err(LLMError::ModelError(format!(
                 "column-parallel forward: input length {} not divisible by in_features {}",
-                x.len(), in_f
+                x.len(),
+                in_f
             )));
         }
         let batch_size = x.len() / in_f;
@@ -150,7 +153,10 @@ impl ColumnParallelLinear {
         if weight_shard.len() != out_f * in_f {
             return Err(LLMError::ModelError(format!(
                 "column-parallel forward: weight_shard length {} != {} * {} = {}",
-                weight_shard.len(), out_f, in_f, out_f * in_f
+                weight_shard.len(),
+                out_f,
+                in_f,
+                out_f * in_f
             )));
         }
 
@@ -232,7 +238,8 @@ impl RowParallelLinear {
         if x_shard.len() % in_f != 0 {
             return Err(LLMError::ModelError(format!(
                 "row-parallel forward: input length {} not divisible by shard_in_features {}",
-                x_shard.len(), in_f
+                x_shard.len(),
+                in_f
             )));
         }
         let batch_size = x_shard.len() / in_f;
@@ -240,7 +247,10 @@ impl RowParallelLinear {
         if weight_shard.len() != out_f * in_f {
             return Err(LLMError::ModelError(format!(
                 "row-parallel forward: weight_shard length {} != {} * {} = {}",
-                weight_shard.len(), out_f, in_f, out_f * in_f
+                weight_shard.len(),
+                out_f,
+                in_f,
+                out_f * in_f
             )));
         }
 
@@ -355,18 +365,11 @@ impl TransformerLayerParallel {
         }
 
         let qkv_proj = ColumnParallelLinear::new(hidden_size, qkv_out, false, tp.clone())?;
-        let o_proj = RowParallelLinear::new(
-            num_heads * head_dim,
-            hidden_size,
-            true,
-            tp.clone(),
-        )?;
+        let o_proj = RowParallelLinear::new(num_heads * head_dim, hidden_size, true, tp.clone())?;
         let gate_proj =
             ColumnParallelLinear::new(hidden_size, intermediate_size, false, tp.clone())?;
-        let up_proj =
-            ColumnParallelLinear::new(hidden_size, intermediate_size, false, tp.clone())?;
-        let down_proj =
-            RowParallelLinear::new(intermediate_size, hidden_size, true, tp)?;
+        let up_proj = ColumnParallelLinear::new(hidden_size, intermediate_size, false, tp.clone())?;
+        let down_proj = RowParallelLinear::new(intermediate_size, hidden_size, true, tp)?;
 
         Ok(Self {
             qkv_proj,
@@ -560,8 +563,7 @@ mod tests {
 
     #[test]
     fn reduce_mismatched_lengths() {
-        let result =
-            RowParallelLinear::reduce_partial_outputs(&[vec![1.0, 2.0], vec![3.0]]);
+        let result = RowParallelLinear::reduce_partial_outputs(&[vec![1.0, 2.0], vec![3.0]]);
         assert!(result.is_err());
     }
 
@@ -613,9 +615,7 @@ mod tests {
     fn transformer_layer_parallel_llama_7b() {
         // LLaMA-7B: hidden=4096, heads=32, head_dim=128, intermediate=11008, kv_heads=32
         let tp = TensorParallelConfig::new(2, 0).unwrap();
-        let layer = TransformerLayerParallel::new_llama(
-            4096, 32, 128, 11008, 32, tp,
-        );
+        let layer = TransformerLayerParallel::new_llama(4096, 32, 128, 11008, 32, tp);
         // 11008 % 2 == 0 -> should succeed
         assert!(layer.is_ok());
         let l = layer.unwrap();
@@ -629,9 +629,7 @@ mod tests {
     fn transformer_layer_parallel_llama_70b_gqa() {
         // LLaMA-70B: hidden=8192, heads=64, head_dim=128, intermediate=28672, kv_heads=8
         let tp = TensorParallelConfig::new(8, 3).unwrap();
-        let layer = TransformerLayerParallel::new_llama(
-            8192, 64, 128, 28672, 8, tp,
-        );
+        let layer = TransformerLayerParallel::new_llama(8192, 64, 128, 28672, 8, tp);
         assert!(layer.is_ok());
         let l = layer.unwrap();
         // QKV out = (64 + 2*8) * 128 = 10240
@@ -644,9 +642,7 @@ mod tests {
     fn transformer_layer_parallel_bad_divisibility() {
         // 5 heads not divisible by tp=2
         let tp = TensorParallelConfig::new(2, 0).unwrap();
-        let result = TransformerLayerParallel::new_llama(
-            4096, 5, 128, 11008, 5, tp,
-        );
+        let result = TransformerLayerParallel::new_llama(4096, 5, 128, 11008, 5, tp);
         assert!(result.is_err());
     }
 

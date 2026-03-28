@@ -292,8 +292,7 @@ impl PyEngineConfig {
 
     fn to_json(&self) -> PyResult<String> {
         let cfg = self.to_rust();
-        serde_json::to_string_pretty(&cfg)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        serde_json::to_string_pretty(&cfg).map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
     fn __repr__(&self) -> String {
@@ -319,12 +318,10 @@ impl PyEngineConfig {
                     .gpu_memory_utilization(self.gpu_memory_utilization)
                     .build(),
             )
-            .parallel(
-                rvllm_config::ParallelConfigImpl {
-                    tensor_parallel_size: self.tensor_parallel_size,
-                    ..Default::default()
-                },
-            )
+            .parallel(rvllm_config::ParallelConfigImpl {
+                tensor_parallel_size: self.tensor_parallel_size,
+                ..Default::default()
+            })
             .build()
     }
 }

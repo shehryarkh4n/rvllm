@@ -73,9 +73,8 @@ fn cuda_list_devices() -> Vec<GpuDevice> {
             })
             .unwrap_or((0, 0));
 
-        let total_memory = unsafe {
-            cudarc::driver::result::device::total_mem(*dev.cu_device())
-        }.unwrap_or(0);
+        let total_memory =
+            unsafe { cudarc::driver::result::device::total_mem(*dev.cu_device()) }.unwrap_or(0);
 
         devices.push(GpuDevice {
             id,
@@ -103,8 +102,16 @@ mod tests {
 
     #[test]
     fn memory_info_eq() {
-        let a = MemoryInfo { total: 100, free: 60, used: 40 };
-        let b = MemoryInfo { total: 100, free: 60, used: 40 };
+        let a = MemoryInfo {
+            total: 100,
+            free: 60,
+            used: 40,
+        };
+        let b = MemoryInfo {
+            total: 100,
+            free: 60,
+            used: 40,
+        };
         assert_eq!(a, b);
     }
 }

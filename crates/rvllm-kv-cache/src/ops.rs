@@ -1,9 +1,9 @@
 //! Cache operations for writing into paged KV buffers.
 
 use half::f16;
-use tracing::debug;
 use rvllm_core::prelude::{LLMError, Result};
 use rvllm_gpu::prelude::GpuBuffer;
+use tracing::debug;
 
 /// Reshape and cache key/value tensors into their paged GPU buffers.
 ///
@@ -152,7 +152,9 @@ mod tests {
 
         // 3 tokens
         let key: Vec<f16> = (0..3 * hs).map(|i| f16::from_f32(i as f32)).collect();
-        let value: Vec<f16> = (0..3 * hs).map(|i| f16::from_f32((i + 50) as f32)).collect();
+        let value: Vec<f16> = (0..3 * hs)
+            .map(|i| f16::from_f32((i + 50) as f32))
+            .collect();
         let slot_mapping = vec![0_i32, 3, 6];
 
         reshape_and_cache(
@@ -243,16 +245,8 @@ mod tests {
         let key: Vec<f16> = vec![f16::ZERO; hs];
         let value: Vec<f16> = vec![f16::ZERO; hs];
         // Slot 10 would be block 5 which doesn't exist (only 1 block)
-        let result = reshape_and_cache(
-            &key,
-            &value,
-            &mut key_cache,
-            &mut val_cache,
-            &[10],
-            1,
-            2,
-            2,
-        );
+        let result =
+            reshape_and_cache(&key, &value, &mut key_cache, &mut val_cache, &[10], 1, 2, 2);
         assert!(result.is_err());
     }
 }

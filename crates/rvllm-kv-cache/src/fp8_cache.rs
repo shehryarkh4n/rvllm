@@ -15,10 +15,10 @@
 //! when configured.
 
 use half::f16;
-use std::mem;
-use tracing::{debug, info};
 use rvllm_core::prelude::{BlockId, LLMError, Result};
 use rvllm_gpu::prelude::{CpuBuffer, GpuAllocator, GpuBuffer, GpuStream};
+use std::mem;
+use tracing::{debug, info};
 
 /// Maximum representable magnitude in FP8 E4M3 format.
 const FP8_E4M3_MAX: f32 = 448.0;
@@ -207,9 +207,7 @@ pub fn quantize_heads(input: &[f32], num_heads: usize, head_dim: usize) -> (Vec<
         let head_slice = &input[base..base + head_dim];
 
         // Dynamic per-head scaling: absmax / FP8_MAX
-        let absmax = head_slice
-            .iter()
-            .fold(0.0f32, |acc, &v| acc.max(v.abs()));
+        let absmax = head_slice.iter().fold(0.0f32, |acc, &v| acc.max(v.abs()));
         let scale = (absmax / FP8_E4M3_MAX).max(1e-12);
         scales[h] = scale;
 
@@ -225,7 +223,12 @@ pub fn quantize_heads(input: &[f32], num_heads: usize, head_dim: usize) -> (Vec<
 /// Dequantize a slice of FP8 E4M3 values back to f32.
 ///
 /// `input` is `[num_heads, head_dim]` as u8, `scales` is `[num_heads]`.
-pub fn dequantize_heads(input: &[u8], scales: &[f32], num_heads: usize, head_dim: usize) -> Vec<f32> {
+pub fn dequantize_heads(
+    input: &[u8],
+    scales: &[f32],
+    num_heads: usize,
+    head_dim: usize,
+) -> Vec<f32> {
     let mut output = vec![0.0f32; num_heads * head_dim];
 
     for h in 0..num_heads {
@@ -429,8 +432,7 @@ impl FP8CacheEngine {
             let block_offset = slot % self.block_size;
 
             let data_cache_offset = block_idx * data_block_stride + block_offset * head_stride;
-            let scale_cache_offset =
-                block_idx * scale_block_stride + block_offset * self.num_heads;
+            let scale_cache_offset = block_idx * scale_block_stride + block_offset * self.num_heads;
             let src_offset = token_idx * head_stride;
 
             if data_cache_offset + head_stride > key_data.len() {
@@ -475,11 +477,7 @@ impl FP8CacheEngine {
 
     /// Dequantize and read back a single token's key/value from the FP8 cache
     /// as f32 vectors (each of length `num_heads * head_dim`).
-    pub fn dequantize_token(
-        &self,
-        layer: usize,
-        slot: usize,
-    ) -> Result<(Vec<f32>, Vec<f32>)> {
+    pub fn dequantize_token(&self, layer: usize, slot: usize) -> Result<(Vec<f32>, Vec<f32>)> {
         let head_stride = self.num_heads * self.head_dim;
         let data_block_stride = self.block_size * head_stride;
         let scale_block_stride = self.block_size * self.num_heads;
@@ -581,11 +579,7 @@ impl FP8CacheEngine {
     }
 
     /// Swap blocks from CPU FP8 cache into GPU FP8 cache.
-    pub fn swap_in(
-        &mut self,
-        mapping: &[(BlockId, BlockId)],
-        _stream: &GpuStream,
-    ) -> Result<()> {
+    pub fn swap_in(&mut self, mapping: &[(BlockId, BlockId)], _stream: &GpuStream) -> Result<()> {
         let depb = self.data_elements_per_block();
         let sepb = self.scale_elements_per_block();
 
@@ -615,11 +609,7 @@ impl FP8CacheEngine {
                 .gpu_cache_data
                 .iter_mut()
                 .zip(self.gpu_cache_scales.iter_mut())
-                .zip(
-                    self.cpu_cache_data
-                        .iter()
-                        .zip(self.cpu_cache_scales.iter()),
-                )
+                .zip(self.cpu_cache_data.iter().zip(self.cpu_cache_scales.iter()))
             {
                 let mut kd = key_d.copy_to_host()?;
                 kd[gpu_data_off..gpu_data_off + depb]
@@ -648,11 +638,7 @@ impl FP8CacheEngine {
     }
 
     /// Swap blocks from GPU FP8 cache out to CPU FP8 cache.
-    pub fn swap_out(
-        &mut self,
-        mapping: &[(BlockId, BlockId)],
-        _stream: &GpuStream,
-    ) -> Result<()> {
+    pub fn swap_out(&mut self, mapping: &[(BlockId, BlockId)], _stream: &GpuStream) -> Result<()> {
         let depb = self.data_elements_per_block();
         let sepb = self.scale_elements_per_block();
 
@@ -722,14 +708,8 @@ mod tests {
             KVCacheDtype::from_str_opt("fp8_e4m3"),
             Some(KVCacheDtype::FP8)
         );
-        assert_eq!(
-            KVCacheDtype::from_str_opt("fp16"),
-            Some(KVCacheDtype::FP16)
-        );
-        assert_eq!(
-            KVCacheDtype::from_str_opt("auto"),
-            Some(KVCacheDtype::FP16)
-        );
+        assert_eq!(KVCacheDtype::from_str_opt("fp16"), Some(KVCacheDtype::FP16));
+        assert_eq!(KVCacheDtype::from_str_opt("auto"), Some(KVCacheDtype::FP16));
         assert_eq!(KVCacheDtype::from_str_opt("nonsense"), None);
     }
 
@@ -852,10 +832,7 @@ mod tests {
             let back = fp8_e4m3_to_float(fp8);
             let err = (val - back).abs();
             let tol = val.abs() * 0.2 + 0.01; // ~12.5% relative + small absolute
-            assert!(
-                err <= tol,
-                "value {val}: got {back}, err={err}, tol={tol}"
-            );
+            assert!(err <= tol, "value {val}: got {back}, err={err}, tol={tol}");
         }
     }
 }

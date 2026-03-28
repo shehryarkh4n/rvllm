@@ -19,7 +19,9 @@
 
 use std::sync::Arc;
 
-use cudarc::driver::{CudaDevice, CudaFunction, CudaSlice, CudaStream, DeviceSlice as _, LaunchAsync, LaunchConfig};
+use cudarc::driver::{
+    CudaDevice, CudaFunction, CudaSlice, CudaStream, DeviceSlice as _, LaunchAsync, LaunchConfig,
+};
 use tracing::trace;
 
 use rvllm_core::prelude::{LLMError, Result};

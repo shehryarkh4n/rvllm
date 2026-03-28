@@ -137,8 +137,7 @@ mod tests {
 
     // Install a throwaway recorder so the metrics macros don't panic.
     fn install_test_recorder() {
-        let _ = metrics_exporter_prometheus::PrometheusBuilder::new()
-            .install_recorder();
+        let _ = metrics_exporter_prometheus::PrometheusBuilder::new().install_recorder();
     }
 
     #[test]

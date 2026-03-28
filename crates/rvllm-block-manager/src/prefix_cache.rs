@@ -105,12 +105,7 @@ impl PrefixCache {
     /// `tokens` is the full prompt, `block_idx` is which block was computed,
     /// and `block_id` is the physical GPU block holding the KV data.
     /// Returns true if newly inserted, false if already present.
-    pub fn insert(
-        &mut self,
-        tokens: &[TokenId],
-        block_idx: usize,
-        block_id: BlockId,
-    ) -> bool {
+    pub fn insert(&mut self, tokens: &[TokenId], block_idx: usize, block_id: BlockId) -> bool {
         let hash = match self.hash_prefix(tokens, block_idx) {
             Some(h) => h,
             None => return false,

@@ -8,9 +8,7 @@
 use half::f16;
 use tracing::trace;
 
-use crate::bridge::{
-    AttentionBackend, CacheEngine, GpuBuffer, ModelWeights, Result,
-};
+use crate::bridge::{AttentionBackend, CacheEngine, GpuBuffer, ModelWeights, Result};
 use crate::input::ModelInput;
 use crate::layers::linear::LinearLayer;
 use crate::layers::norm::{LayerNorm, RMSNorm};
@@ -101,7 +99,9 @@ impl EmbeddingModel {
         let use_layer_norm = weights
             .get("model.encoder.layer.0.attention.output.LayerNorm.weight")
             .is_ok()
-            || weights.get("encoder.layer.0.attention.output.LayerNorm.weight").is_ok()
+            || weights
+                .get("encoder.layer.0.attention.output.LayerNorm.weight")
+                .is_ok()
             || weights.get("model.layers.0.input_layernorm.bias").is_ok();
 
         let embed_tokens = weights
@@ -114,7 +114,14 @@ impl EmbeddingModel {
         for i in 0..num_layers {
             // Try BERT-style prefix first, then Llama-style.
             let layer = if use_layer_norm {
-                Self::load_bert_layer(&weights, i, hidden_size, intermediate_size, num_heads, head_dim)
+                Self::load_bert_layer(
+                    &weights,
+                    i,
+                    hidden_size,
+                    intermediate_size,
+                    num_heads,
+                    head_dim,
+                )
             } else {
                 Self::load_llama_layer(&weights, i, config)
             };
@@ -203,7 +210,10 @@ impl EmbeddingModel {
             k_bias: try_get_opt("attention.self.key.bias", &[attn_out]),
             v_bias: try_get_opt("attention.self.value.bias", &[attn_out]),
             o_bias: try_get_opt("attention.output.dense.bias", &[hidden_size]),
-            intermediate_weight: try_get("intermediate.dense.weight", &[intermediate_size, hidden_size]),
+            intermediate_weight: try_get(
+                "intermediate.dense.weight",
+                &[intermediate_size, hidden_size],
+            ),
             intermediate_bias: try_get_opt("intermediate.dense.bias", &[intermediate_size]),
             output_weight: try_get("output.dense.weight", &[hidden_size, intermediate_size]),
             output_bias: try_get_opt("output.dense.bias", &[hidden_size]),
@@ -224,19 +234,47 @@ impl EmbeddingModel {
         EncoderLayer {
             input_norm_weight: get_or_zeros(weights, &format!("{p}.input_layernorm.weight"), &[h]),
             input_norm_bias: None,
-            post_attn_norm_weight: get_or_zeros(weights, &format!("{p}.post_attention_layernorm.weight"), &[h]),
+            post_attn_norm_weight: get_or_zeros(
+                weights,
+                &format!("{p}.post_attention_layernorm.weight"),
+                &[h],
+            ),
             post_attn_norm_bias: None,
-            q_proj: get_or_zeros(weights, &format!("{p}.self_attn.q_proj.weight"), &[qk_size, h]),
-            k_proj: get_or_zeros(weights, &format!("{p}.self_attn.k_proj.weight"), &[kv_size, h]),
-            v_proj: get_or_zeros(weights, &format!("{p}.self_attn.v_proj.weight"), &[kv_size, h]),
-            o_proj: get_or_zeros(weights, &format!("{p}.self_attn.o_proj.weight"), &[h, qk_size]),
+            q_proj: get_or_zeros(
+                weights,
+                &format!("{p}.self_attn.q_proj.weight"),
+                &[qk_size, h],
+            ),
+            k_proj: get_or_zeros(
+                weights,
+                &format!("{p}.self_attn.k_proj.weight"),
+                &[kv_size, h],
+            ),
+            v_proj: get_or_zeros(
+                weights,
+                &format!("{p}.self_attn.v_proj.weight"),
+                &[kv_size, h],
+            ),
+            o_proj: get_or_zeros(
+                weights,
+                &format!("{p}.self_attn.o_proj.weight"),
+                &[h, qk_size],
+            ),
             q_bias: None,
             k_bias: None,
             v_bias: None,
             o_bias: None,
-            intermediate_weight: get_or_zeros(weights, &format!("{p}.mlp.gate_proj.weight"), &[config.intermediate_size, h]),
+            intermediate_weight: get_or_zeros(
+                weights,
+                &format!("{p}.mlp.gate_proj.weight"),
+                &[config.intermediate_size, h],
+            ),
             intermediate_bias: None,
-            output_weight: get_or_zeros(weights, &format!("{p}.mlp.down_proj.weight"), &[h, config.intermediate_size]),
+            output_weight: get_or_zeros(
+                weights,
+                &format!("{p}.mlp.down_proj.weight"),
+                &[h, config.intermediate_size],
+            ),
             output_bias: None,
         }
     }
@@ -249,7 +287,9 @@ impl EmbeddingModel {
         bias: Option<&GpuBuffer<f16>>,
     ) -> Result<GpuBuffer<f16>> {
         if self.use_layer_norm {
-            let b = bias.cloned().unwrap_or_else(|| GpuBuffer::zeros(&[self.hidden_size]));
+            let b = bias
+                .cloned()
+                .unwrap_or_else(|| GpuBuffer::zeros(&[self.hidden_size]));
             LayerNorm::forward(hidden, weight, &b, self.norm_eps)
         } else {
             RMSNorm::forward(hidden, weight, self.norm_eps)
@@ -280,9 +320,7 @@ impl EmbeddingModel {
             }
             PoolingMode::Cls => {
                 // First token.
-                (0..h)
-                    .map(|j| hidden_states.data[j].to_f32())
-                    .collect()
+                (0..h).map(|j| hidden_states.data[j].to_f32()).collect()
             }
             PoolingMode::LastToken => {
                 let start = (num_tokens.saturating_sub(1)) * h;
@@ -356,13 +394,8 @@ impl Architecture for EmbeddingModel {
             };
 
             // Attention.
-            let attn_out = attention.forward(
-                &q_rot,
-                &k_rot,
-                &v,
-                &input.attention_metadata,
-                layer_idx,
-            )?;
+            let attn_out =
+                attention.forward(&q_rot, &k_rot, &v, &input.attention_metadata, layer_idx)?;
 
             // Output projection.
             let attn_proj = LinearLayer::forward(&attn_out, &layer.o_proj, layer.o_bias.as_ref())?;
@@ -385,11 +418,8 @@ impl Architecture for EmbeddingModel {
             // GELU activation (approximation used by BERT / most embedding models).
             let activated = gelu(&intermediate);
 
-            let ffn_out = LinearLayer::forward(
-                &activated,
-                &layer.output_weight,
-                layer.output_bias.as_ref(),
-            )?;
+            let ffn_out =
+                LinearLayer::forward(&activated, &layer.output_weight, layer.output_bias.as_ref())?;
             add_inplace(&mut hidden, &ffn_out);
         }
 
@@ -422,9 +452,7 @@ fn gelu(input: &GpuBuffer<f16>) -> GpuBuffer<f16> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bridge::{
-        AttentionMetadata, MockAttentionBackend, ModelWeights,
-    };
+    use crate::bridge::{AttentionMetadata, MockAttentionBackend, ModelWeights};
 
     fn make_config(num_layers: usize, hidden_size: usize) -> ModelRunnerConfig {
         ModelRunnerConfig {
@@ -487,8 +515,14 @@ mod tests {
         let model = EmbeddingModel::new(weights, &config).unwrap();
         let hidden = GpuBuffer::from_vec(
             vec![
-                f16::from_f32(1.0), f16::from_f32(2.0), f16::from_f32(3.0), f16::from_f32(4.0),
-                f16::from_f32(5.0), f16::from_f32(6.0), f16::from_f32(7.0), f16::from_f32(8.0),
+                f16::from_f32(1.0),
+                f16::from_f32(2.0),
+                f16::from_f32(3.0),
+                f16::from_f32(4.0),
+                f16::from_f32(5.0),
+                f16::from_f32(6.0),
+                f16::from_f32(7.0),
+                f16::from_f32(8.0),
             ],
             vec![2, 4],
         );
@@ -505,8 +539,10 @@ mod tests {
     fn cls_pooling() {
         let hidden = GpuBuffer::from_vec(
             vec![
-                f16::from_f32(10.0), f16::from_f32(20.0),
-                f16::from_f32(30.0), f16::from_f32(40.0),
+                f16::from_f32(10.0),
+                f16::from_f32(20.0),
+                f16::from_f32(30.0),
+                f16::from_f32(40.0),
             ],
             vec![2, 2],
         );
@@ -523,8 +559,10 @@ mod tests {
     fn last_token_pooling() {
         let hidden = GpuBuffer::from_vec(
             vec![
-                f16::from_f32(10.0), f16::from_f32(20.0),
-                f16::from_f32(30.0), f16::from_f32(40.0),
+                f16::from_f32(10.0),
+                f16::from_f32(20.0),
+                f16::from_f32(30.0),
+                f16::from_f32(40.0),
             ],
             vec![2, 2],
         );
@@ -550,7 +588,10 @@ mod tests {
         assert_eq!(PoolingMode::from_str_loose("mean"), PoolingMode::Mean);
         assert_eq!(PoolingMode::from_str_loose("cls"), PoolingMode::Cls);
         assert_eq!(PoolingMode::from_str_loose("first"), PoolingMode::Cls);
-        assert_eq!(PoolingMode::from_str_loose("last_token"), PoolingMode::LastToken);
+        assert_eq!(
+            PoolingMode::from_str_loose("last_token"),
+            PoolingMode::LastToken
+        );
         assert_eq!(PoolingMode::from_str_loose("eos"), PoolingMode::LastToken);
         assert_eq!(PoolingMode::from_str_loose("unknown"), PoolingMode::Mean);
     }

@@ -39,11 +39,14 @@ impl GpuEngineMetrics {
     pub fn on_request_added(&mut self, request_id: RequestId, prompt_tokens: usize) {
         let id_str = request_id.0.to_string();
         self.recorder.record_request_start(&id_str);
-        self.timings.insert(request_id, RequestTiming {
-            first_token_emitted: false,
-            prompt_tokens,
-            gen_tokens: 0,
-        });
+        self.timings.insert(
+            request_id,
+            RequestTiming {
+                first_token_emitted: false,
+                prompt_tokens,
+                gen_tokens: 0,
+            },
+        );
     }
 
     /// Record that a token was generated for the given request.
@@ -64,11 +67,8 @@ impl GpuEngineMetrics {
     pub fn on_request_finished(&mut self, request_id: RequestId) {
         let id_str = request_id.0.to_string();
         if let Some(timing) = self.timings.remove(&request_id) {
-            self.recorder.record_request_finished(
-                &id_str,
-                timing.prompt_tokens,
-                timing.gen_tokens,
-            );
+            self.recorder
+                .record_request_finished(&id_str, timing.prompt_tokens, timing.gen_tokens);
         }
     }
 
@@ -110,8 +110,7 @@ mod tests {
     use super::*;
 
     fn install_test_recorder() {
-        let _ = metrics_exporter_prometheus::PrometheusBuilder::new()
-            .install_recorder();
+        let _ = metrics_exporter_prometheus::PrometheusBuilder::new().install_recorder();
     }
 
     #[test]

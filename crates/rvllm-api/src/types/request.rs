@@ -111,9 +111,7 @@ impl CompletionRequest {
             ));
         }
         if self.n == 0 {
-            return Err(ApiError::InvalidRequest(
-                "n must be greater than 0".into(),
-            ));
+            return Err(ApiError::InvalidRequest("n must be greater than 0".into()));
         }
         Ok(())
     }
@@ -169,9 +167,7 @@ impl ChatCompletionRequest {
             ));
         }
         if self.n == 0 {
-            return Err(ApiError::InvalidRequest(
-                "n must be greater than 0".into(),
-            ));
+            return Err(ApiError::InvalidRequest("n must be greater than 0".into()));
         }
         Ok(())
     }
@@ -243,6 +239,8 @@ mod tests {
             frequency_penalty: 0.0,
             user: None,
             seed: None,
+            tools: None,
+            tool_choice: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let back: ChatCompletionRequest = serde_json::from_str(&json).unwrap();
@@ -340,6 +338,8 @@ mod tests {
             frequency_penalty: 0.0,
             user: None,
             seed: None,
+            tools: None,
+            tool_choice: None,
         };
         assert!(req.validate().is_err());
     }
@@ -362,6 +362,8 @@ mod tests {
             frequency_penalty: 0.0,
             user: None,
             seed: None,
+            tools: None,
+            tool_choice: None,
         };
         assert!(req.validate().is_err());
     }

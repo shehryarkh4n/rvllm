@@ -105,10 +105,18 @@ pub struct ChatCompletionToolRequest {
     pub tool_choice: Option<ToolChoice>,
 }
 
-fn default_max_tokens() -> usize { 256 }
-fn default_temperature() -> f32 { 1.0 }
-fn default_top_p() -> f32 { 1.0 }
-fn default_n() -> usize { 1 }
+fn default_max_tokens() -> usize {
+    256
+}
+fn default_temperature() -> f32 {
+    1.0
+}
+fn default_top_p() -> f32 {
+    1.0
+}
+fn default_n() -> usize {
+    1
+}
 
 // ---------------------------------------------------------------------------
 // Response types
@@ -170,16 +178,24 @@ impl ChatCompletionToolRequest {
             return Err(ApiError::InvalidRequest("model is required".into()));
         }
         if self.messages.is_empty() {
-            return Err(ApiError::InvalidRequest("messages must not be empty".into()));
+            return Err(ApiError::InvalidRequest(
+                "messages must not be empty".into(),
+            ));
         }
         if self.max_tokens == 0 {
-            return Err(ApiError::InvalidRequest("max_tokens must be greater than 0".into()));
+            return Err(ApiError::InvalidRequest(
+                "max_tokens must be greater than 0".into(),
+            ));
         }
         if self.temperature < 0.0 || self.temperature > 2.0 {
-            return Err(ApiError::InvalidRequest("temperature must be between 0.0 and 2.0".into()));
+            return Err(ApiError::InvalidRequest(
+                "temperature must be between 0.0 and 2.0".into(),
+            ));
         }
         if self.top_p < 0.0 || self.top_p > 1.0 {
-            return Err(ApiError::InvalidRequest("top_p must be between 0.0 and 1.0".into()));
+            return Err(ApiError::InvalidRequest(
+                "top_p must be between 0.0 and 1.0".into(),
+            ));
         }
         // Validate tool_choice value
         if let Some(ToolChoice::Mode(ref mode)) = self.tool_choice {
@@ -233,9 +249,11 @@ impl ChatCompletionToolRequest {
                         function: rvllm_tokenizer::FunctionDefinition {
                             name: t.function.name.clone(),
                             description: t.function.description.clone(),
-                            parameters: t.function.parameters.as_ref().and_then(|p| {
-                                serde_json::from_value(p.clone()).ok()
-                            }),
+                            parameters: t
+                                .function
+                                .parameters
+                                .as_ref()
+                                .and_then(|p| serde_json::from_value(p.clone()).ok()),
                         },
                     })
                     .collect()
@@ -312,7 +330,11 @@ pub async fn create_chat_completion_with_tools(
     // Build messages, optionally augmented with tool definitions
     let messages = if tools_active {
         let tool_defs = req.to_tool_definitions();
-        augment_messages_with_tools(&req.messages, &tool_defs, rvllm_tokenizer::ToolPromptStyle::Hermes)
+        augment_messages_with_tools(
+            &req.messages,
+            &tool_defs,
+            rvllm_tokenizer::ToolPromptStyle::Hermes,
+        )
     } else {
         req.messages.clone()
     };
@@ -416,8 +438,8 @@ pub async fn create_chat_completion_with_tools(
             last_output = Some(output);
         }
 
-        let output = last_output
-            .ok_or_else(|| ApiError::Internal("engine produced no output".into()))?;
+        let output =
+            last_output.ok_or_else(|| ApiError::Internal("engine produced no output".into()))?;
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -610,7 +632,10 @@ mod tests {
     fn tools_enabled_checks() {
         let base = ChatCompletionToolRequest {
             model: "m".into(),
-            messages: vec![ChatMessage { role: "user".into(), content: "hi".into() }],
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: "hi".into(),
+            }],
             max_tokens: 256,
             temperature: 1.0,
             top_p: 1.0,
@@ -660,9 +685,10 @@ mod tests {
 
     #[test]
     fn augment_messages_prepends_system() {
-        let msgs = vec![
-            ChatMessage { role: "user".into(), content: "What's the weather?".into() },
-        ];
+        let msgs = vec![ChatMessage {
+            role: "user".into(),
+            content: "What's the weather?".into(),
+        }];
         let tools = vec![rvllm_tokenizer::ToolDefinition {
             tool_type: "function".to_string(),
             function: rvllm_tokenizer::FunctionDefinition {
@@ -671,7 +697,8 @@ mod tests {
                 parameters: None,
             },
         }];
-        let augmented = augment_messages_with_tools(&msgs, &tools, rvllm_tokenizer::ToolPromptStyle::Hermes);
+        let augmented =
+            augment_messages_with_tools(&msgs, &tools, rvllm_tokenizer::ToolPromptStyle::Hermes);
         assert_eq!(augmented.len(), 2);
         assert_eq!(augmented[0].role, "system");
         assert!(augmented[0].content.contains("get_weather"));
@@ -681,8 +708,14 @@ mod tests {
     #[test]
     fn augment_messages_merges_system() {
         let msgs = vec![
-            ChatMessage { role: "system".into(), content: "You are helpful.".into() },
-            ChatMessage { role: "user".into(), content: "Hi".into() },
+            ChatMessage {
+                role: "system".into(),
+                content: "You are helpful.".into(),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: "Hi".into(),
+            },
         ];
         let tools = vec![rvllm_tokenizer::ToolDefinition {
             tool_type: "function".to_string(),
@@ -692,7 +725,8 @@ mod tests {
                 parameters: None,
             },
         }];
-        let augmented = augment_messages_with_tools(&msgs, &tools, rvllm_tokenizer::ToolPromptStyle::Hermes);
+        let augmented =
+            augment_messages_with_tools(&msgs, &tools, rvllm_tokenizer::ToolPromptStyle::Hermes);
         assert_eq!(augmented.len(), 2);
         assert_eq!(augmented[0].role, "system");
         assert!(augmented[0].content.contains("search"));
@@ -703,7 +737,10 @@ mod tests {
     fn validate_bad_tool_choice() {
         let req = ChatCompletionToolRequest {
             model: "m".into(),
-            messages: vec![ChatMessage { role: "user".into(), content: "hi".into() }],
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: "hi".into(),
+            }],
             max_tokens: 256,
             temperature: 1.0,
             top_p: 1.0,
@@ -795,7 +832,10 @@ mod tests {
     fn to_sampling_params_maps_fields() {
         let req = ChatCompletionToolRequest {
             model: "m".into(),
-            messages: vec![ChatMessage { role: "user".into(), content: "hi".into() }],
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: "hi".into(),
+            }],
             max_tokens: 42,
             temperature: 0.8,
             top_p: 0.95,

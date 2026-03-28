@@ -73,14 +73,10 @@ impl CudaCacheEngine {
             // SAFETY: cudarc alloc_zeros returns zero-initialized device memory.
             // No unsafe needed -- cudarc's safe API handles allocation.
             let key_gpu: CudaSlice<f32> = device.alloc_zeros(gpu_total).map_err(|e| {
-                LLMError::GpuError(format!(
-                    "CUDA key cache alloc failed layer {layer}: {e}"
-                ))
+                LLMError::GpuError(format!("CUDA key cache alloc failed layer {layer}: {e}"))
             })?;
             let val_gpu: CudaSlice<f32> = device.alloc_zeros(gpu_total).map_err(|e| {
-                LLMError::GpuError(format!(
-                    "CUDA value cache alloc failed layer {layer}: {e}"
-                ))
+                LLMError::GpuError(format!("CUDA value cache alloc failed layer {layer}: {e}"))
             })?;
             gpu_cache.push((key_gpu, val_gpu));
 
@@ -178,27 +174,32 @@ impl CudaCacheEngine {
             for (key_buf, val_buf) in &mut self.gpu_cache {
                 // Round-trip through host: dtoh full buffer, copy block, htod back.
                 // This is correct but slow; Agent 9 provides the kernel-based path.
-                let mut key_host = self.device.dtoh_sync_copy(key_buf).map_err(|e| {
-                    LLMError::GpuError(format!("copy_blocks dtoh key: {e}"))
-                })?;
+                let mut key_host = self
+                    .device
+                    .dtoh_sync_copy(key_buf)
+                    .map_err(|e| LLMError::GpuError(format!("copy_blocks dtoh key: {e}")))?;
                 let src_slice: Vec<f32> = key_host[src_off..src_off + epb].to_vec();
                 key_host[dst_off..dst_off + epb].copy_from_slice(&src_slice);
-                self.device.htod_sync_copy_into(&key_host, key_buf).map_err(|e| {
-                    LLMError::GpuError(format!("copy_blocks htod key: {e}"))
-                })?;
+                self.device
+                    .htod_sync_copy_into(&key_host, key_buf)
+                    .map_err(|e| LLMError::GpuError(format!("copy_blocks htod key: {e}")))?;
 
-                let mut val_host = self.device.dtoh_sync_copy(val_buf).map_err(|e| {
-                    LLMError::GpuError(format!("copy_blocks dtoh val: {e}"))
-                })?;
+                let mut val_host = self
+                    .device
+                    .dtoh_sync_copy(val_buf)
+                    .map_err(|e| LLMError::GpuError(format!("copy_blocks dtoh val: {e}")))?;
                 let src_slice: Vec<f32> = val_host[src_off..src_off + epb].to_vec();
                 val_host[dst_off..dst_off + epb].copy_from_slice(&src_slice);
-                self.device.htod_sync_copy_into(&val_host, val_buf).map_err(|e| {
-                    LLMError::GpuError(format!("copy_blocks htod val: {e}"))
-                })?;
+                self.device
+                    .htod_sync_copy_into(&val_host, val_buf)
+                    .map_err(|e| LLMError::GpuError(format!("copy_blocks htod val: {e}")))?;
             }
         }
 
-        debug!(pairs = mapping.len(), "CudaCacheEngine copy_blocks complete");
+        debug!(
+            pairs = mapping.len(),
+            "CudaCacheEngine copy_blocks complete"
+        );
         Ok(())
     }
 
@@ -237,20 +238,22 @@ impl CudaCacheEngine {
                 let mut key_host = self.device.dtoh_sync_copy(key_gpu).map_err(|e| {
                     LLMError::GpuError(format!("swap_in dtoh key layer {layer_idx}: {e}"))
                 })?;
-                key_host[gpu_off..gpu_off + epb]
-                    .copy_from_slice(&key_cpu[cpu_off..cpu_off + epb]);
-                self.device.htod_sync_copy_into(&key_host, key_gpu).map_err(|e| {
-                    LLMError::GpuError(format!("swap_in htod key layer {layer_idx}: {e}"))
-                })?;
+                key_host[gpu_off..gpu_off + epb].copy_from_slice(&key_cpu[cpu_off..cpu_off + epb]);
+                self.device
+                    .htod_sync_copy_into(&key_host, key_gpu)
+                    .map_err(|e| {
+                        LLMError::GpuError(format!("swap_in htod key layer {layer_idx}: {e}"))
+                    })?;
 
                 let mut val_host = self.device.dtoh_sync_copy(val_gpu).map_err(|e| {
                     LLMError::GpuError(format!("swap_in dtoh val layer {layer_idx}: {e}"))
                 })?;
-                val_host[gpu_off..gpu_off + epb]
-                    .copy_from_slice(&val_cpu[cpu_off..cpu_off + epb]);
-                self.device.htod_sync_copy_into(&val_host, val_gpu).map_err(|e| {
-                    LLMError::GpuError(format!("swap_in htod val layer {layer_idx}: {e}"))
-                })?;
+                val_host[gpu_off..gpu_off + epb].copy_from_slice(&val_cpu[cpu_off..cpu_off + epb]);
+                self.device
+                    .htod_sync_copy_into(&val_host, val_gpu)
+                    .map_err(|e| {
+                        LLMError::GpuError(format!("swap_in htod val layer {layer_idx}: {e}"))
+                    })?;
             }
         }
 
@@ -292,14 +295,12 @@ impl CudaCacheEngine {
                 let key_host = self.device.dtoh_sync_copy(key_gpu).map_err(|e| {
                     LLMError::GpuError(format!("swap_out dtoh key layer {layer_idx}: {e}"))
                 })?;
-                key_cpu[cpu_off..cpu_off + epb]
-                    .copy_from_slice(&key_host[gpu_off..gpu_off + epb]);
+                key_cpu[cpu_off..cpu_off + epb].copy_from_slice(&key_host[gpu_off..gpu_off + epb]);
 
                 let val_host = self.device.dtoh_sync_copy(val_gpu).map_err(|e| {
                     LLMError::GpuError(format!("swap_out dtoh val layer {layer_idx}: {e}"))
                 })?;
-                val_cpu[cpu_off..cpu_off + epb]
-                    .copy_from_slice(&val_host[gpu_off..gpu_off + epb]);
+                val_cpu[cpu_off..cpu_off + epb].copy_from_slice(&val_host[gpu_off..gpu_off + epb]);
 
                 let _ = layer_idx;
             }

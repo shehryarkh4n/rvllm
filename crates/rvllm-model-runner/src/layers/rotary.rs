@@ -164,7 +164,10 @@ mod tests {
     fn rope_position_zero_is_identity() {
         // At position 0, all freqs are 0, cos=1, sin=0 -> identity.
         let head_dim = 4;
-        let vals: Vec<f16> = [1.0f32, 2.0, 3.0, 4.0].iter().map(|&v| f16::from_f32(v)).collect();
+        let vals: Vec<f16> = [1.0f32, 2.0, 3.0, 4.0]
+            .iter()
+            .map(|&v| f16::from_f32(v))
+            .collect();
         let q = GpuBuffer::from_vec(vals.clone(), vec![1, head_dim]);
         let k = GpuBuffer::from_vec(vals, vec![1, head_dim]);
         let (qr, kr) = RotaryEmbedding::forward(&[0], &q, &k, head_dim).unwrap();
@@ -177,12 +180,16 @@ mod tests {
     #[test]
     fn rope_changes_nonzero_position() {
         let head_dim = 4;
-        let vals: Vec<f16> = [1.0f32, 0.0, 0.0, 1.0].iter().map(|&v| f16::from_f32(v)).collect();
+        let vals: Vec<f16> = [1.0f32, 0.0, 0.0, 1.0]
+            .iter()
+            .map(|&v| f16::from_f32(v))
+            .collect();
         let q = GpuBuffer::from_vec(vals.clone(), vec![1, head_dim]);
         let k = GpuBuffer::from_vec(vals, vec![1, head_dim]);
         let (qr, _kr) = RotaryEmbedding::forward(&[100], &q, &k, head_dim).unwrap();
         // At pos=100 the rotation should differ from input.
-        let changed = (0..head_dim).any(|i| (qr.data[i].to_f32() - q.data[i].to_f32()).abs() > 0.01);
+        let changed =
+            (0..head_dim).any(|i| (qr.data[i].to_f32() - q.data[i].to_f32()).abs() > 0.01);
         assert!(changed, "RoPE at pos=100 should change the vector");
     }
 }

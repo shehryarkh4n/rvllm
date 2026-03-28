@@ -383,7 +383,11 @@ impl BlockManager {
                 .allocate()
                 .ok_or_else(|| LLMError::MemoryError("out of CPU blocks for swap".into()))?;
             mapping.push((block.block_id, cpu_block_id));
-            cpu_table.push(PhysicalBlock::new(cpu_block_id, self.block_size, Device::Cpu));
+            cpu_table.push(PhysicalBlock::new(
+                cpu_block_id,
+                self.block_size,
+                Device::Cpu,
+            ));
             self.cpu_ref_counts.increment(cpu_block_id);
 
             let remaining = self.gpu_ref_counts.decrement(block.block_id);
@@ -413,7 +417,11 @@ impl BlockManager {
                 .allocate()
                 .ok_or_else(|| LLMError::MemoryError("out of GPU blocks for swap-in".into()))?;
             mapping.push((block.block_id, gpu_block_id));
-            gpu_table.push(PhysicalBlock::new(gpu_block_id, self.block_size, Device::Gpu));
+            gpu_table.push(PhysicalBlock::new(
+                gpu_block_id,
+                self.block_size,
+                Device::Gpu,
+            ));
             self.gpu_ref_counts.increment(gpu_block_id);
 
             let remaining = self.cpu_ref_counts.decrement(block.block_id);
@@ -461,8 +469,8 @@ impl SharedBlockManager {
 mod tests {
     use super::*;
     use crate::SequenceStatus;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use rvllm_core::prelude::TokenId;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct TestPool {
         total: usize,

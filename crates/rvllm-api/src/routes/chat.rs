@@ -14,9 +14,7 @@ use crate::routes::tools::{augment_messages_with_tools, ToolChoice};
 use crate::server::AppState;
 use crate::types::request::ChatCompletionRequest;
 use crate::types::response::ChatCompletionResponse;
-use crate::types::streaming::{
-    format_sse_data, ChatCompletionStreamChunk, SSE_DONE,
-};
+use crate::types::streaming::{format_sse_data, ChatCompletionStreamChunk, SSE_DONE};
 
 /// POST /v1/chat/completions -- chat completion (streaming or non-streaming).
 pub async fn create_chat_completion(
@@ -40,17 +38,29 @@ pub async fn create_chat_completion(
 
     // Build messages, optionally augmented with tool definitions
     let messages = if tools_active {
-        let tool_defs: Vec<rvllm_tokenizer::ToolDefinition> = req.tools.as_ref().unwrap().iter().map(|t| {
-            rvllm_tokenizer::ToolDefinition {
+        let tool_defs: Vec<rvllm_tokenizer::ToolDefinition> = req
+            .tools
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|t| rvllm_tokenizer::ToolDefinition {
                 tool_type: t.tool_type.clone(),
                 function: rvllm_tokenizer::FunctionDefinition {
                     name: t.function.name.clone(),
                     description: t.function.description.clone(),
-                    parameters: t.function.parameters.as_ref().and_then(|p| serde_json::from_value(p.clone()).ok()),
+                    parameters: t
+                        .function
+                        .parameters
+                        .as_ref()
+                        .and_then(|p| serde_json::from_value(p.clone()).ok()),
                 },
-            }
-        }).collect();
-        augment_messages_with_tools(&req.messages, &tool_defs, rvllm_tokenizer::ToolPromptStyle::Hermes)
+            })
+            .collect();
+        augment_messages_with_tools(
+            &req.messages,
+            &tool_defs,
+            rvllm_tokenizer::ToolPromptStyle::Hermes,
+        )
     } else {
         req.messages.clone()
     };
@@ -89,10 +99,7 @@ pub async fn create_chat_completion(
         let model_clone = model.clone();
 
         // First event: role chunk
-        let initial = format_sse_data(&ChatCompletionStreamChunk::role_chunk(
-            &stream_id,
-            &model,
-        ));
+        let initial = format_sse_data(&ChatCompletionStreamChunk::role_chunk(&stream_id, &model));
 
         let sse_stream = output_stream.map(move |output| {
             let mut events = String::new();
@@ -156,9 +163,8 @@ pub async fn create_chat_completion(
             last_output = Some(output);
         }
 
-        let output = last_output.ok_or_else(|| {
-            ApiError::Internal("engine produced no output".into())
-        })?;
+        let output =
+            last_output.ok_or_else(|| ApiError::Internal("engine produced no output".into()))?;
 
         if tools_active {
             // Parse output for tool calls
@@ -169,51 +175,60 @@ pub async fn create_chat_completion(
                 .as_secs();
 
             let mut total_completion = 0usize;
-            let choices: Vec<crate::routes::tools::ToolChatChoice> = output.outputs.iter().map(|co| {
-                total_completion += co.token_ids.len();
-                let finish_reason_val = co.finish_reason.map(|r| match r {
-                    rvllm_core::prelude::FinishReason::Stop => "stop",
-                    rvllm_core::prelude::FinishReason::Length => "length",
-                    rvllm_core::prelude::FinishReason::Abort => "stop",
-                });
-                let call_prefix = format!("{}_{}_", resp_id, co.index);
-                let parse_result = rvllm_tokenizer::parse_tool_calls(&co.text, &call_prefix);
-                match parse_result {
-                    rvllm_tokenizer::ToolParseResult::ToolCalls { prefix_text, calls } => {
-                        let tool_calls: Vec<crate::routes::tools::ResponseToolCall> = calls.into_iter().map(|tc| {
-                            crate::routes::tools::ResponseToolCall {
-                                id: tc.id,
-                                call_type: "function".to_string(),
-                                function: crate::routes::tools::ResponseFunctionCall {
-                                    name: tc.name,
-                                    arguments: tc.arguments,
+            let choices: Vec<crate::routes::tools::ToolChatChoice> = output
+                .outputs
+                .iter()
+                .map(|co| {
+                    total_completion += co.token_ids.len();
+                    let finish_reason_val = co.finish_reason.map(|r| match r {
+                        rvllm_core::prelude::FinishReason::Stop => "stop",
+                        rvllm_core::prelude::FinishReason::Length => "length",
+                        rvllm_core::prelude::FinishReason::Abort => "stop",
+                    });
+                    let call_prefix = format!("{}_{}_", resp_id, co.index);
+                    let parse_result = rvllm_tokenizer::parse_tool_calls(&co.text, &call_prefix);
+                    match parse_result {
+                        rvllm_tokenizer::ToolParseResult::ToolCalls { prefix_text, calls } => {
+                            let tool_calls: Vec<crate::routes::tools::ResponseToolCall> = calls
+                                .into_iter()
+                                .map(|tc| crate::routes::tools::ResponseToolCall {
+                                    id: tc.id,
+                                    call_type: "function".to_string(),
+                                    function: crate::routes::tools::ResponseFunctionCall {
+                                        name: tc.name,
+                                        arguments: tc.arguments,
+                                    },
+                                })
+                                .collect();
+                            let content = if prefix_text.is_empty() {
+                                None
+                            } else {
+                                Some(prefix_text)
+                            };
+                            crate::routes::tools::ToolChatChoice {
+                                index: co.index,
+                                message: crate::routes::tools::ToolChatMessage {
+                                    role: "assistant".to_string(),
+                                    content,
+                                    tool_calls: Some(tool_calls),
                                 },
+                                finish_reason: Some("tool_calls".to_string()),
                             }
-                        }).collect();
-                        let content = if prefix_text.is_empty() { None } else { Some(prefix_text) };
-                        crate::routes::tools::ToolChatChoice {
-                            index: co.index,
-                            message: crate::routes::tools::ToolChatMessage {
-                                role: "assistant".to_string(),
-                                content,
-                                tool_calls: Some(tool_calls),
-                            },
-                            finish_reason: Some("tool_calls".to_string()),
+                        }
+                        rvllm_tokenizer::ToolParseResult::PlainText(text) => {
+                            crate::routes::tools::ToolChatChoice {
+                                index: co.index,
+                                message: crate::routes::tools::ToolChatMessage {
+                                    role: "assistant".to_string(),
+                                    content: Some(text),
+                                    tool_calls: None,
+                                },
+                                finish_reason: finish_reason_val.map(|s| s.to_string()),
+                            }
                         }
                     }
-                    rvllm_tokenizer::ToolParseResult::PlainText(text) => {
-                        crate::routes::tools::ToolChatChoice {
-                            index: co.index,
-                            message: crate::routes::tools::ToolChatMessage {
-                                role: "assistant".to_string(),
-                                content: Some(text),
-                                tool_calls: None,
-                            },
-                            finish_reason: finish_reason_val.map(|s| s.to_string()),
-                        }
-                    }
-                }
-            }).collect();
+                })
+                .collect();
 
             let resp = crate::routes::tools::ChatCompletionToolResponse {
                 id: resp_id,

@@ -5,8 +5,8 @@
 //! running a separate CUDA kernel.
 
 use rand::rngs::StdRng;
-use tracing::trace;
 use rvllm_core::prelude::{LLMError, Result, SamplingParams, TokenId};
+use tracing::trace;
 
 use crate::batch::sample_batch;
 use crate::sampler::SamplerOutput;
@@ -78,7 +78,9 @@ mod tests {
     use rand::SeedableRng;
 
     fn make_rngs(n: usize) -> Vec<StdRng> {
-        (0..n).map(|i| StdRng::seed_from_u64(i as u64 + 42)).collect()
+        (0..n)
+            .map(|i| StdRng::seed_from_u64(i as u64 + 42))
+            .collect()
     }
 
     #[test]
@@ -182,8 +184,7 @@ mod tests {
 
         let out1 =
             sample_from_gpu_logits(logits.clone(), vocab_size, &params, &past, &mut rngs1).unwrap();
-        let out2 =
-            sample_from_gpu_logits(logits, vocab_size, &params, &past, &mut rngs2).unwrap();
+        let out2 = sample_from_gpu_logits(logits, vocab_size, &params, &past, &mut rngs2).unwrap();
 
         assert_eq!(out1[0].token_id, out2[0].token_id);
     }

@@ -34,9 +34,7 @@ mod inner {
             response_tx: oneshot::Sender<Result<()>>,
         },
         /// Abort a running request.
-        AbortRequest {
-            request_id: RequestId,
-        },
+        AbortRequest { request_id: RequestId },
         /// Graceful shutdown.
         Shutdown,
     }
@@ -118,9 +116,7 @@ mod inner {
                     id_tx,
                 })
                 .await
-                .map_err(|_| {
-                    LLMError::GpuError("GPU engine background task stopped".into())
-                })?;
+                .map_err(|_| LLMError::GpuError("GPU engine background task stopped".into()))?;
 
             let request_id = id_rx
                 .await
@@ -149,9 +145,7 @@ mod inner {
                     response_tx: resp_tx,
                 })
                 .await
-                .map_err(|_| {
-                    LLMError::GpuError("GPU engine background task stopped".into())
-                })?;
+                .map_err(|_| LLMError::GpuError("GPU engine background task stopped".into()))?;
 
             resp_rx
                 .await
@@ -282,8 +276,7 @@ mod inner {
                         sampling_params,
                         response_tx,
                     }) => {
-                        let result =
-                            engine.add_request(request_id, prompt, sampling_params);
+                        let result = engine.add_request(request_id, prompt, sampling_params);
                         let _ = response_tx.send(result);
                     }
                     Ok(GpuEngineCommand::AbortRequest { request_id }) => {
@@ -346,8 +339,7 @@ mod inner {
                     sampling_params,
                     response_tx,
                 }) => {
-                    let result =
-                        engine.add_request(request_id, prompt, sampling_params);
+                    let result = engine.add_request(request_id, prompt, sampling_params);
                     let _ = response_tx.send(result);
                     true
                 }

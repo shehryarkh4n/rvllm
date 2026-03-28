@@ -29,9 +29,8 @@ impl GpuStream {
     #[cfg(feature = "cuda")]
     pub fn new(device_id: usize) -> Result<Self> {
         tracing::debug!(device_id, "creating CUDA GPU stream");
-        let device = CudaDevice::new(device_id).map_err(|e| {
-            crate::LLMError::MemoryError(format!("CUDA device init failed: {e}"))
-        })?;
+        let device = CudaDevice::new(device_id)
+            .map_err(|e| crate::LLMError::MemoryError(format!("CUDA device init failed: {e}")))?;
         let stream = device.fork_default_stream().map_err(|e| {
             crate::LLMError::MemoryError(format!("CUDA stream creation failed: {e}"))
         })?;

@@ -197,10 +197,7 @@ fn parse_hermes_tool_calls(text: &str, call_id_prefix: &str) -> ToolParseResult 
         ToolParseResult::PlainText(text.to_string())
     } else {
         debug!(count = calls.len(), "parsed hermes-style tool calls");
-        ToolParseResult::ToolCalls {
-            prefix_text,
-            calls,
-        }
+        ToolParseResult::ToolCalls { prefix_text, calls }
     }
 }
 
@@ -271,10 +268,7 @@ fn parse_json_tool_calls(text: &str, call_id_prefix: &str) -> ToolParseResult {
         ToolParseResult::PlainText(text.to_string())
     } else {
         debug!(count = calls.len(), "parsed json-style tool calls");
-        ToolParseResult::ToolCalls {
-            prefix_text,
-            calls,
-        }
+        ToolParseResult::ToolCalls { prefix_text, calls }
     }
 }
 
@@ -402,7 +396,8 @@ mod tests {
 
     #[test]
     fn parse_json_array_tool_calls() {
-        let text = r#"[{"name": "fn_a", "arguments": {"x": 1}}, {"name": "fn_b", "arguments": {"y": 2}}]"#;
+        let text =
+            r#"[{"name": "fn_a", "arguments": {"x": 1}}, {"name": "fn_b", "arguments": {"y": 2}}]"#;
         let result = parse_tool_calls(text, "a_");
         match result {
             ToolParseResult::ToolCalls { calls, .. } => {

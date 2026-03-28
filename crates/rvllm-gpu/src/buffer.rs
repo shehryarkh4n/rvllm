@@ -108,18 +108,16 @@ impl<T: Pod + Send> GpuBuffer<T> {
             }
             #[cfg(feature = "cuda")]
             GpuBufferInner::Cuda { slice, device } => {
-                device.bind_to_thread().map_err(|e| {
-                    crate::LLMError::MemoryError(format!("CUDA bind failed: {e}"))
-                })?;
+                device
+                    .bind_to_thread()
+                    .map_err(|e| crate::LLMError::MemoryError(format!("CUDA bind failed: {e}")))?;
                 unsafe {
                     cudarc::driver::result::memcpy_htod_sync(
                         *DevicePtrMut::device_ptr_mut(slice),
                         src,
                     )
                 }
-                .map_err(|e| {
-                    crate::LLMError::MemoryError(format!("CUDA htod copy failed: {e}"))
-                })?;
+                .map_err(|e| crate::LLMError::MemoryError(format!("CUDA htod copy failed: {e}")))?;
                 Ok(())
             }
             #[cfg(not(any(feature = "mock-gpu", feature = "cuda")))]
@@ -135,9 +133,9 @@ impl<T: Pod + Send> GpuBuffer<T> {
             GpuBufferInner::Mock { data, .. } => Ok(data.clone()),
             #[cfg(feature = "cuda")]
             GpuBufferInner::Cuda { slice, device } => {
-                device.bind_to_thread().map_err(|e| {
-                    crate::LLMError::MemoryError(format!("CUDA bind failed: {e}"))
-                })?;
+                device
+                    .bind_to_thread()
+                    .map_err(|e| crate::LLMError::MemoryError(format!("CUDA bind failed: {e}")))?;
                 let len = cudarc::driver::DeviceSlice::len(slice);
                 let mut host = vec![T::zeroed(); len];
                 unsafe {
@@ -146,9 +144,7 @@ impl<T: Pod + Send> GpuBuffer<T> {
                         *DevicePtr::device_ptr(slice),
                     )
                 }
-                .map_err(|e| {
-                    crate::LLMError::MemoryError(format!("CUDA dtoh copy failed: {e}"))
-                })?;
+                .map_err(|e| crate::LLMError::MemoryError(format!("CUDA dtoh copy failed: {e}")))?;
                 Ok(host)
             }
             #[cfg(not(any(feature = "mock-gpu", feature = "cuda")))]

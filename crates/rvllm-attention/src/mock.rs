@@ -1,8 +1,8 @@
 //! Mock attention backend for testing -- simple scaled dot-product on CPU data.
 
+use crate::buffer::GpuBuffer;
 use half::f16;
 use rvllm_core::prelude::Result;
-use crate::buffer::GpuBuffer;
 
 use crate::backend::AttentionBackend;
 
@@ -54,12 +54,7 @@ impl AttentionBackend for MockAttentionBackend {
 
         let mut output = vec![f16::ZERO; num_tokens * num_heads * head_dim];
 
-        let ctx_len = context_lens
-            .data
-            .first()
-            .copied()
-            .unwrap_or(0)
-            .max(0) as usize;
+        let ctx_len = context_lens.data.first().copied().unwrap_or(0).max(0) as usize;
         let ctx_len = ctx_len.min(total_kv_positions);
 
         for t in 0..num_tokens {
@@ -154,7 +149,15 @@ mod tests {
 
         let backend = MockAttentionBackend::new();
         let out = backend
-            .forward(&query, &key_cache, &value_cache, &block_tables, &context_lens, ctx_len, 1.0)
+            .forward(
+                &query,
+                &key_cache,
+                &value_cache,
+                &block_tables,
+                &context_lens,
+                ctx_len,
+                1.0,
+            )
             .unwrap();
 
         assert_eq!(out.shape, vec![1, 2, 4]);
@@ -186,7 +189,15 @@ mod tests {
         };
 
         let out = MockAttentionBackend::new()
-            .forward(&query, &key_cache, &value_cache, &block_tables, &context_lens, 0, 1.0)
+            .forward(
+                &query,
+                &key_cache,
+                &value_cache,
+                &block_tables,
+                &context_lens,
+                0,
+                1.0,
+            )
             .unwrap();
         // Output should be all zeros (no context to attend to)
         for &v in &out.data {

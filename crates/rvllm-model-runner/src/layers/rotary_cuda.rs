@@ -11,7 +11,8 @@ mod inner {
     use std::sync::Arc;
 
     use cudarc::driver::{
-        CudaDevice, CudaFunction, CudaSlice, CudaStream, DeviceRepr, DeviceSlice as _, LaunchAsync, LaunchConfig,
+        CudaDevice, CudaFunction, CudaSlice, CudaStream, DeviceRepr, DeviceSlice as _, LaunchAsync,
+        LaunchConfig,
     };
     use tracing::debug;
 
@@ -96,9 +97,7 @@ mod inner {
             let kernel_fn = device
                 .get_func(module_name, "rotary_embedding_kernel")
                 .ok_or_else(|| {
-                    LLMError::GpuError(
-                        "rotary_embedding_kernel not found after PTX load".into(),
-                    )
+                    LLMError::GpuError("rotary_embedding_kernel not found after PTX load".into())
                 })?;
 
             Ok(Self {
@@ -158,15 +157,15 @@ mod inner {
                         stream,
                         cfg,
                         (
-                            query,                         // float* query
-                            key,                           // float* key
-                            &self.cos_cache,               // const float* cos_cache
-                            &self.sin_cache,               // const float* sin_cache
-                            positions,                     // const int* positions
-                            num_tokens as i32,             // int num_tokens
-                            num_heads as i32,              // int num_heads
-                            num_kv_heads as i32,           // int num_kv_heads
-                            self.head_dim as i32,          // int head_dim
+                            query,                // float* query
+                            key,                  // float* key
+                            &self.cos_cache,      // const float* cos_cache
+                            &self.sin_cache,      // const float* sin_cache
+                            positions,            // const int* positions
+                            num_tokens as i32,    // int num_tokens
+                            num_heads as i32,     // int num_heads
+                            num_kv_heads as i32,  // int num_kv_heads
+                            self.head_dim as i32, // int head_dim
                         ),
                     )
                     .map_err(|e| LLMError::GpuError(format!("RoPE kernel launch: {e}")))?;

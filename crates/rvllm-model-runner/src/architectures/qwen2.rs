@@ -6,9 +6,7 @@
 use half::f16;
 use tracing::trace;
 
-use crate::bridge::{
-    AttentionBackend, CacheEngine, GpuBuffer, ModelWeights, Result,
-};
+use crate::bridge::{AttentionBackend, CacheEngine, GpuBuffer, ModelWeights, Result};
 use crate::input::ModelInput;
 use crate::layers::linear::LinearLayer;
 use crate::layers::mlp::MLP;
@@ -58,18 +56,60 @@ impl Qwen2ForCausalLM {
             let kv_dim = config.num_kv_heads * config.head_dim;
 
             layers.push(Qwen2Layer {
-                input_layernorm: get_or_zeros(&weights, &format!("{p}.input_layernorm.weight"), &[config.hidden_size]),
-                post_attention_layernorm: get_or_zeros(&weights, &format!("{p}.post_attention_layernorm.weight"), &[config.hidden_size]),
-                q_proj: get_or_zeros(&weights, &format!("{p}.self_attn.q_proj.weight"), &[q_dim, config.hidden_size]),
-                q_bias: weights.get_as_buffer(&format!("{p}.self_attn.q_proj.bias")).ok(),
-                k_proj: get_or_zeros(&weights, &format!("{p}.self_attn.k_proj.weight"), &[kv_dim, config.hidden_size]),
-                k_bias: weights.get_as_buffer(&format!("{p}.self_attn.k_proj.bias")).ok(),
-                v_proj: get_or_zeros(&weights, &format!("{p}.self_attn.v_proj.weight"), &[kv_dim, config.hidden_size]),
-                v_bias: weights.get_as_buffer(&format!("{p}.self_attn.v_proj.bias")).ok(),
-                o_proj: get_or_zeros(&weights, &format!("{p}.self_attn.o_proj.weight"), &[config.hidden_size, q_dim]),
-                gate_proj: get_or_zeros(&weights, &format!("{p}.mlp.gate_proj.weight"), &[config.intermediate_size, config.hidden_size]),
-                up_proj: get_or_zeros(&weights, &format!("{p}.mlp.up_proj.weight"), &[config.intermediate_size, config.hidden_size]),
-                down_proj: get_or_zeros(&weights, &format!("{p}.mlp.down_proj.weight"), &[config.hidden_size, config.intermediate_size]),
+                input_layernorm: get_or_zeros(
+                    &weights,
+                    &format!("{p}.input_layernorm.weight"),
+                    &[config.hidden_size],
+                ),
+                post_attention_layernorm: get_or_zeros(
+                    &weights,
+                    &format!("{p}.post_attention_layernorm.weight"),
+                    &[config.hidden_size],
+                ),
+                q_proj: get_or_zeros(
+                    &weights,
+                    &format!("{p}.self_attn.q_proj.weight"),
+                    &[q_dim, config.hidden_size],
+                ),
+                q_bias: weights
+                    .get_as_buffer(&format!("{p}.self_attn.q_proj.bias"))
+                    .ok(),
+                k_proj: get_or_zeros(
+                    &weights,
+                    &format!("{p}.self_attn.k_proj.weight"),
+                    &[kv_dim, config.hidden_size],
+                ),
+                k_bias: weights
+                    .get_as_buffer(&format!("{p}.self_attn.k_proj.bias"))
+                    .ok(),
+                v_proj: get_or_zeros(
+                    &weights,
+                    &format!("{p}.self_attn.v_proj.weight"),
+                    &[kv_dim, config.hidden_size],
+                ),
+                v_bias: weights
+                    .get_as_buffer(&format!("{p}.self_attn.v_proj.bias"))
+                    .ok(),
+                o_proj: get_or_zeros(
+                    &weights,
+                    &format!("{p}.self_attn.o_proj.weight"),
+                    &[config.hidden_size, q_dim],
+                ),
+                gate_proj: get_or_zeros(
+                    &weights,
+                    &format!("{p}.mlp.gate_proj.weight"),
+                    &[config.intermediate_size, config.hidden_size],
+                ),
+                up_proj: get_or_zeros(
+                    &weights,
+                    &format!("{p}.mlp.up_proj.weight"),
+                    &[config.intermediate_size, config.hidden_size],
+                ),
+                down_proj: get_or_zeros(
+                    &weights,
+                    &format!("{p}.mlp.down_proj.weight"),
+                    &[config.hidden_size, config.intermediate_size],
+                ),
             });
         }
 
@@ -124,16 +164,17 @@ impl Architecture for Qwen2ForCausalLM {
 
             let normed2 =
                 RMSNorm::forward(&hidden, &layer.post_attention_layernorm, self.rms_norm_eps)?;
-            let mlp_out = MLP::forward(
-                &normed2,
-                &layer.gate_proj,
-                &layer.up_proj,
-                &layer.down_proj,
-            )?;
+            let mlp_out =
+                MLP::forward(&normed2, &layer.gate_proj, &layer.up_proj, &layer.down_proj)?;
             add_inplace(&mut hidden, &mlp_out);
         }
 
         let normed_final = RMSNorm::forward(&hidden, &self.norm_weight, self.rms_norm_eps)?;
-        lm_head(&normed_final, &self.lm_head_weight, num_tokens, self.vocab_size)
+        lm_head(
+            &normed_final,
+            &self.lm_head_weight,
+            num_tokens,
+            self.vocab_size,
+        )
     }
 }

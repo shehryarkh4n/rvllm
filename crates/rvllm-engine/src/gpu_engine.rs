@@ -14,14 +14,14 @@ mod inner {
 
     use tracing::{debug, info, warn};
 
+    use rvllm_block_manager::prefix_cache::{self, PrefixCache};
     use rvllm_config::EngineConfig;
     use rvllm_core::prelude::{
-        BlockId, FinishReason, LLMError, LogProb, RequestId, RequestOutput, Result,
-        SamplingParams, SequenceId, TokenId,
+        BlockId, FinishReason, LLMError, LogProb, RequestId, RequestOutput, Result, SamplingParams,
+        SequenceId, TokenId,
     };
     use rvllm_sequence::{Sequence, SequenceData, SequenceGroup, SequenceGroupMetadata};
     use rvllm_tokenizer::Tokenizer;
-    use rvllm_block_manager::prefix_cache::{self, PrefixCache};
     use rvllm_worker::gpu_worker::GpuWorker;
 
     use crate::output::{OutputProcessor, SequenceOutputState};
@@ -78,15 +78,14 @@ mod inner {
 
         // Try downloading via hf-hub
         info!(model = model_name, "downloading model from HuggingFace");
-        let api = hf_hub::api::sync::Api::new().map_err(|e| {
-            LLMError::ModelError(format!("failed to init hf-hub: {e}"))
-        })?;
+        let api = hf_hub::api::sync::Api::new()
+            .map_err(|e| LLMError::ModelError(format!("failed to init hf-hub: {e}")))?;
         let repo = api.model(model_name.to_string());
 
         // Download config.json and model files
-        let _config_path = repo.get("config.json").map_err(|e| {
-            LLMError::ModelError(format!("failed to download config.json: {e}"))
-        })?;
+        let _config_path = repo
+            .get("config.json")
+            .map_err(|e| LLMError::ModelError(format!("failed to download config.json: {e}")))?;
         let _model_path = repo.get("model.safetensors").map_err(|e| {
             LLMError::ModelError(format!("failed to download model.safetensors: {e}"))
         })?;
@@ -104,7 +103,8 @@ mod inner {
         }
 
         Err(LLMError::ModelError(format!(
-            "could not resolve model directory for '{}'", model_name
+            "could not resolve model directory for '{}'",
+            model_name
         )))
     }
 
@@ -124,22 +124,28 @@ mod inner {
         let content = std::fs::read_to_string(&config_path).map_err(|e| {
             LLMError::ModelError(format!("failed to read {}: {e}", config_path.display()))
         })?;
-        let json: serde_json::Value = serde_json::from_str(&content).map_err(|e| {
-            LLMError::ModelError(format!("invalid config.json: {e}"))
-        })?;
+        let json: serde_json::Value = serde_json::from_str(&content)
+            .map_err(|e| LLMError::ModelError(format!("invalid config.json: {e}")))?;
 
         let get_usize = |key: &str, default: usize| -> usize {
-            json.get(key).and_then(|v| v.as_u64()).map(|v| v as usize).unwrap_or(default)
+            json.get(key)
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize)
+                .unwrap_or(default)
         };
         let get_f32 = |key: &str, default: f32| -> f32 {
-            json.get(key).and_then(|v| v.as_f64()).map(|v| v as f32).unwrap_or(default)
+            json.get(key)
+                .and_then(|v| v.as_f64())
+                .map(|v| v as f32)
+                .unwrap_or(default)
         };
 
         let hidden_size = get_usize("hidden_size", 4096);
         let num_attention_heads = get_usize("num_attention_heads", 32);
         let head_dim = hidden_size / num_attention_heads;
 
-        let architecture = json.get("architectures")
+        let architecture = json
+            .get("architectures")
             .and_then(|v| v.as_array())
             .and_then(|a| a.first())
             .and_then(|v| v.as_str())
@@ -154,8 +160,10 @@ mod inner {
             num_hidden_layers: get_usize("num_hidden_layers", 32),
             vocab_size: get_usize("vocab_size", 32000),
             rms_norm_eps: get_f32("rms_norm_eps", 1e-5),
-            tie_word_embeddings: json.get("tie_word_embeddings")
-                .and_then(|v| v.as_bool()).unwrap_or(false),
+            tie_word_embeddings: json
+                .get("tie_word_embeddings")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
             architecture,
             rope_theta: get_f32("rope_theta", 10000.0),
             partial_rotary_factor: get_f32("partial_rotary_factor", 1.0),
@@ -194,7 +202,12 @@ mod inner {
 
     impl FifoScheduler {
         fn new(max_num_seqs: usize, max_num_batched_tokens: usize) -> Self {
-            Self { waiting: Vec::new(), running: Vec::new(), max_num_seqs, max_num_batched_tokens }
+            Self {
+                waiting: Vec::new(),
+                running: Vec::new(),
+                max_num_seqs,
+                max_num_batched_tokens,
+            }
         }
 
         fn add_seq_group(&mut self, group: SequenceGroup) {
@@ -211,7 +224,9 @@ mod inner {
         }
 
         fn live_seq_ids(&self) -> std::collections::HashSet<SequenceId> {
-            self.waiting.iter().chain(self.running.iter())
+            self.waiting
+                .iter()
+                .chain(self.running.iter())
                 .flat_map(|g| g.get_seqs().iter().map(|s| s.seq_id))
                 .collect()
         }
@@ -241,22 +256,42 @@ mod inner {
 
             // Running groups are always re-scheduled (they need their next token).
             for group in &self.running {
-                let tokens_this: usize = group.get_seqs().iter()
+                let tokens_this: usize = group
+                    .get_seqs()
+                    .iter()
                     .filter(|s| !s.is_finished())
-                    .map(|s| if s.get_output_len() == 0 { s.get_len() } else { 1 })
+                    .map(|s| {
+                        if s.get_output_len() == 0 {
+                            s.get_len()
+                        } else {
+                            1
+                        }
+                    })
                     .sum();
                 total_tokens += tokens_this;
             }
 
             // Promote waiting groups into running up to budget limits.
             while !self.waiting.is_empty() {
-                if self.running.len() >= self.max_num_seqs { break; }
+                if self.running.len() >= self.max_num_seqs {
+                    break;
+                }
                 let group = &self.waiting[0];
-                let tokens_this: usize = group.get_seqs().iter()
+                let tokens_this: usize = group
+                    .get_seqs()
+                    .iter()
                     .filter(|s| !s.is_finished())
-                    .map(|s| if s.get_output_len() == 0 { s.get_len() } else { 1 })
+                    .map(|s| {
+                        if s.get_output_len() == 0 {
+                            s.get_len()
+                        } else {
+                            1
+                        }
+                    })
                     .sum();
-                if total_tokens + tokens_this > self.max_num_batched_tokens { break; }
+                if total_tokens + tokens_this > self.max_num_batched_tokens {
+                    break;
+                }
                 total_tokens += tokens_this;
                 self.running.push(self.waiting.remove(0));
             }
@@ -313,8 +348,7 @@ mod inner {
             let head_dim = hf_config.hidden_size / hf_config.num_attention_heads;
 
             // 3. Tokenizer
-            let tokenizer_path = config.model.tokenizer_path.as_deref()
-                .unwrap_or(model_name);
+            let tokenizer_path = config.model.tokenizer_path.as_deref().unwrap_or(model_name);
             let tokenizer = Tokenizer::from_pretrained(tokenizer_path)?;
 
             // 4. Build WorkerConfig from real model config
@@ -357,9 +391,8 @@ mod inner {
             info!("model weights loaded successfully");
 
             // 8. Profile GPU memory and init KV cache + GPU model runner
-            let (num_gpu_blocks, num_cpu_blocks) = worker.profile_num_available_blocks(
-                config.cache.gpu_memory_utilization,
-            )?;
+            let (num_gpu_blocks, num_cpu_blocks) =
+                worker.profile_num_available_blocks(config.cache.gpu_memory_utilization)?;
             worker.init_cache(num_gpu_blocks, num_cpu_blocks)?;
 
             // 8. Scheduler
@@ -405,7 +438,9 @@ mod inner {
             debug!(%request_id, num_tokens = prompt_token_ids.len(), "prompt tokenized");
 
             if prompt_token_ids.is_empty() {
-                return Err(LLMError::TokenizerError("prompt produced zero tokens".into()));
+                return Err(LLMError::TokenizerError(
+                    "prompt produced zero tokens".into(),
+                ));
             }
 
             self.insert_request(request_id, prompt, prompt_token_ids, params)
@@ -440,14 +475,24 @@ mod inner {
             }
 
             let seq_group = SequenceGroup::new(
-                request_id, seqs, params.clone(), Instant::now(), prompt.clone(),
+                request_id,
+                seqs,
+                params.clone(),
+                Instant::now(),
+                prompt.clone(),
             );
             self.scheduler.add_seq_group(seq_group);
 
-            self.requests.insert(request_id, EngineRequest {
-                request_id, prompt, prompt_token_ids,
-                sampling_params: params, seq_states,
-            });
+            self.requests.insert(
+                request_id,
+                EngineRequest {
+                    request_id,
+                    prompt,
+                    prompt_token_ids,
+                    sampling_params: params,
+                    seq_states,
+                },
+            );
 
             Ok(())
         }
@@ -468,7 +513,10 @@ mod inner {
             debug!("GpuLLMEngine: step begin");
 
             let (scheduled_groups, num_tokens) = self.scheduler.schedule();
-            debug!(num_groups = scheduled_groups.len(), num_tokens, "scheduler output");
+            debug!(
+                num_groups = scheduled_groups.len(),
+                num_tokens, "scheduler output"
+            );
 
             if scheduled_groups.is_empty() {
                 return Ok(Vec::new());
@@ -497,10 +545,18 @@ mod inner {
                 }
             }
 
-            info!(num_groups = metadata.len(), "gpu_engine: calling worker.execute");
-            let worker_outputs = self.worker.execute(&metadata)
+            info!(
+                num_groups = metadata.len(),
+                "gpu_engine: calling worker.execute"
+            );
+            let worker_outputs = self
+                .worker
+                .execute(&metadata)
                 .map_err(|e| LLMError::GpuError(format!("worker execute failed: {e}")))?;
-            info!(num_outputs = worker_outputs.outputs.len(), "gpu_engine: worker.execute returned");
+            info!(
+                num_outputs = worker_outputs.outputs.len(),
+                "gpu_engine: worker.execute returned"
+            );
 
             // Prefix caching: after prefill, register new prefix blocks
             if let Some(ref mut pc) = self.prefix_cache {
@@ -529,9 +585,13 @@ mod inner {
                 }
             }
 
-            let mut output_map: HashMap<u64, (TokenId, LogProb, Vec<(TokenId, LogProb)>)> = HashMap::new();
+            let mut output_map: HashMap<u64, (TokenId, LogProb, Vec<(TokenId, LogProb)>)> =
+                HashMap::new();
             for wo in &worker_outputs.outputs {
-                output_map.insert(wo.seq_id, (wo.token_id, wo.logprob, wo.top_logprobs.clone()));
+                output_map.insert(
+                    wo.seq_id,
+                    (wo.token_id, wo.logprob, wo.top_logprobs.clone()),
+                );
             }
 
             let mut results = Vec::new();
@@ -544,18 +604,20 @@ mod inner {
                     None => continue,
                 };
 
-                let logprobs_requested = req.sampling_params.logprobs
-                    .map(|n| n > 0)
-                    .unwrap_or(false);
+                let logprobs_requested =
+                    req.sampling_params.logprobs.map(|n| n > 0).unwrap_or(false);
 
                 for (seq_idx, seq) in group.get_seqs().iter().enumerate() {
-                    if seq.is_finished() { continue; }
+                    if seq.is_finished() {
+                        continue;
+                    }
 
                     if let Some((token_id, logprob, top_lps)) = output_map.get(&seq.seq_id.0) {
                         let decoded = self.tokenizer.decode(&[*token_id]).unwrap_or_default();
 
                         // Update the scheduler's sequence with the new token
-                        self.scheduler.update_seq_token(seq.seq_id, *token_id, *logprob);
+                        self.scheduler
+                            .update_seq_token(seq.seq_id, *token_id, *logprob);
 
                         let top_logprobs = if logprobs_requested && !top_lps.is_empty() {
                             Some(top_lps.clone())
@@ -565,21 +627,31 @@ mod inner {
 
                         if let Some(state) = req.seq_states.get_mut(seq_idx) {
                             OutputProcessor::process_token(
-                                state, *token_id, *logprob, top_logprobs, &decoded,
-                                &req.sampling_params, eos,
+                                state,
+                                *token_id,
+                                *logprob,
+                                top_logprobs,
+                                &decoded,
+                                &req.sampling_params,
+                                eos,
                             );
                         }
                     }
                 }
 
                 let output = OutputProcessor::build_request_output(
-                    request_id, &req.prompt, &req.prompt_token_ids, &req.seq_states,
+                    request_id,
+                    &req.prompt,
+                    &req.prompt_token_ids,
+                    &req.seq_states,
                 );
                 results.push(output);
             }
 
             // Clean up finished requests
-            let finished_ids: Vec<RequestId> = self.requests.iter()
+            let finished_ids: Vec<RequestId> = self
+                .requests
+                .iter()
                 .filter(|(_, req)| req.seq_states.iter().all(|s| s.is_finished()))
                 .map(|(&id, _)| id)
                 .collect();
@@ -589,9 +661,11 @@ mod inner {
             }
             // Clean up block tables for finished sequences -- recycle block IDs
             if !finished_ids.is_empty() {
-                let live_seq_ids: std::collections::HashSet<SequenceId> = self.scheduler
-                    .live_seq_ids();
-                let dead_sids: Vec<SequenceId> = self.seq_block_tables.keys()
+                let live_seq_ids: std::collections::HashSet<SequenceId> =
+                    self.scheduler.live_seq_ids();
+                let dead_sids: Vec<SequenceId> = self
+                    .seq_block_tables
+                    .keys()
                     .filter(|sid| !live_seq_ids.contains(sid))
                     .copied()
                     .collect();
@@ -619,7 +693,10 @@ mod inner {
                     }
                 }
             }
-            info!(num_completed = all_outputs.len(), "GpuLLMEngine: run loop finished");
+            info!(
+                num_completed = all_outputs.len(),
+                "GpuLLMEngine: run loop finished"
+            );
             Ok(all_outputs)
         }
 
@@ -644,7 +721,9 @@ mod inner {
                 let mut block_tables = HashMap::new();
 
                 for seq in group.get_seqs() {
-                    if seq.is_finished() { continue; }
+                    if seq.is_finished() {
+                        continue;
+                    }
                     let total_tokens = seq.prompt_token_ids.len() + seq.output_token_ids.len();
                     // +1 headroom: pre-allocate for the token about to be generated this step
                     let needed_blocks = (total_tokens + 1 + block_size - 1) / block_size;
@@ -661,11 +740,14 @@ mod inner {
                     }
                     block_tables.insert(seq.seq_id, existing.clone());
 
-                    seq_data.insert(seq.seq_id, SequenceData {
-                        prompt_token_ids: seq.prompt_token_ids.clone(),
-                        output_token_ids: seq.output_token_ids.clone(),
-                        cumulative_logprob: seq.cumulative_logprob,
-                    });
+                    seq_data.insert(
+                        seq.seq_id,
+                        SequenceData {
+                            prompt_token_ids: seq.prompt_token_ids.clone(),
+                            output_token_ids: seq.output_token_ids.clone(),
+                            cumulative_logprob: seq.cumulative_logprob,
+                        },
+                    );
                 }
 
                 metadata.push(SequenceGroupMetadata {

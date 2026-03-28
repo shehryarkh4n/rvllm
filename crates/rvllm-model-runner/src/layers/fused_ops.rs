@@ -57,11 +57,7 @@ mod inner {
 
         let kernel = device
             .get_func("fused_residual_rmsnorm", "fused_residual_rmsnorm_kernel")
-            .ok_or_else(|| {
-                LLMError::GpuError(
-                    "fused_residual_rmsnorm_kernel not loaded".into(),
-                )
-            })?;
+            .ok_or_else(|| LLMError::GpuError("fused_residual_rmsnorm_kernel not loaded".into()))?;
 
         // SAFETY: All slices are valid device memory. Grid covers all tokens,
         // block covers hidden_size with stride loop. Shared memory is sized
@@ -80,9 +76,7 @@ mod inner {
                         hidden_size as i32,
                     ),
                 )
-                .map_err(|e| {
-                    LLMError::GpuError(format!("fused_residual_rmsnorm launch: {e}"))
-                })?;
+                .map_err(|e| LLMError::GpuError(format!("fused_residual_rmsnorm launch: {e}")))?;
         }
 
         trace!(num_tokens, hidden_size, "fused_residual_rmsnorm launched");
@@ -122,9 +116,7 @@ mod inner {
 
         let kernel = device
             .get_func("embedding_gather", "embedding_gather_kernel")
-            .ok_or_else(|| {
-                LLMError::GpuError("embedding_gather_kernel not loaded".into())
-            })?;
+            .ok_or_else(|| LLMError::GpuError("embedding_gather_kernel not loaded".into()))?;
 
         // SAFETY: embed_table has vocab_size * hidden_size elements.
         // output has num_tokens * hidden_size elements. token_ids_gpu has
@@ -141,9 +133,7 @@ mod inner {
                         vocab_size as i32,
                     ),
                 )
-                .map_err(|e| {
-                    LLMError::GpuError(format!("embedding_gather launch: {e}"))
-                })?;
+                .map_err(|e| LLMError::GpuError(format!("embedding_gather launch: {e}")))?;
         }
 
         trace!(num_tokens, hidden_size, "embedding_gather launched");

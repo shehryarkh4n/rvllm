@@ -13,13 +13,37 @@ use crate::Result;
 /// Known kernel -> function-name mappings for the vllm-rs kernel set.
 /// These are the `extern "C" __global__` entry points in each .cu file.
 static KERNEL_FUNCTIONS: &[(&str, &[&str])] = &[
-    ("activation", &["silu_kernel", "fused_silu_mul_kernel", "gelu_kernel"]),
-    ("activation_f16", &["silu_f16_kernel", "fused_silu_mul_f16_kernel", "gelu_f16_kernel"]),
+    (
+        "activation",
+        &["silu_kernel", "fused_silu_mul_kernel", "gelu_kernel"],
+    ),
+    (
+        "activation_f16",
+        &[
+            "silu_f16_kernel",
+            "fused_silu_mul_f16_kernel",
+            "gelu_f16_kernel",
+        ],
+    ),
     ("add_bias", &["add_bias_kernel", "add_kernel"]),
     ("copy_blocks", &["copy_blocks_kernel"]),
     ("embedding_gather", &["embedding_gather_kernel"]),
-    ("flash_attention", &["flash_attention_2_kernel", "flash_attention_2_decode_kernel"]),
-    ("fp8_kv", &["quantize_kv_kernel", "dequantize_kv_kernel", "quantize_paged_kv_kernel", "dequantize_paged_kv_kernel"]),
+    (
+        "flash_attention",
+        &[
+            "flash_attention_2_kernel",
+            "flash_attention_2_decode_kernel",
+        ],
+    ),
+    (
+        "fp8_kv",
+        &[
+            "quantize_kv_kernel",
+            "dequantize_kv_kernel",
+            "quantize_paged_kv_kernel",
+            "dequantize_paged_kv_kernel",
+        ],
+    ),
     ("fused_residual_rmsnorm", &["fused_residual_rmsnorm_kernel"]),
     ("paged_attention", &["paged_attention_v2_kernel"]),
     ("reshape_and_cache", &["reshape_and_cache_kernel"]),
@@ -107,11 +131,9 @@ impl KernelLoader {
 
         let ptx = Ptx::from_src(ptx_src);
 
-        self.device
-            .load_ptx(ptx, name, func_names)
-            .map_err(|e| {
-                crate::LLMError::GpuError(format!("failed to load PTX module '{name}': {e}"))
-            })?;
+        self.device.load_ptx(ptx, name, func_names).map_err(|e| {
+            crate::LLMError::GpuError(format!("failed to load PTX module '{name}': {e}"))
+        })?;
 
         debug!(module = name, functions = ?func_names, "loaded PTX module");
         self.loaded_modules
@@ -124,14 +146,9 @@ impl KernelLoader {
         let func_names = self.resolve_function_names(name);
         let ptx = Ptx::from_file(path);
 
-        self.device
-            .load_ptx(ptx, name, &func_names)
-            .map_err(|e| {
-                crate::LLMError::GpuError(format!(
-                    "failed to load PTX file '{}': {e}",
-                    path.display()
-                ))
-            })?;
+        self.device.load_ptx(ptx, name, &func_names).map_err(|e| {
+            crate::LLMError::GpuError(format!("failed to load PTX file '{}': {e}", path.display()))
+        })?;
 
         debug!(module = name, path = %path.display(), "loaded PTX file");
         self.loaded_modules
@@ -221,9 +238,8 @@ impl KernelLoader {
 
         let mut count = 0u32;
         for entry in entries {
-            let entry = entry.map_err(|e| {
-                crate::LLMError::GpuError(format!("readdir error: {e}"))
-            })?;
+            let entry =
+                entry.map_err(|e| crate::LLMError::GpuError(format!("readdir error: {e}")))?;
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) == Some("ptx") {
                 let stem = path
@@ -250,7 +266,11 @@ impl KernelLoader {
         // Convention fallback: leak a string so we get &'static str.
         // This is intentional -- kernel names live for the process lifetime.
         let fallback: &'static str = Box::leak(format!("{name}_kernel").into_boxed_str());
-        trace!(module = name, fallback, "using convention-based function name");
+        trace!(
+            module = name,
+            fallback,
+            "using convention-based function name"
+        );
         vec![fallback]
     }
 }
@@ -279,7 +299,10 @@ mod tests {
         let loader = KernelLoader::empty(device);
 
         let names = loader.resolve_function_names("activation");
-        assert_eq!(names, &["silu_kernel", "fused_silu_mul_kernel", "gelu_kernel"]);
+        assert_eq!(
+            names,
+            &["silu_kernel", "fused_silu_mul_kernel", "gelu_kernel"]
+        );
 
         let names = loader.resolve_function_names("rms_norm");
         assert_eq!(names, &["rms_norm_kernel"]);

@@ -29,7 +29,9 @@ pub struct ScopedTimer {
 impl ScopedTimer {
     /// Start a new scoped timer.
     pub fn start() -> Self {
-        Self { start: Instant::now() }
+        Self {
+            start: Instant::now(),
+        }
     }
 
     /// Consume the timer and return elapsed seconds.
@@ -82,8 +84,7 @@ mod tests {
     #[test]
     fn record_worker_step_with_recorder() {
         // Install a throwaway prometheus recorder for this test.
-        let _ = metrics_exporter_prometheus::PrometheusBuilder::new()
-            .install_recorder();
+        let _ = metrics_exporter_prometheus::PrometheusBuilder::new().install_recorder();
 
         let recorder = MetricsRecorder::new();
         let timings = WorkerStepTimings {

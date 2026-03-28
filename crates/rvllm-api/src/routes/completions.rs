@@ -56,13 +56,8 @@ pub async fn create_completion(
                     rvllm_core::prelude::FinishReason::Length => "length".to_string(),
                     rvllm_core::prelude::FinishReason::Abort => "stop".to_string(),
                 });
-                let chunk = CompletionStreamChunk::new(
-                    &stream_id,
-                    &model,
-                    co.index,
-                    &co.text,
-                    finish,
-                );
+                let chunk =
+                    CompletionStreamChunk::new(&stream_id, &model, co.index, &co.text, finish);
                 events.push_str(&format_sse_data(&chunk));
             }
             if output.finished {
@@ -96,9 +91,8 @@ pub async fn create_completion(
             last_output = Some(output);
         }
 
-        let output = last_output.ok_or_else(|| {
-            ApiError::Internal("engine produced no output".into())
-        })?;
+        let output =
+            last_output.ok_or_else(|| ApiError::Internal("engine produced no output".into()))?;
 
         let resp = CompletionResponse::from_request_output(&output, &state.model_name);
         Ok(Json(resp).into_response())

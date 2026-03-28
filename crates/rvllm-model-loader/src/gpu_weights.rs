@@ -9,8 +9,8 @@ mod inner {
     use std::sync::Arc;
 
     use cudarc::driver::{CudaDevice, CudaSlice, DeviceSlice as _};
-    use tracing::debug;
     use rvllm_core::error::{LLMError, Result};
+    use tracing::debug;
 
     /// Container holding all model weights as typed CUDA device buffers.
     ///
@@ -120,12 +120,7 @@ mod inner {
         }
 
         /// Consume the container and return the underlying maps.
-        pub fn into_parts(
-            self,
-        ) -> (
-            HashMap<String, CudaSlice<f32>>,
-            HashMap<String, Vec<usize>>,
-        ) {
+        pub fn into_parts(self) -> (HashMap<String, CudaSlice<f32>>, HashMap<String, Vec<usize>>) {
             (self.weights, self.shapes)
         }
     }

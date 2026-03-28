@@ -3,8 +3,8 @@
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 use rayon::prelude::*;
-use tracing::trace;
 use rvllm_core::prelude::{LLMError, Result, SamplingParams};
+use tracing::trace;
 
 use crate::sampler::{Sampler, SamplerOutput};
 
@@ -144,10 +144,7 @@ mod tests {
         };
         let params: Vec<&SamplingParams> = vec![&p1, &p2];
         let past: Vec<&[u32]> = vec![&[], &[]];
-        let mut rngs = vec![
-            StdRng::seed_from_u64(1),
-            StdRng::seed_from_u64(2),
-        ];
+        let mut rngs = vec![StdRng::seed_from_u64(1), StdRng::seed_from_u64(2)];
 
         let outputs = sample_batch(&logits_batch, &params, &past, &mut rngs).unwrap();
         assert_eq!(outputs.len(), 2);
@@ -232,13 +229,16 @@ mod tests {
         let past: Vec<&[u32]> = vec![&[]; batch_size];
 
         // Sequential run.
-        let mut rngs_seq: Vec<StdRng> =
-            (0..batch_size).map(|i| StdRng::seed_from_u64(i as u64 + 100)).collect();
-        let seq_out = sample_batch_sequential(&logits_batch, &params, &past, &mut rngs_seq).unwrap();
+        let mut rngs_seq: Vec<StdRng> = (0..batch_size)
+            .map(|i| StdRng::seed_from_u64(i as u64 + 100))
+            .collect();
+        let seq_out =
+            sample_batch_sequential(&logits_batch, &params, &past, &mut rngs_seq).unwrap();
 
         // Parallel run (same seeds).
-        let mut rngs_par: Vec<StdRng> =
-            (0..batch_size).map(|i| StdRng::seed_from_u64(i as u64 + 100)).collect();
+        let mut rngs_par: Vec<StdRng> = (0..batch_size)
+            .map(|i| StdRng::seed_from_u64(i as u64 + 100))
+            .collect();
         let par_out = sample_batch_parallel(&logits_batch, &params, &past, &mut rngs_par).unwrap();
 
         for i in 0..batch_size {

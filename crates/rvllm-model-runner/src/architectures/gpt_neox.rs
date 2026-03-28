@@ -10,9 +10,7 @@
 use half::f16;
 use tracing::trace;
 
-use crate::bridge::{
-    AttentionBackend, CacheEngine, GpuBuffer, ModelWeights, Result,
-};
+use crate::bridge::{AttentionBackend, CacheEngine, GpuBuffer, ModelWeights, Result};
 use crate::input::ModelInput;
 use crate::layers::activation::gelu;
 use crate::layers::linear::LinearLayer;
@@ -104,22 +102,70 @@ impl GPTNeoXForCausalLM {
         for i in 0..config.num_layers {
             let p = format!("gpt_neox.layers.{}", i);
             layers.push(NeoXLayer {
-                ln_attn_weight: get_or_zeros(&weights, &format!("{p}.input_layernorm.weight"), &[h]),
+                ln_attn_weight: get_or_zeros(
+                    &weights,
+                    &format!("{p}.input_layernorm.weight"),
+                    &[h],
+                ),
                 ln_attn_bias: get_or_zeros(&weights, &format!("{p}.input_layernorm.bias"), &[h]),
-                ln_mlp_weight: get_or_zeros(&weights, &format!("{p}.post_attention_layernorm.weight"), &[h]),
-                ln_mlp_bias: get_or_zeros(&weights, &format!("{p}.post_attention_layernorm.bias"), &[h]),
-                q_proj: get_or_zeros(&weights, &format!("{p}.attention.query_key_value.q_proj.weight"), &[q_dim, h]),
-                k_proj: get_or_zeros(&weights, &format!("{p}.attention.query_key_value.k_proj.weight"), &[kv_dim, h]),
-                v_proj: get_or_zeros(&weights, &format!("{p}.attention.query_key_value.v_proj.weight"), &[kv_dim, h]),
-                q_bias: weights.get_as_buffer(&format!("{p}.attention.query_key_value.q_proj.bias")).ok(),
-                k_bias: weights.get_as_buffer(&format!("{p}.attention.query_key_value.k_proj.bias")).ok(),
-                v_bias: weights.get_as_buffer(&format!("{p}.attention.query_key_value.v_proj.bias")).ok(),
-                o_proj: get_or_zeros(&weights, &format!("{p}.attention.dense.weight"), &[h, q_dim]),
-                o_bias: weights.get_as_buffer(&format!("{p}.attention.dense.bias")).ok(),
-                dense_h_to_4h_weight: get_or_zeros(&weights, &format!("{p}.mlp.dense_h_to_4h.weight"), &[inter, h]),
-                dense_h_to_4h_bias: weights.get_as_buffer(&format!("{p}.mlp.dense_h_to_4h.bias")).ok(),
-                dense_4h_to_h_weight: get_or_zeros(&weights, &format!("{p}.mlp.dense_4h_to_h.weight"), &[h, inter]),
-                dense_4h_to_h_bias: weights.get_as_buffer(&format!("{p}.mlp.dense_4h_to_h.bias")).ok(),
+                ln_mlp_weight: get_or_zeros(
+                    &weights,
+                    &format!("{p}.post_attention_layernorm.weight"),
+                    &[h],
+                ),
+                ln_mlp_bias: get_or_zeros(
+                    &weights,
+                    &format!("{p}.post_attention_layernorm.bias"),
+                    &[h],
+                ),
+                q_proj: get_or_zeros(
+                    &weights,
+                    &format!("{p}.attention.query_key_value.q_proj.weight"),
+                    &[q_dim, h],
+                ),
+                k_proj: get_or_zeros(
+                    &weights,
+                    &format!("{p}.attention.query_key_value.k_proj.weight"),
+                    &[kv_dim, h],
+                ),
+                v_proj: get_or_zeros(
+                    &weights,
+                    &format!("{p}.attention.query_key_value.v_proj.weight"),
+                    &[kv_dim, h],
+                ),
+                q_bias: weights
+                    .get_as_buffer(&format!("{p}.attention.query_key_value.q_proj.bias"))
+                    .ok(),
+                k_bias: weights
+                    .get_as_buffer(&format!("{p}.attention.query_key_value.k_proj.bias"))
+                    .ok(),
+                v_bias: weights
+                    .get_as_buffer(&format!("{p}.attention.query_key_value.v_proj.bias"))
+                    .ok(),
+                o_proj: get_or_zeros(
+                    &weights,
+                    &format!("{p}.attention.dense.weight"),
+                    &[h, q_dim],
+                ),
+                o_bias: weights
+                    .get_as_buffer(&format!("{p}.attention.dense.bias"))
+                    .ok(),
+                dense_h_to_4h_weight: get_or_zeros(
+                    &weights,
+                    &format!("{p}.mlp.dense_h_to_4h.weight"),
+                    &[inter, h],
+                ),
+                dense_h_to_4h_bias: weights
+                    .get_as_buffer(&format!("{p}.mlp.dense_h_to_4h.bias"))
+                    .ok(),
+                dense_4h_to_h_weight: get_or_zeros(
+                    &weights,
+                    &format!("{p}.mlp.dense_4h_to_h.weight"),
+                    &[h, inter],
+                ),
+                dense_4h_to_h_bias: weights
+                    .get_as_buffer(&format!("{p}.mlp.dense_4h_to_h.bias"))
+                    .ok(),
             });
         }
 
@@ -158,12 +204,8 @@ impl Architecture for GPTNeoXForCausalLM {
             trace!(layer = layer_idx, "gpt_neox layer forward");
 
             // Pre-attention LayerNorm.
-            let normed_attn = LayerNorm::forward(
-                &hidden,
-                &layer.ln_attn_weight,
-                &layer.ln_attn_bias,
-                eps,
-            )?;
+            let normed_attn =
+                LayerNorm::forward(&hidden, &layer.ln_attn_weight, &layer.ln_attn_bias, eps)?;
 
             // QKV with optional bias.
             let q = LinearLayer::forward(&normed_attn, &layer.q_proj, layer.q_bias.as_ref())?;
@@ -172,21 +214,12 @@ impl Architecture for GPTNeoXForCausalLM {
 
             // RoPE on full head_dim (non-interleaved -- same RotaryEmbedding,
             // GPT-NeoX applies rotation to the entire head dimension).
-            let (q_rot, k_rot) = RotaryEmbedding::forward(
-                &input.position_ids,
-                &q,
-                &k,
-                self.config.head_dim,
-            )?;
+            let (q_rot, k_rot) =
+                RotaryEmbedding::forward(&input.position_ids, &q, &k, self.config.head_dim)?;
 
             // Attention.
-            let attn_out = attention.forward(
-                &q_rot,
-                &k_rot,
-                &v,
-                &input.attention_metadata,
-                layer_idx,
-            )?;
+            let attn_out =
+                attention.forward(&q_rot, &k_rot, &v, &input.attention_metadata, layer_idx)?;
 
             // Output projection with optional bias.
             let attn_proj = LinearLayer::forward(&attn_out, &layer.o_proj, layer.o_bias.as_ref())?;
@@ -195,12 +228,8 @@ impl Architecture for GPTNeoXForCausalLM {
                 // Parallel attention + MLP: both branches computed from the
                 // *same* pre-norm hidden state and added to the residual
                 // simultaneously.
-                let normed_mlp = LayerNorm::forward(
-                    &hidden,
-                    &layer.ln_mlp_weight,
-                    &layer.ln_mlp_bias,
-                    eps,
-                )?;
+                let normed_mlp =
+                    LayerNorm::forward(&hidden, &layer.ln_mlp_weight, &layer.ln_mlp_bias, eps)?;
 
                 let mlp_out = neox_mlp(
                     &normed_mlp,
@@ -217,12 +246,8 @@ impl Architecture for GPTNeoXForCausalLM {
                 // Sequential residual (some NeoX variants).
                 add_inplace(&mut hidden, &attn_proj);
 
-                let normed_mlp = LayerNorm::forward(
-                    &hidden,
-                    &layer.ln_mlp_weight,
-                    &layer.ln_mlp_bias,
-                    eps,
-                )?;
+                let normed_mlp =
+                    LayerNorm::forward(&hidden, &layer.ln_mlp_weight, &layer.ln_mlp_bias, eps)?;
 
                 let mlp_out = neox_mlp(
                     &normed_mlp,
@@ -237,14 +262,15 @@ impl Architecture for GPTNeoXForCausalLM {
         }
 
         // Final LayerNorm.
-        let normed_final = LayerNorm::forward(
-            &hidden,
-            &self.final_ln_weight,
-            &self.final_ln_bias,
-            eps,
-        )?;
+        let normed_final =
+            LayerNorm::forward(&hidden, &self.final_ln_weight, &self.final_ln_bias, eps)?;
 
-        lm_head(&normed_final, &self.lm_head_weight, num_tokens, self.config.vocab_size)
+        lm_head(
+            &normed_final,
+            &self.lm_head_weight,
+            num_tokens,
+            self.config.vocab_size,
+        )
     }
 }
 
@@ -294,22 +320,68 @@ impl StableLmForCausalLM {
         for i in 0..config.num_layers {
             let p = format!("model.layers.{}", i);
             layers.push(NeoXLayer {
-                ln_attn_weight: get_or_zeros(&weights, &format!("{p}.input_layernorm.weight"), &[h]),
+                ln_attn_weight: get_or_zeros(
+                    &weights,
+                    &format!("{p}.input_layernorm.weight"),
+                    &[h],
+                ),
                 ln_attn_bias: get_or_zeros(&weights, &format!("{p}.input_layernorm.bias"), &[h]),
-                ln_mlp_weight: get_or_zeros(&weights, &format!("{p}.post_attention_layernorm.weight"), &[h]),
-                ln_mlp_bias: get_or_zeros(&weights, &format!("{p}.post_attention_layernorm.bias"), &[h]),
-                q_proj: get_or_zeros(&weights, &format!("{p}.self_attn.q_proj.weight"), &[q_dim, h]),
-                k_proj: get_or_zeros(&weights, &format!("{p}.self_attn.k_proj.weight"), &[kv_dim, h]),
-                v_proj: get_or_zeros(&weights, &format!("{p}.self_attn.v_proj.weight"), &[kv_dim, h]),
-                q_bias: weights.get_as_buffer(&format!("{p}.self_attn.q_proj.bias")).ok(),
-                k_bias: weights.get_as_buffer(&format!("{p}.self_attn.k_proj.bias")).ok(),
-                v_bias: weights.get_as_buffer(&format!("{p}.self_attn.v_proj.bias")).ok(),
-                o_proj: get_or_zeros(&weights, &format!("{p}.self_attn.o_proj.weight"), &[h, q_dim]),
-                o_bias: weights.get_as_buffer(&format!("{p}.self_attn.o_proj.bias")).ok(),
-                dense_h_to_4h_weight: get_or_zeros(&weights, &format!("{p}.mlp.up_proj.weight"), &[inter, h]),
+                ln_mlp_weight: get_or_zeros(
+                    &weights,
+                    &format!("{p}.post_attention_layernorm.weight"),
+                    &[h],
+                ),
+                ln_mlp_bias: get_or_zeros(
+                    &weights,
+                    &format!("{p}.post_attention_layernorm.bias"),
+                    &[h],
+                ),
+                q_proj: get_or_zeros(
+                    &weights,
+                    &format!("{p}.self_attn.q_proj.weight"),
+                    &[q_dim, h],
+                ),
+                k_proj: get_or_zeros(
+                    &weights,
+                    &format!("{p}.self_attn.k_proj.weight"),
+                    &[kv_dim, h],
+                ),
+                v_proj: get_or_zeros(
+                    &weights,
+                    &format!("{p}.self_attn.v_proj.weight"),
+                    &[kv_dim, h],
+                ),
+                q_bias: weights
+                    .get_as_buffer(&format!("{p}.self_attn.q_proj.bias"))
+                    .ok(),
+                k_bias: weights
+                    .get_as_buffer(&format!("{p}.self_attn.k_proj.bias"))
+                    .ok(),
+                v_bias: weights
+                    .get_as_buffer(&format!("{p}.self_attn.v_proj.bias"))
+                    .ok(),
+                o_proj: get_or_zeros(
+                    &weights,
+                    &format!("{p}.self_attn.o_proj.weight"),
+                    &[h, q_dim],
+                ),
+                o_bias: weights
+                    .get_as_buffer(&format!("{p}.self_attn.o_proj.bias"))
+                    .ok(),
+                dense_h_to_4h_weight: get_or_zeros(
+                    &weights,
+                    &format!("{p}.mlp.up_proj.weight"),
+                    &[inter, h],
+                ),
                 dense_h_to_4h_bias: weights.get_as_buffer(&format!("{p}.mlp.up_proj.bias")).ok(),
-                dense_4h_to_h_weight: get_or_zeros(&weights, &format!("{p}.mlp.down_proj.weight"), &[h, inter]),
-                dense_4h_to_h_bias: weights.get_as_buffer(&format!("{p}.mlp.down_proj.bias")).ok(),
+                dense_4h_to_h_weight: get_or_zeros(
+                    &weights,
+                    &format!("{p}.mlp.down_proj.weight"),
+                    &[h, inter],
+                ),
+                dense_4h_to_h_bias: weights
+                    .get_as_buffer(&format!("{p}.mlp.down_proj.bias"))
+                    .ok(),
             });
         }
 
@@ -347,41 +419,24 @@ impl Architecture for StableLmForCausalLM {
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             trace!(layer = layer_idx, "stablelm layer forward");
 
-            let normed_attn = LayerNorm::forward(
-                &hidden,
-                &layer.ln_attn_weight,
-                &layer.ln_attn_bias,
-                eps,
-            )?;
+            let normed_attn =
+                LayerNorm::forward(&hidden, &layer.ln_attn_weight, &layer.ln_attn_bias, eps)?;
 
             let q = LinearLayer::forward(&normed_attn, &layer.q_proj, layer.q_bias.as_ref())?;
             let k = LinearLayer::forward(&normed_attn, &layer.k_proj, layer.k_bias.as_ref())?;
             let v = LinearLayer::forward(&normed_attn, &layer.v_proj, layer.v_bias.as_ref())?;
 
-            let (q_rot, k_rot) = RotaryEmbedding::forward(
-                &input.position_ids,
-                &q,
-                &k,
-                self.config.head_dim,
-            )?;
+            let (q_rot, k_rot) =
+                RotaryEmbedding::forward(&input.position_ids, &q, &k, self.config.head_dim)?;
 
-            let attn_out = attention.forward(
-                &q_rot,
-                &k_rot,
-                &v,
-                &input.attention_metadata,
-                layer_idx,
-            )?;
+            let attn_out =
+                attention.forward(&q_rot, &k_rot, &v, &input.attention_metadata, layer_idx)?;
 
             let attn_proj = LinearLayer::forward(&attn_out, &layer.o_proj, layer.o_bias.as_ref())?;
 
             if self.config.use_parallel_residual {
-                let normed_mlp = LayerNorm::forward(
-                    &hidden,
-                    &layer.ln_mlp_weight,
-                    &layer.ln_mlp_bias,
-                    eps,
-                )?;
+                let normed_mlp =
+                    LayerNorm::forward(&hidden, &layer.ln_mlp_weight, &layer.ln_mlp_bias, eps)?;
 
                 let mlp_out = neox_mlp(
                     &normed_mlp,
@@ -396,12 +451,8 @@ impl Architecture for StableLmForCausalLM {
             } else {
                 add_inplace(&mut hidden, &attn_proj);
 
-                let normed_mlp = LayerNorm::forward(
-                    &hidden,
-                    &layer.ln_mlp_weight,
-                    &layer.ln_mlp_bias,
-                    eps,
-                )?;
+                let normed_mlp =
+                    LayerNorm::forward(&hidden, &layer.ln_mlp_weight, &layer.ln_mlp_bias, eps)?;
 
                 let mlp_out = neox_mlp(
                     &normed_mlp,
@@ -415,14 +466,15 @@ impl Architecture for StableLmForCausalLM {
             }
         }
 
-        let normed_final = LayerNorm::forward(
-            &hidden,
-            &self.final_ln_weight,
-            &self.final_ln_bias,
-            eps,
-        )?;
+        let normed_final =
+            LayerNorm::forward(&hidden, &self.final_ln_weight, &self.final_ln_bias, eps)?;
 
-        lm_head(&normed_final, &self.lm_head_weight, num_tokens, self.config.vocab_size)
+        lm_head(
+            &normed_final,
+            &self.lm_head_weight,
+            num_tokens,
+            self.config.vocab_size,
+        )
     }
 }
 
@@ -450,7 +502,7 @@ fn neox_mlp(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bridge::{AttentionMetadata, MockAttentionBackend, CacheEngine, ModelWeights};
+    use crate::bridge::{AttentionMetadata, CacheEngine, MockAttentionBackend, ModelWeights};
     use crate::input::ModelInput;
     use crate::runner::ModelRunnerConfig;
 
@@ -559,18 +611,9 @@ mod tests {
     fn neox_mlp_smoke() {
         let h = 4;
         let inter = 8;
-        let input = GpuBuffer::from_vec(
-            vec![f16::from_f32(1.0); h],
-            vec![1, h],
-        );
-        let up_w = GpuBuffer::from_vec(
-            vec![f16::from_f32(0.1); inter * h],
-            vec![inter, h],
-        );
-        let down_w = GpuBuffer::from_vec(
-            vec![f16::from_f32(0.1); h * inter],
-            vec![h, inter],
-        );
+        let input = GpuBuffer::from_vec(vec![f16::from_f32(1.0); h], vec![1, h]);
+        let up_w = GpuBuffer::from_vec(vec![f16::from_f32(0.1); inter * h], vec![inter, h]);
+        let down_w = GpuBuffer::from_vec(vec![f16::from_f32(0.1); h * inter], vec![h, inter]);
         let out = neox_mlp(&input, &up_w, None, &down_w, None).unwrap();
         assert_eq!(out.shape, vec![1, h]);
         // With non-zero weights, GELU should produce non-zero output.

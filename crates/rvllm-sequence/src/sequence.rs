@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use rvllm_core::prelude::{SequenceId, TokenId};
+use serde::{Deserialize, Serialize};
 
 use crate::status::SequenceStatus;
 

@@ -6,8 +6,8 @@
 //! we compute log-softmax per position and extract the requested top-N entries
 //! for populating `CompletionOutput.logprobs`.
 
-use tracing::trace;
 use rvllm_core::prelude::{LogProb, TokenId};
+use tracing::trace;
 
 use crate::math;
 
@@ -157,13 +157,8 @@ pub fn compute_prompt_logprobs(
 
 /// Convert a list of `PositionLogprobs` into the format stored in
 /// `CompletionOutput.logprobs`: `Vec<Vec<(TokenId, LogProb)>>`.
-pub fn logprobs_to_output_format(
-    positions: &[PositionLogprobs],
-) -> Vec<Vec<(TokenId, LogProb)>> {
-    positions
-        .iter()
-        .map(|p| p.top_logprobs.clone())
-        .collect()
+pub fn logprobs_to_output_format(positions: &[PositionLogprobs]) -> Vec<Vec<(TokenId, LogProb)>> {
+    positions.iter().map(|p| p.top_logprobs.clone()).collect()
 }
 
 #[cfg(test)]

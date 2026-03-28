@@ -9,9 +9,7 @@
 use half::f16;
 use tracing::trace;
 
-use crate::bridge::{
-    AttentionBackend, CacheEngine, GpuBuffer, ModelWeights, Result,
-};
+use crate::bridge::{AttentionBackend, CacheEngine, GpuBuffer, ModelWeights, Result};
 use crate::input::ModelInput;
 use crate::layers::linear::LinearLayer;
 use crate::layers::mlp::MLP;
@@ -160,13 +158,11 @@ impl CohereForCausalLM {
             .unwrap_or_else(|_| GpuBuffer::zeros(&[config.hidden_size]));
 
         // Command-R uses tied embeddings: lm_head shares embed_tokens weight.
-        let lm_head_weight = weights
-            .get_as_buffer("lm_head.weight")
-            .unwrap_or_else(|_| {
-                weights
-                    .get_as_buffer("model.embed_tokens.weight")
-                    .unwrap_or_else(|_| GpuBuffer::zeros(&[config.vocab_size, config.hidden_size]))
-            });
+        let lm_head_weight = weights.get_as_buffer("lm_head.weight").unwrap_or_else(|_| {
+            weights
+                .get_as_buffer("model.embed_tokens.weight")
+                .unwrap_or_else(|_| GpuBuffer::zeros(&[config.vocab_size, config.hidden_size]))
+        });
 
         Ok(Self {
             hidden_size: config.hidden_size,
@@ -232,12 +228,8 @@ impl Architecture for CohereForCausalLM {
             )?;
 
             // RoPE on normalized Q/K.
-            let (q_rot, k_rot) = RotaryEmbedding::forward(
-                &input.position_ids,
-                &q_normed,
-                &k_normed,
-                self.head_dim,
-            )?;
+            let (q_rot, k_rot) =
+                RotaryEmbedding::forward(&input.position_ids, &q_normed, &k_normed, self.head_dim)?;
 
             // Expand shared keys for MQA: replicate the single KV head(s) to match num_heads.
             let k_expanded = expand_kv_heads(
@@ -273,12 +265,8 @@ impl Architecture for CohereForCausalLM {
             // Cohere uses a single pre-norm for both attention and MLP (parallel style),
             // but the residual from MLP also adds to hidden. We reuse the same normed
             // input for MLP (parallel residual pattern as in Command-R).
-            let mlp_out = MLP::forward(
-                &normed,
-                &layer.gate_proj,
-                &layer.up_proj,
-                &layer.down_proj,
-            )?;
+            let mlp_out =
+                MLP::forward(&normed, &layer.gate_proj, &layer.up_proj, &layer.down_proj)?;
             add_inplace(&mut hidden, &mlp_out);
         }
 
@@ -291,7 +279,12 @@ impl Architecture for CohereForCausalLM {
         )?;
 
         // LM head projection to vocab logits.
-        lm_head(&normed_final, &self.lm_head_weight, num_tokens, self.vocab_size)
+        lm_head(
+            &normed_final,
+            &self.lm_head_weight,
+            num_tokens,
+            self.vocab_size,
+        )
     }
 }
 
@@ -390,17 +383,12 @@ fn expand_kv_heads(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bridge::{
-        AttentionMetadata, CacheEngine, MockAttentionBackend, ModelWeights,
-    };
+    use crate::bridge::{AttentionMetadata, CacheEngine, MockAttentionBackend, ModelWeights};
     use crate::input::ModelInput;
     use crate::runner::ModelRunnerConfig;
 
     fn make_buf(vals: &[f32], shape: Vec<usize>) -> GpuBuffer<f16> {
-        GpuBuffer::from_vec(
-            vals.iter().map(|&v| f16::from_f32(v)).collect(),
-            shape,
-        )
+        GpuBuffer::from_vec(vals.iter().map(|&v| f16::from_f32(v)).collect(), shape)
     }
 
     fn tiny_config() -> ModelRunnerConfig {
@@ -498,6 +486,9 @@ mod tests {
         let config = tiny_config();
         let weights = ModelWeights::default();
         let model = super::super::create_model("CohereForCausalLM", weights, &config);
-        assert!(model.is_ok(), "CohereForCausalLM should be registered in factory");
+        assert!(
+            model.is_ok(),
+            "CohereForCausalLM should be registered in factory"
+        );
     }
 }

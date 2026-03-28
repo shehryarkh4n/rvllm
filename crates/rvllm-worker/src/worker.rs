@@ -2,14 +2,12 @@
 
 use std::sync::Arc;
 
-use tracing::{debug, info};
 use rvllm_core::prelude::{BlockId, LLMError, Result, TokenId};
 use rvllm_gpu::prelude::GpuStream;
 use rvllm_kv_cache::CacheEngine;
-use rvllm_model_runner::bridge::{
-    GpuAllocator, ModelWeights, MockAttentionBackend,
-};
+use rvllm_model_runner::bridge::{GpuAllocator, MockAttentionBackend, ModelWeights};
 use rvllm_model_runner::ModelRunner;
+use tracing::{debug, info};
 
 use crate::config::WorkerConfig;
 use crate::input::{self, SequenceGroupMetadata};
@@ -54,9 +52,8 @@ impl Worker {
         let device_id = config.device_id;
         info!(device_id, rank = config.rank, "creating worker");
 
-        let cache_stream = GpuStream::new(device_id).map_err(|e| {
-            LLMError::GpuError(format!("failed to create GPU stream: {e}"))
-        })?;
+        let cache_stream = GpuStream::new(device_id)
+            .map_err(|e| LLMError::GpuError(format!("failed to create GPU stream: {e}")))?;
 
         Ok(Self {
             model_runner: None,
@@ -74,21 +71,14 @@ impl Worker {
 
         let mr_config = self.config.model_runner_config();
         let cache_elements = self.config.num_kv_heads * self.config.head_dim * 16;
-        let cache = Arc::new(
-            rvllm_model_runner::bridge::CacheEngine::new(
-                self.config.num_layers,
-                cache_elements,
-            ),
-        );
+        let cache = Arc::new(rvllm_model_runner::bridge::CacheEngine::new(
+            self.config.num_layers,
+            cache_elements,
+        ));
         let attention = Box::new(MockAttentionBackend);
 
-        let runner = ModelRunner::new(
-            model_weights,
-            mr_config,
-            attention,
-            cache,
-            self.gpu.clone(),
-        )?;
+        let runner =
+            ModelRunner::new(model_weights, mr_config, attention, cache, self.gpu.clone())?;
 
         self.model_runner = Some(runner);
         info!(device_id = self.device_id, "model initialized");
@@ -96,16 +86,10 @@ impl Worker {
     }
 
     /// Allocate GPU and CPU KV cache blocks.
-    pub fn init_cache(
-        &mut self,
-        num_gpu_blocks: usize,
-        num_cpu_blocks: usize,
-    ) -> Result<()> {
+    pub fn init_cache(&mut self, num_gpu_blocks: usize, num_cpu_blocks: usize) -> Result<()> {
         info!(
             device_id = self.device_id,
-            num_gpu_blocks,
-            num_cpu_blocks,
-            "initializing KV cache"
+            num_gpu_blocks, num_cpu_blocks, "initializing KV cache"
         );
 
         // TODO: use the real GPU allocator once CacheEngine::new accepts dyn GpuAllocator
@@ -157,9 +141,10 @@ impl Worker {
         let model_input = input::prepare_input(&input.seq_group_metadata_list)?;
 
         // 3. Run forward pass
-        let runner = self.model_runner.as_ref().ok_or_else(|| {
-            LLMError::ModelError("model not initialized".into())
-        })?;
+        let runner = self
+            .model_runner
+            .as_ref()
+            .ok_or_else(|| LLMError::ModelError("model not initialized".into()))?;
         let logits = runner.execute_model(model_input)?;
 
         // 4. Sample tokens from logits
@@ -169,7 +154,11 @@ impl Worker {
             runner.config.vocab_size,
         );
 
-        debug!(device_id = self.device_id, num_outputs = outputs.len(), "execute_model done");
+        debug!(
+            device_id = self.device_id,
+            num_outputs = outputs.len(),
+            "execute_model done"
+        );
         Ok(WorkerOutput { outputs })
     }
 
@@ -200,10 +189,7 @@ impl Worker {
 
         info!(
             free_bytes,
-            available,
-            num_gpu_blocks,
-            num_cpu_blocks,
-            "profiled available blocks"
+            available, num_gpu_blocks, num_cpu_blocks, "profiled available blocks"
         );
 
         Ok((num_gpu_blocks, num_cpu_blocks))
@@ -332,8 +318,16 @@ mod tests {
     fn worker_output_construction() {
         let output = WorkerOutput {
             outputs: vec![
-                SamplerOutput { seq_id: 1, token_id: 42, logprob: -0.5 },
-                SamplerOutput { seq_id: 2, token_id: 99, logprob: -1.2 },
+                SamplerOutput {
+                    seq_id: 1,
+                    token_id: 42,
+                    logprob: -0.5,
+                },
+                SamplerOutput {
+                    seq_id: 2,
+                    token_id: 99,
+                    logprob: -1.2,
+                },
             ],
         };
         assert_eq!(output.outputs.len(), 2);
@@ -354,9 +348,9 @@ mod tests {
 
     #[test]
     fn sample_from_logits_basic() {
-        use std::collections::HashMap;
         use rvllm_core::prelude::{RequestId, SequenceId};
         use rvllm_sequence::SequenceData;
+        use std::collections::HashMap;
 
         let vocab_size = 4;
         // 2 sequences, decode mode (1 token each)
@@ -401,9 +395,9 @@ mod tests {
 
     #[test]
     fn sample_from_logits_short_logits_fallback() {
-        use std::collections::HashMap;
         use rvllm_core::prelude::{RequestId, SequenceId};
         use rvllm_sequence::SequenceData;
+        use std::collections::HashMap;
 
         let sd = SequenceData {
             prompt_token_ids: vec![1],

@@ -34,14 +34,14 @@ use crate::output::{OutputProcessor, SequenceOutputState};
 
 /// The real async executor trait from rvllm-executor.
 pub use rvllm_executor::Executor as RealExecutorTrait;
-/// The real executor input type.
-pub use rvllm_executor::ExecutorInput as RealExecutorInput;
-/// The real batch-level sampler output.
-pub use rvllm_executor::SamplerOutput as RealSamplerOutput;
 /// The real executor configuration.
 pub use rvllm_executor::ExecutorConfig;
 /// Factory for creating executors based on config.
 pub use rvllm_executor::ExecutorFactory;
+/// The real executor input type.
+pub use rvllm_executor::ExecutorInput as RealExecutorInput;
+/// The real batch-level sampler output.
+pub use rvllm_executor::SamplerOutput as RealSamplerOutput;
 
 // ---------------------------------------------------------------------------
 // Engine-level types
@@ -407,10 +407,7 @@ impl LLMEngine {
                 && req.sampling_params.best_of > 1
                 && !req.sampling_params.use_beam_search
             {
-                output = crate::best_of_n::build_best_of_n_output(
-                    output,
-                    &req.seq_states,
-                );
+                output = crate::best_of_n::build_best_of_n_output(output, &req.seq_states);
             }
 
             results.push(output);
@@ -447,7 +444,10 @@ impl LLMEngine {
             }
         }
 
-        info!(num_completed = all_outputs.len(), "engine run loop finished");
+        info!(
+            num_completed = all_outputs.len(),
+            "engine run loop finished"
+        );
         Ok(all_outputs)
     }
 
@@ -467,10 +467,7 @@ impl LLMEngine {
         let mut metadata = Vec::with_capacity(sched_out.scheduled_seq_groups.len());
 
         for group in &sched_out.scheduled_seq_groups {
-            let is_prompt = group
-                .get_seqs()
-                .iter()
-                .any(|s| s.get_output_len() == 0);
+            let is_prompt = group.get_seqs().iter().any(|s| s.get_output_len() == 0);
 
             let mut seq_data = HashMap::new();
             let block_tables = HashMap::new();
@@ -618,15 +615,14 @@ mod tests {
         let mut hf = HfTokenizer::new(bpe);
         hf.with_pre_tokenizer(Some(Whitespace {}));
 
-        Tokenizer::from_file(std::path::Path::new("/dev/null"))
-            .unwrap_or_else(|_| {
-                // Construct via the public API path -- we use a workaround
-                // since from_hf_tokenizer is private. Write to temp file.
-                let dir = tempfile::tempdir().unwrap();
-                let path = dir.path().join("tokenizer.json");
-                hf.save(&path, false).unwrap();
-                Tokenizer::from_file(&path).unwrap()
-            })
+        Tokenizer::from_file(std::path::Path::new("/dev/null")).unwrap_or_else(|_| {
+            // Construct via the public API path -- we use a workaround
+            // since from_hf_tokenizer is private. Write to temp file.
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("tokenizer.json");
+            hf.save(&path, false).unwrap();
+            Tokenizer::from_file(&path).unwrap()
+        })
     }
 
     fn make_engine(max_executor_calls: usize) -> LLMEngine {
@@ -640,11 +636,8 @@ mod tests {
     #[test]
     fn add_request_tokenizes_prompt() {
         let mut engine = make_engine(5);
-        let result = engine.add_request(
-            RequestId(1),
-            "hello".to_string(),
-            SamplingParams::default(),
-        );
+        let result =
+            engine.add_request(RequestId(1), "hello".to_string(), SamplingParams::default());
         assert!(result.is_ok());
         assert!(engine.has_unfinished());
         assert!(engine.requests.contains_key(&RequestId(1)));
@@ -659,7 +652,10 @@ mod tests {
         engine.abort_request(&RequestId(1));
         // States should be marked as aborted
         let req = engine.requests.get(&RequestId(1)).unwrap();
-        assert!(req.seq_states.iter().all(|s| s.finish_reason == Some(FinishReason::Abort)));
+        assert!(req
+            .seq_states
+            .iter()
+            .all(|s| s.finish_reason == Some(FinishReason::Abort)));
     }
 
     #[test]

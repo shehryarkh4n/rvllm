@@ -101,8 +101,7 @@ mod tests {
     fn stop_on_stop_string() {
         let mut params = default_params();
         params.stop_strings = vec!["<|end|>".to_string()];
-        let result =
-            StopChecker::check_stop("hello world<|end|>more", &[1, 2], &params, None);
+        let result = StopChecker::check_stop("hello world<|end|>more", &[1, 2], &params, None);
         assert_eq!(result, Some(FinishReason::Stop));
     }
 
@@ -134,8 +133,7 @@ mod tests {
     #[test]
     fn truncate_picks_earliest_stop() {
         let stops = vec!["<a>".to_string(), "<b>".to_string()];
-        let (text, truncated) =
-            StopChecker::truncate_at_stop("prefix<b>middle<a>suffix", &stops);
+        let (text, truncated) = StopChecker::truncate_at_stop("prefix<b>middle<a>suffix", &stops);
         assert!(truncated);
         assert_eq!(text, "prefix");
     }

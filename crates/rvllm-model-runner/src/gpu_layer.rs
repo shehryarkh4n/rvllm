@@ -153,9 +153,33 @@ mod inner {
             let q_dim = num_heads * head_dim;
             let kv_dim = num_kv_heads * head_dim;
 
-            let mut q = Self::linear(&self.device, blas, &normed, weights.q_proj, num_tokens, q_dim, hidden)?;
-            let mut k = Self::linear(&self.device, blas, &normed, weights.k_proj, num_tokens, kv_dim, hidden)?;
-            let mut v = Self::linear(&self.device, blas, &normed, weights.v_proj, num_tokens, kv_dim, hidden)?;
+            let mut q = Self::linear(
+                &self.device,
+                blas,
+                &normed,
+                weights.q_proj,
+                num_tokens,
+                q_dim,
+                hidden,
+            )?;
+            let mut k = Self::linear(
+                &self.device,
+                blas,
+                &normed,
+                weights.k_proj,
+                num_tokens,
+                kv_dim,
+                hidden,
+            )?;
+            let mut v = Self::linear(
+                &self.device,
+                blas,
+                &normed,
+                weights.v_proj,
+                num_tokens,
+                kv_dim,
+                hidden,
+            )?;
 
             // Apply QKV biases if present (e.g. Qwen2.5)
             if let Some(bias) = weights.q_proj_bias {
@@ -184,7 +208,6 @@ mod inner {
                 head_dim,
             )?;
 
-
             // ---------------------------------------------------------------
             // 4. KV cache write + Attention (prefill vs decode)
             // ---------------------------------------------------------------
@@ -192,23 +215,35 @@ mod inner {
             info!(layer = cfg.layer_idx, "gpu_layer: cache_write start");
             Self::cache_write(
                 &self.device,
-                &k_rot, &v,
-                input.key_cache, input.value_cache,
+                &k_rot,
+                &v,
+                input.key_cache,
+                input.value_cache,
                 input.slot_mapping,
-                num_tokens, num_kv_heads, head_dim,
+                num_tokens,
+                num_kv_heads,
+                head_dim,
             )?;
 
             info!(layer = cfg.layer_idx, "gpu_layer: cache_write done");
 
-
             let attn_out = if input.is_prefill {
                 // Prefill: use naive cuBLAS attention (Q@K^T -> softmax -> @V)
                 // FA2 prefill kernel has a multi-token bug; bypass it.
-                info!(layer = cfg.layer_idx, "gpu_layer: naive_prefill_attention start");
+                info!(
+                    layer = cfg.layer_idx,
+                    "gpu_layer: naive_prefill_attention start"
+                );
                 Self::naive_prefill_attention(
-                    &self.device, blas,
-                    &q_rot, &k_rot, &v,
-                    num_tokens, num_heads, num_kv_heads, head_dim,
+                    &self.device,
+                    blas,
+                    &q_rot,
+                    &k_rot,
+                    &v,
+                    num_tokens,
+                    num_heads,
+                    num_kv_heads,
+                    head_dim,
                 )?
             } else {
                 // Decode: read from paged cache
@@ -216,21 +251,31 @@ mod inner {
                 Self::decode_attention(
                     &self.device,
                     &q_rot,
-                    input.key_cache, input.value_cache,
-                    input.block_tables, input.context_lens,
-                    num_tokens, input.num_seqs,
-                    num_heads, num_kv_heads, head_dim,
-                    input.max_context_len, input.block_size,
+                    input.key_cache,
+                    input.value_cache,
+                    input.block_tables,
+                    input.context_lens,
+                    num_tokens,
+                    input.num_seqs,
+                    num_heads,
+                    num_kv_heads,
+                    head_dim,
+                    input.max_context_len,
+                    input.block_size,
                 )?
             };
-
 
             // ---------------------------------------------------------------
             // 5. Output projection
             // ---------------------------------------------------------------
             let attn_proj = Self::linear(
-                &self.device, blas, &attn_out, weights.o_proj,
-                num_tokens, hidden, q_dim,
+                &self.device,
+                blas,
+                &attn_out,
+                weights.o_proj,
+                num_tokens,
+                hidden,
+                q_dim,
             )?;
 
             // ---------------------------------------------------------------
@@ -259,30 +304,40 @@ mod inner {
             // 7. MLP: gate_proj + up_proj -> fused_silu_mul -> down_proj
             // ---------------------------------------------------------------
             let gate = Self::linear(
-                &self.device, blas, &normed2, weights.gate_proj,
-                num_tokens, intermediate, hidden,
+                &self.device,
+                blas,
+                &normed2,
+                weights.gate_proj,
+                num_tokens,
+                intermediate,
+                hidden,
             )?;
             let up = Self::linear(
-                &self.device, blas, &normed2, weights.up_proj,
-                num_tokens, intermediate, hidden,
+                &self.device,
+                blas,
+                &normed2,
+                weights.up_proj,
+                num_tokens,
+                intermediate,
+                hidden,
             )?;
 
             let fused = Self::fused_silu_mul(&self.device, &gate, &up, num_tokens * intermediate)?;
 
             let mlp_out = Self::linear(
-                &self.device, blas, &fused, weights.down_proj,
-                num_tokens, hidden, intermediate,
+                &self.device,
+                blas,
+                &fused,
+                weights.down_proj,
+                num_tokens,
+                hidden,
+                intermediate,
             )?;
 
             // ---------------------------------------------------------------
             // 8. Residual: residual + mlp_out
             // ---------------------------------------------------------------
-            let output = Self::add_tensors(
-                &self.device,
-                &residual,
-                &mlp_out,
-                num_tokens * hidden,
-            )?;
+            let output = Self::add_tensors(&self.device, &residual, &mlp_out, num_tokens * hidden)?;
 
             Ok(output)
         }
@@ -327,9 +382,9 @@ mod inner {
             // the same device. Grid/block dims are checked above. The kernel reads
             // `input` [num_tokens * hidden_size], `weight` [hidden_size], and writes
             // `output` [num_tokens * hidden_size].
-            let kernel = device
-                .get_func(module_name, func_name)
-                .ok_or_else(|| LLMError::GpuError(format!("kernel {module_name}::{func_name} not loaded")))?;
+            let kernel = device.get_func(module_name, func_name).ok_or_else(|| {
+                LLMError::GpuError(format!("kernel {module_name}::{func_name} not loaded"))
+            })?;
             unsafe {
                 kernel
                     .launch(cfg, (&mut output, input, weight, eps, hidden_size as i32))
@@ -359,7 +414,8 @@ mod inner {
                 shared_mem_bytes: 0,
             };
             unsafe {
-                kernel.launch(cfg, (tensor as &mut CudaSlice<f32>, bias, dim as i32))
+                kernel
+                    .launch(cfg, (tensor as &mut CudaSlice<f32>, bias, dim as i32))
                     .map_err(|e| LLMError::GpuError(format!("add_bias launch: {e}")))?;
             }
             Ok(())
@@ -415,9 +471,11 @@ mod inner {
                 .alloc_zeros::<f32>(k_len)
                 .map_err(|e| LLMError::GpuError(format!("rope k alloc: {e}")))?;
 
-            device.dtod_copy(q, &mut q_out)
+            device
+                .dtod_copy(q, &mut q_out)
                 .map_err(|e| LLMError::GpuError(format!("rope q copy: {e}")))?;
-            device.dtod_copy(k, &mut k_out)
+            device
+                .dtod_copy(k, &mut k_out)
                 .map_err(|e| LLMError::GpuError(format!("rope k copy: {e}")))?;
 
             let kernel = device
@@ -438,17 +496,20 @@ mod inner {
             // They're the same size; cast is safe.
             unsafe {
                 kernel
-                    .launch(cfg, (
-                        &mut q_out,
-                        &mut k_out,
-                        rope_cos,
-                        rope_sin,
-                        positions, // u32 == i32 in CUDA ABI
-                        num_tokens as i32,
-                        num_heads as i32,
-                        num_kv_heads as i32,
-                        head_dim as i32,
-                    ))
+                    .launch(
+                        cfg,
+                        (
+                            &mut q_out,
+                            &mut k_out,
+                            rope_cos,
+                            rope_sin,
+                            positions, // u32 == i32 in CUDA ABI
+                            num_tokens as i32,
+                            num_heads as i32,
+                            num_kv_heads as i32,
+                            head_dim as i32,
+                        ),
+                    )
                     .map_err(|e| LLMError::GpuError(format!("rope k launch failed: {e}")))?;
             }
 
@@ -487,16 +548,21 @@ mod inner {
             // Kernel signature: (key_cache, value_cache, key, value, slot_mapping, num_tokens, num_kv_heads, head_dim)
             // All int args are i32.
             unsafe {
-                kernel.launch(cfg, (
-                    key_cache,
-                    value_cache,
-                    k,
-                    v,
-                    slot_mapping,
-                    num_tokens as i32,
-                    num_kv_heads as i32,
-                    head_dim as i32,
-                )).map_err(|e| LLMError::GpuError(format!("reshape_and_cache launch: {e}")))?;
+                kernel
+                    .launch(
+                        cfg,
+                        (
+                            key_cache,
+                            value_cache,
+                            k,
+                            v,
+                            slot_mapping,
+                            num_tokens as i32,
+                            num_kv_heads as i32,
+                            head_dim as i32,
+                        ),
+                    )
+                    .map_err(|e| LLMError::GpuError(format!("reshape_and_cache launch: {e}")))?;
             }
             Ok(())
         }
@@ -508,9 +574,9 @@ mod inner {
         fn naive_prefill_attention(
             device: &Arc<CudaDevice>,
             blas: &CublasHandle,
-            q: &CudaSlice<f32>,      // [num_tokens, num_heads * head_dim]
-            k: &CudaSlice<f32>,      // [num_tokens, num_kv_heads * head_dim]
-            v: &CudaSlice<f32>,      // [num_tokens, num_kv_heads * head_dim]
+            q: &CudaSlice<f32>, // [num_tokens, num_heads * head_dim]
+            k: &CudaSlice<f32>, // [num_tokens, num_kv_heads * head_dim]
+            v: &CudaSlice<f32>, // [num_tokens, num_kv_heads * head_dim]
             num_tokens: usize,
             num_heads: usize,
             num_kv_heads: usize,
@@ -521,7 +587,8 @@ mod inner {
             let q_stride = num_heads * head_dim;
 
             // Output: [num_tokens, num_heads * head_dim]
-            let mut output = device.alloc_zeros::<f32>(num_tokens * q_stride)
+            let mut output = device
+                .alloc_zeros::<f32>(num_tokens * q_stride)
                 .map_err(|e| LLMError::GpuError(format!("naive attn output alloc: {e}")))?;
 
             // Per-head attention via cuBLAS
@@ -532,11 +599,14 @@ mod inner {
                 // Extract K_head [num_tokens, head_dim] from K [num_tokens, num_kv_heads * head_dim]
                 // Extract V_head [num_tokens, head_dim] from V [num_tokens, num_kv_heads * head_dim]
                 // Use CPU gather for correctness (not perf-critical for prefill)
-                let q_all: Vec<f32> = device.dtoh_sync_copy(q)
+                let q_all: Vec<f32> = device
+                    .dtoh_sync_copy(q)
                     .map_err(|e| LLMError::GpuError(format!("naive attn q DtoH: {e}")))?;
-                let k_all: Vec<f32> = device.dtoh_sync_copy(k)
+                let k_all: Vec<f32> = device
+                    .dtoh_sync_copy(k)
                     .map_err(|e| LLMError::GpuError(format!("naive attn k DtoH: {e}")))?;
-                let v_all: Vec<f32> = device.dtoh_sync_copy(v)
+                let v_all: Vec<f32> = device
+                    .dtoh_sync_copy(v)
                     .map_err(|e| LLMError::GpuError(format!("naive attn v DtoH: {e}")))?;
 
                 let kv_stride = num_kv_heads * head_dim;
@@ -596,14 +666,16 @@ mod inner {
                 }
 
                 // Scatter back into output
-                let mut out_all: Vec<f32> = device.dtoh_sync_copy(&output)
+                let mut out_all: Vec<f32> = device
+                    .dtoh_sync_copy(&output)
                     .map_err(|e| LLMError::GpuError(format!("naive attn out DtoH: {e}")))?;
                 for t in 0..num_tokens {
                     for d in 0..head_dim {
                         out_all[t * q_stride + h * head_dim + d] = out_head[t * head_dim + d];
                     }
                 }
-                output = device.htod_sync_copy(&out_all)
+                output = device
+                    .htod_sync_copy(&out_all)
                     .map_err(|e| LLMError::GpuError(format!("naive attn out HtoD: {e}")))?;
             }
 
@@ -636,7 +708,8 @@ mod inner {
 
             const FA2_BC: usize = 64;
             const FA2_THREADS: u32 = 128;
-            let shared_mem_bytes = ((2 * FA2_BC * head_dim + FA2_BC + (FA2_THREADS as usize / 32)) * std::mem::size_of::<f32>()) as u32;
+            let shared_mem_bytes = ((2 * FA2_BC * head_dim + FA2_BC + (FA2_THREADS as usize / 32))
+                * std::mem::size_of::<f32>()) as u32;
 
             let kernel = device
                 .get_func("flash_attention", "flash_attention_2_kernel")
@@ -644,14 +717,22 @@ mod inner {
 
             let bt_len = DeviceSlice::len(block_tables);
             info!(
-                num_tokens, num_seqs, num_heads, num_kv_heads, head_dim,
-                block_size, max_context_len, bt_len,
+                num_tokens,
+                num_seqs,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                block_size,
+                max_context_len,
+                bt_len,
                 shared_mem_bytes,
                 "prefill_attention: dimensions"
             );
 
             if num_seqs == 0 {
-                return Err(LLMError::GpuError("prefill_attention: num_seqs == 0".into()));
+                return Err(LLMError::GpuError(
+                    "prefill_attention: num_seqs == 0".into(),
+                ));
             }
 
             let cfg = LaunchConfig {
@@ -661,7 +742,8 @@ mod inner {
             };
 
             // Build seq_start_pos from context_lens (cumulative prefix sum on CPU, upload)
-            let ctx_host = device.dtoh_sync_copy(context_lens)
+            let ctx_host = device
+                .dtoh_sync_copy(context_lens)
                 .map_err(|e| LLMError::GpuError(format!("context_lens DtoH: {e}")))?;
             let mut seq_starts = Vec::with_capacity(num_seqs);
             let mut pos = 0i32;
@@ -669,7 +751,8 @@ mod inner {
                 seq_starts.push(pos);
                 pos += cl as i32;
             }
-            let seq_start_pos_gpu: CudaSlice<i32> = device.htod_sync_copy(&seq_starts)
+            let seq_start_pos_gpu: CudaSlice<i32> = device
+                .htod_sync_copy(&seq_starts)
                 .map_err(|e| LLMError::GpuError(format!("seq_start_pos HtoD: {e}")))?;
 
             let max_blocks_per_seq = if num_seqs > 0 {
@@ -723,7 +806,8 @@ mod inner {
                     &mut p_num_tokens as *mut _ as *mut _,
                     &mut p_causal as *mut _ as *mut _,
                 ];
-                kernel.launch(cfg, params)
+                kernel
+                    .launch(cfg, params)
                     .map_err(|e| LLMError::GpuError(format!("prefill FA2 launch: {e}")))?;
             }
 
@@ -758,7 +842,8 @@ mod inner {
             const FA2_BC: usize = 64;
             const FA2_THREADS: u32 = 128;
             // smem: s_key[FA2_BC*head_dim] + s_val[FA2_BC*head_dim] + s_score[FA2_BC] + s_reduce[FA2_THREADS/32]
-            let shared_mem_bytes = ((2 * FA2_BC * head_dim + FA2_BC + (FA2_THREADS as usize / 32)) * std::mem::size_of::<f32>()) as u32;
+            let shared_mem_bytes = ((2 * FA2_BC * head_dim + FA2_BC + (FA2_THREADS as usize / 32))
+                * std::mem::size_of::<f32>()) as u32;
 
             let module_name = "flash_attention";
             let func_name = "flash_attention_2_decode_kernel";
@@ -769,9 +854,9 @@ mod inner {
                 shared_mem_bytes,
             };
 
-            let kernel = device
-                .get_func(module_name, func_name)
-                .ok_or_else(|| LLMError::GpuError(format!("kernel {module_name}::{func_name} not loaded")))?;
+            let kernel = device.get_func(module_name, func_name).ok_or_else(|| {
+                LLMError::GpuError(format!("kernel {module_name}::{func_name} not loaded"))
+            })?;
 
             // Opt into extended shared memory if needed
             if shared_mem_bytes > 49152 {
@@ -808,7 +893,9 @@ mod inner {
                             (block_tables.len() / num_seqs.max(1)) as i32,
                         ),
                     )
-                    .map_err(|e| LLMError::GpuError(format!("flash_attention_2_decode launch failed: {e}")))?;
+                    .map_err(|e| {
+                        LLMError::GpuError(format!("flash_attention_2_decode launch failed: {e}"))
+                    })?;
             }
 
             Ok(output)
@@ -838,16 +925,18 @@ mod inner {
                 shared_mem_bytes: 0,
             };
 
-            let kernel = device
-                .get_func(module_name, func_name)
-                .ok_or_else(|| LLMError::GpuError(format!("kernel {module_name}::{func_name} not loaded")))?;
+            let kernel = device.get_func(module_name, func_name).ok_or_else(|| {
+                LLMError::GpuError(format!("kernel {module_name}::{func_name} not loaded"))
+            })?;
 
             // SAFETY: gate, up, and output all have exactly n elements.
             // Grid covers all elements with ceil division.
             unsafe {
                 kernel
                     .launch(cfg, (&mut output, gate, up, n as i32))
-                    .map_err(|e| LLMError::GpuError(format!("fused_silu_mul launch failed: {e}")))?;
+                    .map_err(|e| {
+                        LLMError::GpuError(format!("fused_silu_mul launch failed: {e}"))
+                    })?;
             }
 
             Ok(output)
@@ -876,25 +965,34 @@ mod inner {
             };
 
             // Try dedicated add_bias module first, then activation module
-            let kernel = device.get_func("add_bias", "add_kernel")
+            let kernel = device
+                .get_func("add_bias", "add_kernel")
                 .or_else(|| device.get_func("activation", "add_kernel"));
 
             match kernel {
                 Some(k) => {
                     // SAFETY: a, b, output all have exactly n elements.
                     unsafe {
-                        k.launch(cfg, (&mut output, a, b, n as i32))
-                            .map_err(|e| LLMError::GpuError(format!("add_kernel launch failed: {e}")))?;
+                        k.launch(cfg, (&mut output, a, b, n as i32)).map_err(|e| {
+                            LLMError::GpuError(format!("add_kernel launch failed: {e}"))
+                        })?;
                     }
                 }
                 None => {
                     // Fallback: CPU add (only until kernels are compiled).
-                    let a_host = device.dtoh_sync_copy(a)
+                    let a_host = device
+                        .dtoh_sync_copy(a)
                         .map_err(|e| LLMError::GpuError(format!("add dtoh a failed: {e}")))?;
-                    let b_host = device.dtoh_sync_copy(b)
+                    let b_host = device
+                        .dtoh_sync_copy(b)
                         .map_err(|e| LLMError::GpuError(format!("add dtoh b failed: {e}")))?;
-                    let sum: Vec<f32> = a_host.iter().zip(b_host.iter()).map(|(x, y)| x + y).collect();
-                    output = device.htod_sync_copy(&sum)
+                    let sum: Vec<f32> = a_host
+                        .iter()
+                        .zip(b_host.iter())
+                        .map(|(x, y)| x + y)
+                        .collect();
+                    output = device
+                        .htod_sync_copy(&sum)
                         .map_err(|e| LLMError::GpuError(format!("add htod failed: {e}")))?;
                 }
             }

@@ -4,8 +4,8 @@
 //! that the guided decoder walks to determine which characters (and therefore
 //! tokens) are valid at each position in the output.
 
-use serde_json::Value;
 use rvllm_core::prelude::LLMError;
+use serde_json::Value;
 
 /// Compiled representation of a JSON schema node.
 #[derive(Debug, Clone)]
@@ -119,21 +119,18 @@ fn compile_node(schema: &Value, depth: usize) -> Result<SchemaNode, LLMError> {
 
     // enum
     if let Some(vals) = obj.get("enum") {
-        let arr = vals.as_array().ok_or_else(|| {
-            LLMError::SamplingError("'enum' must be an array".into())
-        })?;
+        let arr = vals
+            .as_array()
+            .ok_or_else(|| LLMError::SamplingError("'enum' must be an array".into()))?;
         return Ok(SchemaNode::Enum(arr.clone()));
     }
 
     // anyOf / oneOf
     if let Some(any_of) = obj.get("anyOf").or_else(|| obj.get("oneOf")) {
-        let arr = any_of.as_array().ok_or_else(|| {
-            LLMError::SamplingError("'anyOf'/'oneOf' must be an array".into())
-        })?;
-        let nodes: Result<Vec<_>, _> = arr
-            .iter()
-            .map(|v| compile_node(v, depth + 1))
-            .collect();
+        let arr = any_of
+            .as_array()
+            .ok_or_else(|| LLMError::SamplingError("'anyOf'/'oneOf' must be an array".into()))?;
+        let nodes: Result<Vec<_>, _> = arr.iter().map(|v| compile_node(v, depth + 1)).collect();
         return Ok(SchemaNode::AnyOf(nodes?));
     }
 
@@ -165,10 +162,7 @@ fn compile_string(
     obj: &serde_json::Map<String, Value>,
     _depth: usize,
 ) -> Result<SchemaNode, LLMError> {
-    let min_length = obj
-        .get("minLength")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as usize;
+    let min_length = obj.get("minLength").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
     let max_length = obj
         .get("maxLength")
         .and_then(|v| v.as_u64())
@@ -203,10 +197,7 @@ fn compile_array(
         Some(v) => compile_node(v, depth + 1)?,
         None => SchemaNode::Any,
     };
-    let min_items = obj
-        .get("minItems")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as usize;
+    let min_items = obj.get("minItems").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
     let max_items = obj
         .get("maxItems")
         .and_then(|v| v.as_u64())
@@ -238,9 +229,9 @@ fn compile_object(
 
     let properties = match obj.get("properties") {
         Some(props) => {
-            let props_obj = props.as_object().ok_or_else(|| {
-                LLMError::SamplingError("'properties' must be an object".into())
-            })?;
+            let props_obj = props
+                .as_object()
+                .ok_or_else(|| LLMError::SamplingError("'properties' must be an object".into()))?;
             let mut result = Vec::with_capacity(props_obj.len());
             for (key, val) in props_obj {
                 let node = compile_node(val, depth + 1)?;
@@ -321,9 +312,9 @@ fn valid_start_chars(node: &SchemaNode) -> ValidChars {
         SchemaNode::Any => ValidChars::Any,
         SchemaNode::Null => ValidChars::Set(vec![b'n']),
         SchemaNode::Boolean => ValidChars::Set(vec![b't', b'f']),
-        SchemaNode::Number | SchemaNode::Integer => {
-            ValidChars::Set(vec![b'-', b'0', b'1', b'2', b'3', b'4', b'5', b'6', b'7', b'8', b'9'])
-        }
+        SchemaNode::Number | SchemaNode::Integer => ValidChars::Set(vec![
+            b'-', b'0', b'1', b'2', b'3', b'4', b'5', b'6', b'7', b'8', b'9',
+        ]),
         SchemaNode::String(_) => ValidChars::Set(vec![b'"']),
         SchemaNode::Array { .. } => ValidChars::Set(vec![b'[']),
         SchemaNode::Object { .. } => ValidChars::Set(vec![b'{']),
@@ -429,12 +420,15 @@ impl<'a> ParseContext<'a> {
             SchemaNode::Number => ctx.valid_next_number(false),
             SchemaNode::Integer => ctx.valid_next_number(true),
             SchemaNode::String(_constraints) => ctx.valid_next_string(),
-            SchemaNode::Array { items, min_items, max_items } => {
-                ctx.valid_next_array(items, *min_items, *max_items)
-            }
-            SchemaNode::Object { properties, additional_properties } => {
-                ctx.valid_next_object(properties, *additional_properties)
-            }
+            SchemaNode::Array {
+                items,
+                min_items,
+                max_items,
+            } => ctx.valid_next_array(items, *min_items, *max_items),
+            SchemaNode::Object {
+                properties,
+                additional_properties,
+            } => ctx.valid_next_object(properties, *additional_properties),
             SchemaNode::AnyOf(nodes) => {
                 let mut result = ValidChars::End;
                 for n in nodes {
@@ -495,9 +489,9 @@ impl<'a> ParseContext<'a> {
     fn valid_next_number(&self, integer_only: bool) -> ValidChars {
         let remaining = self.remaining();
         if remaining.is_empty() {
-            return ValidChars::Set(
-                vec![b'-', b'0', b'1', b'2', b'3', b'4', b'5', b'6', b'7', b'8', b'9'],
-            );
+            return ValidChars::Set(vec![
+                b'-', b'0', b'1', b'2', b'3', b'4', b'5', b'6', b'7', b'8', b'9',
+            ]);
         }
 
         let bytes = remaining.as_bytes();
@@ -777,7 +771,11 @@ mod tests {
         });
         let node = compile_schema(&schema).unwrap();
         match node {
-            SchemaNode::Array { items, min_items, max_items } => {
+            SchemaNode::Array {
+                items,
+                min_items,
+                max_items,
+            } => {
                 assert!(matches!(*items, SchemaNode::Integer));
                 assert_eq!(min_items, 1);
                 assert_eq!(max_items, 5);
@@ -798,7 +796,10 @@ mod tests {
         });
         let node = compile_schema(&schema).unwrap();
         match node {
-            SchemaNode::Object { properties, additional_properties } => {
+            SchemaNode::Object {
+                properties,
+                additional_properties,
+            } => {
                 assert_eq!(properties.len(), 2);
                 let name_prop = properties.iter().find(|(k, _, _)| k == "name").unwrap();
                 assert!(name_prop.2); // required

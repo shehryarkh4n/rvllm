@@ -279,11 +279,7 @@ log_level = "warn"
     #[test]
     fn toml_round_trip() {
         let cfg = EngineConfig::builder()
-            .model(
-                ModelConfigImpl::builder()
-                    .model_path("test/model")
-                    .build(),
-            )
+            .model(ModelConfigImpl::builder().model_path("test/model").build())
             .cache(CacheConfigImpl::builder().block_size(32).build())
             .build();
 

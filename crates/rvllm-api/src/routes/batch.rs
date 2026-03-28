@@ -479,8 +479,8 @@ async fn process_single_request(
                 }
                 last = Some(output);
             }
-            let output = last
-                .ok_or_else(|| ApiError::Internal("engine produced no output".into()))?;
+            let output =
+                last.ok_or_else(|| ApiError::Internal("engine produced no output".into()))?;
 
             let resp = CompletionResponse::from_request_output(&output, model_name);
             serde_json::to_value(&resp).map_err(|e| ApiError::Internal(e.to_string()))
@@ -526,8 +526,8 @@ async fn process_single_request(
                 }
                 last = Some(output);
             }
-            let output = last
-                .ok_or_else(|| ApiError::Internal("engine produced no output".into()))?;
+            let output =
+                last.ok_or_else(|| ApiError::Internal("engine produced no output".into()))?;
 
             let resp = ChatCompletionResponse::from_request_output(&output, model_name);
             serde_json::to_value(&resp).map_err(|e| ApiError::Internal(e.to_string()))
@@ -650,8 +650,7 @@ mod tests {
     #[test]
     fn create_batch_request_serde() {
         let req = CreateBatchRequest {
-            input: r#"{"custom_id":"r1","method":"POST","url":"/v1/completions","body":{}}"#
-                .into(),
+            input: r#"{"custom_id":"r1","method":"POST","url":"/v1/completions","body":{}}"#.into(),
             endpoint: "/v1/completions".into(),
             completion_window: Some("24h".into()),
         };

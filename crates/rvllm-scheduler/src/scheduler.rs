@@ -51,7 +51,8 @@ impl SequenceGroup {
 
     /// Remaining prompt tokens to prefill.
     pub fn remaining_prefill(&self) -> usize {
-        self.prompt_len().saturating_sub(self.num_prompt_tokens_processed)
+        self.prompt_len()
+            .saturating_sub(self.num_prompt_tokens_processed)
     }
 
     /// True if the group still has prompt tokens to prefill.
@@ -61,17 +62,12 @@ impl SequenceGroup {
 
     /// Number of active (non-finished) sequences.
     pub fn num_active(&self) -> usize {
-        self.sequences
-            .iter()
-            .filter(|s| !s.is_finished())
-            .count()
+        self.sequences.iter().filter(|s| !s.is_finished()).count()
     }
 
     /// True if all sequences are finished.
     pub fn is_finished(&self) -> bool {
-        self.sequences
-            .iter()
-            .all(|s| s.is_finished())
+        self.sequences.iter().all(|s| s.is_finished())
     }
 
     /// Set the status of all sequences in this group.
@@ -479,10 +475,10 @@ impl Scheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
     use rvllm_block_manager::MemoryPool;
     use rvllm_core::prelude::{BlockId, SequenceId};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     // -----------------------------------------------------------------------
     // Test pool -- simple free-list backed by atomics
@@ -864,7 +860,10 @@ mod tests {
 
         let out = sched.schedule().unwrap();
         assert_eq!(out.scheduled_seq_groups.len(), 1);
-        assert_eq!(out.scheduled_seq_groups[0].seq_group.request_id, RequestId(2));
+        assert_eq!(
+            out.scheduled_seq_groups[0].seq_group.request_id,
+            RequestId(2)
+        );
     }
 
     #[test]
@@ -883,7 +882,10 @@ mod tests {
 
         let out = sched.schedule().unwrap();
         assert_eq!(out.scheduled_seq_groups.len(), 1);
-        assert_eq!(out.scheduled_seq_groups[0].seq_group.request_id, RequestId(2));
+        assert_eq!(
+            out.scheduled_seq_groups[0].seq_group.request_id,
+            RequestId(2)
+        );
     }
 
     // -----------------------------------------------------------------------

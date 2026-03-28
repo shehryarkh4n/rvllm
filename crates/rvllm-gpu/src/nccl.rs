@@ -106,7 +106,8 @@ impl NcclComm {
     pub fn new(unique_id: &NcclUniqueId, world_size: usize, rank: usize) -> Result<Self> {
         if rank >= world_size {
             return Err(LLMError::ConfigError(format!(
-                "NCCL rank {} >= world_size {}", rank, world_size
+                "NCCL rank {} >= world_size {}",
+                rank, world_size
             )));
         }
 
@@ -123,11 +124,16 @@ impl NcclComm {
             };
             if ret != 0 {
                 return Err(LLMError::GpuError(format!(
-                    "ncclCommInitRank failed with code {}", ret
+                    "ncclCommInitRank failed with code {}",
+                    ret
                 )));
             }
             tracing::info!(rank, world_size, "NCCL communicator initialized");
-            Ok(Self { rank, world_size, handle })
+            Ok(Self {
+                rank,
+                world_size,
+                handle,
+            })
         }
 
         #[cfg(not(feature = "cuda"))]
@@ -188,7 +194,8 @@ impl NcclComm {
             };
             if ret != 0 {
                 return Err(LLMError::GpuError(format!(
-                    "ncclAllReduce failed with code {}", ret
+                    "ncclAllReduce failed with code {}",
+                    ret
                 )));
             }
         }
@@ -239,7 +246,8 @@ impl NcclComm {
             };
             if ret != 0 {
                 return Err(LLMError::GpuError(format!(
-                    "ncclAllReduce (in-place) failed with code {}", ret
+                    "ncclAllReduce (in-place) failed with code {}",
+                    ret
                 )));
             }
         }
@@ -295,7 +303,8 @@ impl NcclComm {
             };
             if ret != 0 {
                 return Err(LLMError::GpuError(format!(
-                    "ncclAllGather failed with code {}", ret
+                    "ncclAllGather failed with code {}",
+                    ret
                 )));
             }
         }
@@ -356,7 +365,8 @@ impl NcclComm {
             };
             if ret != 0 {
                 return Err(LLMError::GpuError(format!(
-                    "ncclReduceScatter failed with code {}", ret
+                    "ncclReduceScatter failed with code {}",
+                    ret
                 )));
             }
         }
@@ -407,7 +417,8 @@ impl NcclComm {
             };
             if ret != 0 {
                 return Err(LLMError::GpuError(format!(
-                    "ncclBroadcast failed with code {}", ret
+                    "ncclBroadcast failed with code {}",
+                    ret
                 )));
             }
         }
@@ -450,9 +461,7 @@ impl NcclGroup {
     /// Create a group of communicators for `world_size` ranks.
     pub fn new(world_size: usize) -> Result<Self> {
         if world_size == 0 {
-            return Err(LLMError::ConfigError(
-                "NCCL world_size must be >= 1".into(),
-            ));
+            return Err(LLMError::ConfigError("NCCL world_size must be >= 1".into()));
         }
 
         let unique_id = NcclUniqueId::new();
@@ -591,8 +600,14 @@ mod tests {
 
         let send: Vec<u8> = vec![1, 0, 0, 0, 2, 0, 0, 0]; // two f32-sized chunks
         let mut recv = vec![0u8; 8];
-        comm.all_reduce(&send, &mut recv, 2, NcclDataType::Float32, NcclReduceOp::Sum)
-            .unwrap();
+        comm.all_reduce(
+            &send,
+            &mut recv,
+            2,
+            NcclDataType::Float32,
+            NcclReduceOp::Sum,
+        )
+        .unwrap();
         assert_eq!(recv, send);
     }
 
@@ -614,7 +629,8 @@ mod tests {
 
         let send = vec![1u8, 2, 3, 4];
         let mut recv = vec![0u8; 4];
-        comm.all_gather(&send, &mut recv, 1, NcclDataType::Float32).unwrap();
+        comm.all_gather(&send, &mut recv, 1, NcclDataType::Float32)
+            .unwrap();
         assert_eq!(recv, send);
     }
 
@@ -625,8 +641,14 @@ mod tests {
 
         let send = vec![5u8, 6, 7, 8];
         let mut recv = vec![0u8; 4];
-        comm.reduce_scatter(&send, &mut recv, 1, NcclDataType::Float32, NcclReduceOp::Sum)
-            .unwrap();
+        comm.reduce_scatter(
+            &send,
+            &mut recv,
+            1,
+            NcclDataType::Float32,
+            NcclReduceOp::Sum,
+        )
+        .unwrap();
         assert_eq!(recv, send);
     }
 
@@ -636,7 +658,8 @@ mod tests {
         let comm = NcclComm::new(&id, 1, 0).unwrap();
 
         let mut buf = vec![42u8, 43, 44, 45];
-        comm.broadcast(&mut buf, 1, NcclDataType::Float32, 0).unwrap();
+        comm.broadcast(&mut buf, 1, NcclDataType::Float32, 0)
+            .unwrap();
         assert_eq!(buf, vec![42, 43, 44, 45]);
     }
 
@@ -647,8 +670,13 @@ mod tests {
 
         let send = vec![0u8; 2];
         let mut recv = vec![0u8; 2];
-        let result =
-            comm.all_reduce(&send, &mut recv, 4, NcclDataType::Float32, NcclReduceOp::Sum);
+        let result = comm.all_reduce(
+            &send,
+            &mut recv,
+            4,
+            NcclDataType::Float32,
+            NcclReduceOp::Sum,
+        );
         assert!(result.is_err());
     }
 

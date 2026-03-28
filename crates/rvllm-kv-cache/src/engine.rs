@@ -1,9 +1,9 @@
 //! CacheEngine: manages per-layer GPU and CPU KV caches.
 
 use half::f16;
-use tracing::{debug, info};
 use rvllm_core::prelude::{BlockId, LLMError, Result};
 use rvllm_gpu::prelude::{CpuBuffer, GpuAllocator, GpuBuffer, GpuStream};
+use tracing::{debug, info};
 
 /// Per-layer paged KV cache engine.
 ///
@@ -48,9 +48,9 @@ impl CacheEngine {
 
         for layer in 0..num_layers {
             debug!(layer, gpu_total, "allocating GPU KV cache");
-            let key_gpu = allocator.alloc::<f16>(gpu_total).map_err(|e| {
-                LLMError::MemoryError(format!("GPU key alloc layer {layer}: {e}"))
-            })?;
+            let key_gpu = allocator
+                .alloc::<f16>(gpu_total)
+                .map_err(|e| LLMError::MemoryError(format!("GPU key alloc layer {layer}: {e}")))?;
             let val_gpu = allocator.alloc::<f16>(gpu_total).map_err(|e| {
                 LLMError::MemoryError(format!("GPU value alloc layer {layer}: {e}"))
             })?;
@@ -119,11 +119,7 @@ impl CacheEngine {
 
     /// Swap blocks from CPU cache into GPU cache.
     /// Each (cpu_block, gpu_block) copies CPU -> GPU across all layers.
-    pub fn swap_in(
-        &mut self,
-        mapping: &[(BlockId, BlockId)],
-        _stream: &GpuStream,
-    ) -> Result<()> {
+    pub fn swap_in(&mut self, mapping: &[(BlockId, BlockId)], _stream: &GpuStream) -> Result<()> {
         let epb = self.elements_per_block();
 
         for &(cpu_id, gpu_id) in mapping {
@@ -172,11 +168,7 @@ impl CacheEngine {
 
     /// Swap blocks from GPU cache out to CPU cache.
     /// Each (gpu_block, cpu_block) copies GPU -> CPU across all layers.
-    pub fn swap_out(
-        &mut self,
-        mapping: &[(BlockId, BlockId)],
-        _stream: &GpuStream,
-    ) -> Result<()> {
+    pub fn swap_out(&mut self, mapping: &[(BlockId, BlockId)], _stream: &GpuStream) -> Result<()> {
         let epb = self.elements_per_block();
 
         for &(gpu_id, cpu_id) in mapping {
@@ -316,8 +308,14 @@ mod tests {
             .unwrap();
 
         let cpu_off = 3 * epb;
-        assert_eq!(engine.cpu_cache[0].0.as_slice()[cpu_off], f16::from_f32(42.0));
-        assert_eq!(engine.cpu_cache[0].1.as_slice()[cpu_off], f16::from_f32(43.0));
+        assert_eq!(
+            engine.cpu_cache[0].0.as_slice()[cpu_off],
+            f16::from_f32(42.0)
+        );
+        assert_eq!(
+            engine.cpu_cache[0].1.as_slice()[cpu_off],
+            f16::from_f32(43.0)
+        );
 
         // Zero GPU block 1
         let mut kdata = engine.gpu_cache[0].0.copy_to_host().unwrap();
@@ -344,16 +342,24 @@ mod tests {
     fn swap_in_out_of_range() {
         let mut engine = make_engine(1, 2, 4, 2, 4, 2);
         let stream = GpuStream::new(0).unwrap();
-        assert!(engine.swap_in(&[(BlockId(10), BlockId(0))], &stream).is_err());
-        assert!(engine.swap_in(&[(BlockId(0), BlockId(10))], &stream).is_err());
+        assert!(engine
+            .swap_in(&[(BlockId(10), BlockId(0))], &stream)
+            .is_err());
+        assert!(engine
+            .swap_in(&[(BlockId(0), BlockId(10))], &stream)
+            .is_err());
     }
 
     #[test]
     fn swap_out_out_of_range() {
         let mut engine = make_engine(1, 2, 4, 2, 4, 2);
         let stream = GpuStream::new(0).unwrap();
-        assert!(engine.swap_out(&[(BlockId(10), BlockId(0))], &stream).is_err());
-        assert!(engine.swap_out(&[(BlockId(0), BlockId(10))], &stream).is_err());
+        assert!(engine
+            .swap_out(&[(BlockId(10), BlockId(0))], &stream)
+            .is_err());
+        assert!(engine
+            .swap_out(&[(BlockId(0), BlockId(10))], &stream)
+            .is_err());
     }
 
     #[test]

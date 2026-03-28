@@ -1,8 +1,8 @@
 //! Flash Attention paged backend -- stub for SM >= 8.0 devices.
 
+use crate::buffer::GpuBuffer;
 use half::f16;
 use rvllm_core::prelude::Result;
-use crate::buffer::GpuBuffer;
 
 use crate::backend::AttentionBackend;
 

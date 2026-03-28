@@ -1,5 +1,5 @@
-use tracing::{debug, info};
 use rvllm_core::error::{LLMError, Result};
+use tracing::{debug, info};
 
 use crate::weights::{GpuAllocator, ModelWeights, WeightTensor};
 
@@ -49,15 +49,13 @@ impl ShardedLoader {
 
             match shard_dim {
                 ShardDim::Column => {
-                    let sharded_tensor =
-                        shard_along_dim(tensor, 0, tp_size, rank, gpu)?;
+                    let sharded_tensor = shard_along_dim(tensor, 0, tp_size, rank, gpu)?;
                     debug!(tensor = name.as_str(), dim = 0, "column-parallel shard");
                     sharded.insert(sharded_tensor);
                 }
                 ShardDim::Row => {
                     if tensor.shape().len() >= 2 {
-                        let sharded_tensor =
-                            shard_along_dim(tensor, 1, tp_size, rank, gpu)?;
+                        let sharded_tensor = shard_along_dim(tensor, 1, tp_size, rank, gpu)?;
                         debug!(tensor = name.as_str(), dim = 1, "row-parallel shard");
                         sharded.insert(sharded_tensor);
                     } else {
@@ -272,7 +270,12 @@ mod tests {
     fn replicated_weights() {
         let data = vec![1u8; 8];
         let mut weights = ModelWeights::new();
-        weights.insert(make_tensor("embed_tokens.weight", vec![4, 2], DType::U8, data.clone()));
+        weights.insert(make_tensor(
+            "embed_tokens.weight",
+            vec![4, 2],
+            DType::U8,
+            data.clone(),
+        ));
         weights.insert(make_tensor("norm.weight", vec![8], DType::U8, vec![2u8; 8]));
 
         let gpu = MockGpuAllocator;
@@ -284,11 +287,23 @@ mod tests {
 
     #[test]
     fn classify_names() {
-        assert_eq!(classify_shard_dim("layers.0.attn.q.weight"), ShardDim::Column);
+        assert_eq!(
+            classify_shard_dim("layers.0.attn.q.weight"),
+            ShardDim::Column
+        );
         assert_eq!(classify_shard_dim("layers.0.attn.o.weight"), ShardDim::Row);
-        assert_eq!(classify_shard_dim("layers.0.ffn.gate.weight"), ShardDim::Column);
-        assert_eq!(classify_shard_dim("layers.0.ffn.down.weight"), ShardDim::Row);
-        assert_eq!(classify_shard_dim("embed_tokens.weight"), ShardDim::Replicate);
+        assert_eq!(
+            classify_shard_dim("layers.0.ffn.gate.weight"),
+            ShardDim::Column
+        );
+        assert_eq!(
+            classify_shard_dim("layers.0.ffn.down.weight"),
+            ShardDim::Row
+        );
+        assert_eq!(
+            classify_shard_dim("embed_tokens.weight"),
+            ShardDim::Replicate
+        );
         assert_eq!(classify_shard_dim("norm.weight"), ShardDim::Replicate);
     }
 }

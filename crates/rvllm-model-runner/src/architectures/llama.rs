@@ -3,9 +3,7 @@
 use half::f16;
 use tracing::trace;
 
-use crate::bridge::{
-    AttentionBackend, CacheEngine, GpuBuffer, ModelWeights, Result,
-};
+use crate::bridge::{AttentionBackend, CacheEngine, GpuBuffer, ModelWeights, Result};
 use crate::input::ModelInput;
 use crate::layers::linear::LinearLayer;
 use crate::layers::mlp::MLP;
@@ -66,15 +64,51 @@ impl LlamaForCausalLM {
         for i in 0..cfg.num_layers {
             let p = format!("model.layers.{}", i);
             layers.push(LlamaLayer {
-                input_layernorm: get_or_zeros(&weights, &format!("{p}.input_layernorm.weight"), &[cfg.hidden_size]),
-                post_attention_layernorm: get_or_zeros(&weights, &format!("{p}.post_attention_layernorm.weight"), &[cfg.hidden_size]),
-                q_proj: get_or_zeros(&weights, &format!("{p}.self_attn.q_proj.weight"), &[cfg.num_heads * cfg.head_dim, cfg.hidden_size]),
-                k_proj: get_or_zeros(&weights, &format!("{p}.self_attn.k_proj.weight"), &[cfg.num_kv_heads * cfg.head_dim, cfg.hidden_size]),
-                v_proj: get_or_zeros(&weights, &format!("{p}.self_attn.v_proj.weight"), &[cfg.num_kv_heads * cfg.head_dim, cfg.hidden_size]),
-                o_proj: get_or_zeros(&weights, &format!("{p}.self_attn.o_proj.weight"), &[cfg.hidden_size, cfg.num_heads * cfg.head_dim]),
-                gate_proj: get_or_zeros(&weights, &format!("{p}.mlp.gate_proj.weight"), &[config.intermediate_size, cfg.hidden_size]),
-                up_proj: get_or_zeros(&weights, &format!("{p}.mlp.up_proj.weight"), &[config.intermediate_size, cfg.hidden_size]),
-                down_proj: get_or_zeros(&weights, &format!("{p}.mlp.down_proj.weight"), &[cfg.hidden_size, config.intermediate_size]),
+                input_layernorm: get_or_zeros(
+                    &weights,
+                    &format!("{p}.input_layernorm.weight"),
+                    &[cfg.hidden_size],
+                ),
+                post_attention_layernorm: get_or_zeros(
+                    &weights,
+                    &format!("{p}.post_attention_layernorm.weight"),
+                    &[cfg.hidden_size],
+                ),
+                q_proj: get_or_zeros(
+                    &weights,
+                    &format!("{p}.self_attn.q_proj.weight"),
+                    &[cfg.num_heads * cfg.head_dim, cfg.hidden_size],
+                ),
+                k_proj: get_or_zeros(
+                    &weights,
+                    &format!("{p}.self_attn.k_proj.weight"),
+                    &[cfg.num_kv_heads * cfg.head_dim, cfg.hidden_size],
+                ),
+                v_proj: get_or_zeros(
+                    &weights,
+                    &format!("{p}.self_attn.v_proj.weight"),
+                    &[cfg.num_kv_heads * cfg.head_dim, cfg.hidden_size],
+                ),
+                o_proj: get_or_zeros(
+                    &weights,
+                    &format!("{p}.self_attn.o_proj.weight"),
+                    &[cfg.hidden_size, cfg.num_heads * cfg.head_dim],
+                ),
+                gate_proj: get_or_zeros(
+                    &weights,
+                    &format!("{p}.mlp.gate_proj.weight"),
+                    &[config.intermediate_size, cfg.hidden_size],
+                ),
+                up_proj: get_or_zeros(
+                    &weights,
+                    &format!("{p}.mlp.up_proj.weight"),
+                    &[config.intermediate_size, cfg.hidden_size],
+                ),
+                down_proj: get_or_zeros(
+                    &weights,
+                    &format!("{p}.mlp.down_proj.weight"),
+                    &[cfg.hidden_size, config.intermediate_size],
+                ),
             });
         }
 
@@ -114,7 +148,8 @@ impl Architecture for LlamaForCausalLM {
             trace!(layer = layer_idx, "llama layer forward");
 
             // Pre-attention norm.
-            let normed = RMSNorm::forward(&hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
+            let normed =
+                RMSNorm::forward(&hidden, &layer.input_layernorm, self.config.rms_norm_eps)?;
 
             // QKV projections.
             let q = LinearLayer::forward(&normed, &layer.q_proj, None)?;
@@ -122,21 +157,12 @@ impl Architecture for LlamaForCausalLM {
             let v = LinearLayer::forward(&normed, &layer.v_proj, None)?;
 
             // RoPE.
-            let (q_rot, k_rot) = RotaryEmbedding::forward(
-                &input.position_ids,
-                &q,
-                &k,
-                self.config.head_dim,
-            )?;
+            let (q_rot, k_rot) =
+                RotaryEmbedding::forward(&input.position_ids, &q, &k, self.config.head_dim)?;
 
             // Attention.
-            let attn_out = attention.forward(
-                &q_rot,
-                &k_rot,
-                &v,
-                &input.attention_metadata,
-                layer_idx,
-            )?;
+            let attn_out =
+                attention.forward(&q_rot, &k_rot, &v, &input.attention_metadata, layer_idx)?;
 
             // Output projection.
             let attn_proj = LinearLayer::forward(&attn_out, &layer.o_proj, None)?;
@@ -145,8 +171,13 @@ impl Architecture for LlamaForCausalLM {
             add_inplace(&mut hidden, &attn_proj);
 
             // Post-attention norm + MLP.
-            let normed2 = RMSNorm::forward(&hidden, &layer.post_attention_layernorm, self.config.rms_norm_eps)?;
-            let mlp_out = MLP::forward(&normed2, &layer.gate_proj, &layer.up_proj, &layer.down_proj)?;
+            let normed2 = RMSNorm::forward(
+                &hidden,
+                &layer.post_attention_layernorm,
+                self.config.rms_norm_eps,
+            )?;
+            let mlp_out =
+                MLP::forward(&normed2, &layer.gate_proj, &layer.up_proj, &layer.down_proj)?;
             add_inplace(&mut hidden, &mlp_out);
         }
 
@@ -154,7 +185,12 @@ impl Architecture for LlamaForCausalLM {
         let normed_final = RMSNorm::forward(&hidden, &self.norm_weight, self.config.rms_norm_eps)?;
 
         // LM head: project to vocab (in f32 for logits).
-        lm_head(&normed_final, &self.lm_head_weight, num_tokens, self.config.vocab_size)
+        lm_head(
+            &normed_final,
+            &self.lm_head_weight,
+            num_tokens,
+            self.config.vocab_size,
+        )
     }
 }
 
@@ -166,7 +202,11 @@ pub(crate) fn get_or_zeros(weights: &ModelWeights, name: &str, shape: &[usize]) 
         .unwrap_or_else(|_| GpuBuffer::zeros(shape))
 }
 
-pub(crate) fn embed_tokens(embed: &GpuBuffer<f16>, token_ids: &[u32], hidden: usize) -> GpuBuffer<f16> {
+pub(crate) fn embed_tokens(
+    embed: &GpuBuffer<f16>,
+    token_ids: &[u32],
+    hidden: usize,
+) -> GpuBuffer<f16> {
     let mut out = Vec::with_capacity(token_ids.len() * hidden);
     for &tid in token_ids {
         let start = tid as usize * hidden;
@@ -201,8 +241,7 @@ pub(crate) fn lm_head(
             let w_start = v * h;
             let mut acc: f32 = 0.0;
             for k in 0..h {
-                acc += hidden.data[row_start + k].to_f32()
-                    * weight.data[w_start + k].to_f32();
+                acc += hidden.data[row_start + k].to_f32() * weight.data[w_start + k].to_f32();
             }
             logits.push(acc);
         }

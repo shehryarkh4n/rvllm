@@ -11,9 +11,7 @@ pub mod mixtral;
 pub mod phi;
 pub mod qwen2;
 
-use crate::bridge::{
-    AttentionBackend, CacheEngine, GpuBuffer, LLMError, ModelWeights, Result,
-};
+use crate::bridge::{AttentionBackend, CacheEngine, GpuBuffer, LLMError, ModelWeights, Result};
 use crate::input::ModelInput;
 use crate::runner::ModelRunnerConfig;
 
@@ -39,25 +37,30 @@ pub fn create_model(
         "MistralForCausalLM" => Ok(Box::new(mistral::MistralForCausalLM::new(weights, config)?)),
         "Qwen2ForCausalLM" => Ok(Box::new(qwen2::Qwen2ForCausalLM::new(weights, config)?)),
         "CohereForCausalLM" => Ok(Box::new(cohere::CohereForCausalLM::new(weights, config)?)),
-        "GPTNeoXForCausalLM" => Ok(Box::new(gpt_neox::GPTNeoXForCausalLM::new(weights, config)?)),
-        "StableLmForCausalLM" | "StableLMForCausalLM" => {
-            Ok(Box::new(gpt_neox::StableLmForCausalLM::new(weights, config)?))
-        }
+        "GPTNeoXForCausalLM" => Ok(Box::new(gpt_neox::GPTNeoXForCausalLM::new(
+            weights, config,
+        )?)),
+        "StableLmForCausalLM" | "StableLMForCausalLM" => Ok(Box::new(
+            gpt_neox::StableLmForCausalLM::new(weights, config)?,
+        )),
         "GemmaForCausalLM" => Ok(Box::new(gemma::GemmaForCausalLM::new(weights, config)?)),
         "Gemma2ForCausalLM" => Ok(Box::new(gemma::Gemma2ForCausalLM::new(weights, config)?)),
-        "DeepSeekV2ForCausalLM" | "DeepseekV2ForCausalLM" => {
-            Ok(Box::new(deepseek::DeepSeekV2ForCausalLM::new(weights, config)?))
-        }
+        "DeepSeekV2ForCausalLM" | "DeepseekV2ForCausalLM" => Ok(Box::new(
+            deepseek::DeepSeekV2ForCausalLM::new(weights, config)?,
+        )),
         "MixtralForCausalLM" => Ok(Box::new(mixtral::MixtralForCausalLM::new(weights, config)?)),
         "PhiForCausalLM" | "Phi3ForCausalLM" | "Phi3SmallForCausalLM" => {
             Ok(Box::new(phi::PhiForCausalLM::new(weights, config)?))
         }
         // Embedding / encoder-only models (sentence-transformers, E5, GTE, BGE, etc.)
-        "BertModel" | "RobertaModel" | "XLMRobertaModel"
-        | "E5Model" | "GTEModel" | "BGEModel"
-        | "EmbeddingModel" | "SentenceTransformer" => {
-            Ok(Box::new(embedding::EmbeddingModel::new(weights, config)?))
-        }
+        "BertModel"
+        | "RobertaModel"
+        | "XLMRobertaModel"
+        | "E5Model"
+        | "GTEModel"
+        | "BGEModel"
+        | "EmbeddingModel"
+        | "SentenceTransformer" => Ok(Box::new(embedding::EmbeddingModel::new(weights, config)?)),
         other => Err(LLMError::ModelError(format!(
             "unsupported architecture: {}",
             other
