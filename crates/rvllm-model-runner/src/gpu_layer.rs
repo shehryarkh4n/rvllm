@@ -216,12 +216,17 @@ mod inner {
         // With a single scratch buffer sized to max(T*qkv_dim, T*2I, T*H):
         //   Could eliminate 4-5 allocs, reducing 10 -> 5-6 per layer.
         // ==================================================================
+        /// Full f16 forward with cross-layer fusion support.
+        /// When `prev_mlp_out` is Some, fuses the previous layer's residual add
+        /// with this layer's pre-attention RMSNorm (1 kernel instead of 2).
+        /// Returns (residual, mlp_out) for the NEXT layer to fuse.
         pub fn forward_f16(
             &self,
             input: &GpuLayerInput<'_>,
             weights: &GpuLayerWeightsF16<'_>,
             blas: &CublasHandle,
-        ) -> Result<CudaSlice<f16>> {
+            prev_mlp_out: Option<&CudaSlice<f16>>,
+        ) -> Result<(CudaSlice<f16>, CudaSlice<f16>)> {
             let cfg = &self.config;
             let num_tokens = input.num_tokens;
             let hidden = cfg.hidden_size;
@@ -237,12 +242,26 @@ mod inner {
             let post_norm_w = weights.post_attention_layernorm_f16
                 .ok_or_else(|| LLMError::GpuError("f16 post_attention_layernorm required".into()))?;
 
-            // 1. Pre-attention RMSNorm f16
-            let normed = Self::rms_norm_f16(
-                &self.stream, &self.loader,
-                hidden_f16, norm_w,
-                cfg.rms_norm_eps, num_tokens, hidden,
-            )?;
+            // 1. Pre-attention RMSNorm f16 (fused with previous layer's residual add if available)
+            let (normed, fused_residual) = if let Some(prev_mlp) = prev_mlp_out {
+                // Fuse: hidden + prev_mlp -> norm in one kernel
+                let (n, r) = Self::fused_residual_rmsnorm_f16(
+                    &self.stream, &self.loader,
+                    hidden_f16, prev_mlp, norm_w,
+                    cfg.rms_norm_eps, num_tokens, hidden,
+                )?;
+                (n, Some(r))
+            } else {
+                // First layer: standalone norm
+                let n = Self::rms_norm_f16(
+                    &self.stream, &self.loader,
+                    hidden_f16, norm_w,
+                    cfg.rms_norm_eps, num_tokens, hidden,
+                )?;
+                (n, None)
+            };
+            // The residual stream: either the fused result or the original hidden_states
+            let residual_ref = fused_residual.as_ref().unwrap_or(hidden_f16);
 
             // 2. QKV projections: hgemm f16 x f16 -> f16
             let q_dim = num_heads * head_dim;
@@ -339,7 +358,7 @@ mod inner {
             // 8. Fused residual + post-attention RMSNorm f16
             let (normed2, residual) = Self::fused_residual_rmsnorm_f16(
                 &self.stream, &self.loader,
-                hidden_f16, &attn_proj, post_norm_w,
+                residual_ref, &attn_proj, post_norm_w,
                 cfg.rms_norm_eps, num_tokens, hidden,
             )?;
 
@@ -357,8 +376,8 @@ mod inner {
             // 10. Down projection: hgemm f16
             let mlp_out = Self::hgemm_alloc(&self.stream, blas, &fused, weights.down_proj, num_tokens, hidden, intermediate)?;
 
-            // 11. Residual add f16
-            Self::add_tensors_f16(&self.stream, &self.loader, &residual, &mlp_out, num_tokens * hidden)
+            // 11. Return (residual, mlp_out) -- the add is fused into the NEXT layer's norm
+            Ok((residual, mlp_out))
         }
 
         pub fn forward(
@@ -1675,7 +1694,7 @@ mod inner {
 
         /// Fused residual add + RMSNorm, all f16.
         /// Returns (normed_output, residual) both f16.
-        fn fused_residual_rmsnorm_f16(
+        pub fn fused_residual_rmsnorm_f16(
             stream: &Arc<CudaStream>,
             loader: &KernelLoader,
             input: &CudaSlice<f16>,

@@ -494,10 +494,8 @@ mod cuda_impl {
                 // Need a dummy f32 buffer for GpuLayerInput.hidden_states (unused in f16 path)
                 let dummy_f32 = self.stream.alloc_zeros::<f32>(1)
                     .map_err(|e| LLMError::GpuError(format!("dummy alloc: {e}")))?;
+                let mut prev_mlp_out: Option<CudaSlice<f16>> = None;
                 for (layer_idx, layer) in self.layers.iter().enumerate() {
-                    if layer_idx == 0 || layer_idx == num_layers - 1 {
-                        info!(layer = layer_idx, "gpu_runner: f16 layer start");
-                    }
                     let (key_cache, value_cache) = &gpu_cache[layer_idx];
                     let input = GpuLayerInput {
                         hidden_states: &dummy_f32,
@@ -518,16 +516,24 @@ mod cuda_impl {
                         rope_sin: &self.rope_sin,
                     };
                     let weights = self.layer_weights_f16(layer_idx)?;
-                    hidden_f16 = layer.forward_f16(&input, &weights, &self.blas)?;
-                    if layer_idx == 0 || layer_idx == num_layers - 1 {
-                        info!(layer = layer_idx, "gpu_runner: f16 layer done");
-                    }
+                    let (residual, mlp_out) = layer.forward_f16(&input, &weights, &self.blas, prev_mlp_out.as_ref())?;
+                    hidden_f16 = residual;
+                    prev_mlp_out = Some(mlp_out);
                 }
 
-                // Final RMSNorm f16
+                // Final: fuse last layer's residual add with final RMSNorm
                 let fn_w = self.final_norm_weight_f16.as_ref()
                     .ok_or_else(|| LLMError::GpuError("f16 final_norm not initialized".into()))?;
-                let normed_f16 = self.rms_norm_f16_runner(&hidden_f16, fn_w, hidden_size)?;
+                let normed_f16 = if let Some(ref last_mlp) = prev_mlp_out {
+                    let (n, _) = GpuTransformerLayer::fused_residual_rmsnorm_f16(
+                        &self.stream, &self.loader,
+                        &hidden_f16, last_mlp, fn_w,
+                        self.rms_norm_eps, num_tokens, hidden_size,
+                    )?;
+                    n
+                } else {
+                    self.rms_norm_f16_runner(&hidden_f16, fn_w, hidden_size)?
+                };
 
                 // LM head + argmax: f16 hidden -> fused argmax
                 if num_tokens == 1 && greedy_only {
@@ -803,6 +809,7 @@ mod cuda_impl {
                 let offsets = self.meta_packed_offsets.get();
                 let dummy_f32 = self.stream.alloc_zeros::<f32>(1)
                     .map_err(|e| LLMError::GpuError(format!("dummy alloc: {e}")))?;
+                let mut prev_mlp_out: Option<CudaSlice<f16>> = None;
                 for (layer_idx, layer) in self.layers.iter().enumerate() {
                     let (key_cache, value_cache) = &gpu_cache[layer_idx];
                     let input = GpuLayerInput {
@@ -824,13 +831,24 @@ mod cuda_impl {
                         rope_sin: &self.rope_sin,
                     };
                     let weights = self.layer_weights_f16(layer_idx)?;
-                    hidden_f16 = layer.forward_f16(&input, &weights, &self.blas)?;
+                    let (residual, mlp_out) = layer.forward_f16(&input, &weights, &self.blas, prev_mlp_out.as_ref())?;
+                    hidden_f16 = residual;
+                    prev_mlp_out = Some(mlp_out);
                 }
 
-                // Final RMSNorm f16
+                // Final: fuse last layer's residual add with final RMSNorm
                 let fn_w = self.final_norm_weight_f16.as_ref()
                     .ok_or_else(|| LLMError::GpuError("f16 final_norm not initialized".into()))?;
-                let normed_f16 = self.rms_norm_f16_runner(&hidden_f16, fn_w, hidden_size)?;
+                let normed_f16 = if let Some(ref last_mlp) = prev_mlp_out {
+                    let (n, _) = GpuTransformerLayer::fused_residual_rmsnorm_f16(
+                        &self.stream, &self.loader,
+                        &hidden_f16, last_mlp, fn_w,
+                        self.rms_norm_eps, num_tokens, hidden_size,
+                    )?;
+                    n
+                } else {
+                    self.rms_norm_f16_runner(&hidden_f16, fn_w, hidden_size)?
+                };
 
                 if num_tokens == 1 && greedy_only {
                     let lm_f16 = self.weights.get_f16("lm_head.weight")
@@ -1019,6 +1037,7 @@ mod cuda_impl {
                 let offsets = self.meta_packed_offsets.get();
                 let dummy_f32 = self.stream.alloc_zeros::<f32>(1)
                     .map_err(|e| LLMError::GpuError(format!("dummy alloc: {e}")))?;
+                let mut prev_mlp_out: Option<CudaSlice<f16>> = None;
                 for (layer_idx, layer) in self.layers.iter().enumerate() {
                     let (key_cache, value_cache) = &gpu_cache[layer_idx];
                     let input = GpuLayerInput {
@@ -1040,13 +1059,24 @@ mod cuda_impl {
                         rope_sin: &self.rope_sin,
                     };
                     let weights = self.layer_weights_f16(layer_idx)?;
-                    hidden_f16 = layer.forward_f16(&input, &weights, &self.blas)?;
+                    let (residual, mlp_out) = layer.forward_f16(&input, &weights, &self.blas, prev_mlp_out.as_ref())?;
+                    hidden_f16 = residual;
+                    prev_mlp_out = Some(mlp_out);
                 }
 
-                // Final RMSNorm f16
+                // Final: fuse last layer's residual add with final RMSNorm
                 let fn_w = self.final_norm_weight_f16.as_ref()
                     .ok_or_else(|| LLMError::GpuError("f16 final_norm not initialized".into()))?;
-                let normed_f16 = self.rms_norm_f16_runner(&hidden_f16, fn_w, hidden_size)?;
+                let normed_f16 = if let Some(ref last_mlp) = prev_mlp_out {
+                    let (n, _) = GpuTransformerLayer::fused_residual_rmsnorm_f16(
+                        &self.stream, &self.loader,
+                        &hidden_f16, last_mlp, fn_w,
+                        self.rms_norm_eps, num_tokens, hidden_size,
+                    )?;
+                    n
+                } else {
+                    self.rms_norm_f16_runner(&hidden_f16, fn_w, hidden_size)?
+                };
 
                 let token_ids_gpu = if num_tokens == 1 {
                     let lm_f16 = self.weights.get_f16("lm_head.weight")
