@@ -351,7 +351,9 @@ mod inner {
                     let gate_up = Self::hgemm_dispatch(&self.stream, blas, lt, &normed2, fused_gate_up, num_tokens, intermediate * 2, hidden, &self.loader)?;
                     let gate = gate_up.slice(..intermediate);
                     let up = gate_up.slice(intermediate..intermediate * 2);
-                    if let Ok(kernel) = self.loader.get_func("fused_silu_down", "fused_silu_down_f16_kernel") {
+                    // Fused silu+down GEMV: saves 1 launch but custom GEMV can't
+                    // beat cuBLAS for large intermediate_size. Disabled pending profiling.
+                    if let Ok(kernel) = self.loader.get_func("_disabled_fused_silu_down", "fused_silu_down_f16_kernel") {
                         let mut out = unsafe { self.stream.alloc::<f16>(hidden) }
                             .map_err(|e| LLMError::GpuError(format!("fused_silu_down alloc: {e}")))?;
                         let smem = (256 / 32) * std::mem::size_of::<f32>();
