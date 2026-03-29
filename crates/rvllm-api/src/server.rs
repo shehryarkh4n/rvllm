@@ -4,6 +4,7 @@
 //! the server uses the GPU-accelerated AsyncGpuLLMEngine. Otherwise it falls
 //! back to the mock executor via AsyncLLMEngine.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -76,6 +77,8 @@ pub struct AppState {
     pub tokenizer: Arc<RwLock<Tokenizer>>,
     /// Batch job store (None if batch API is not enabled).
     pub batch_store: Option<crate::routes::batch::SharedBatchStore>,
+    /// Stored response objects for Responses API follow-up turns and retrieval.
+    pub response_store: crate::routes::responses::SharedResponseStore,
     next_id: AtomicU64,
 }
 
@@ -86,6 +89,7 @@ impl AppState {
             model_name,
             tokenizer: Arc::new(RwLock::new(tokenizer)),
             batch_store: Some(crate::routes::batch::create_batch_store(None)),
+            response_store: Arc::new(RwLock::new(HashMap::new())),
             next_id: AtomicU64::new(1),
         }
     }
@@ -106,19 +110,28 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/v1/chat/completions",
             post(routes::chat::create_chat_completion),
         )
+        .route("/v1/responses", post(routes::responses::create_response))
+        .route(
+            "/v1/responses/:response_id",
+            get(routes::responses::get_response),
+        )
+        .route(
+            "/v1/responses/:response_id/input_items",
+            get(routes::responses::list_response_input_items),
+        )
         .route(
             "/v1/embeddings",
             post(routes::embeddings::create_embeddings),
         )
         .route("/v1/models", get(routes::models::list_models))
         .route("/v1/batches", post(routes::batch::create_batch))
-        .route("/v1/batches/{batch_id}", get(routes::batch::get_batch))
+        .route("/v1/batches/:batch_id", get(routes::batch::get_batch))
         .route(
-            "/v1/batches/{batch_id}/output",
+            "/v1/batches/:batch_id/output",
             get(routes::batch::get_batch_output),
         )
         .route(
-            "/v1/batches/{batch_id}/cancel",
+            "/v1/batches/:batch_id/cancel",
             post(routes::batch::cancel_batch),
         )
         .route(

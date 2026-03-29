@@ -1,0 +1,1110 @@
+//! Types for the OpenAI Responses API.
+
+use std::collections::BTreeMap;
+
+use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
+
+use crate::error::ApiError;
+use crate::types::request::ChatMessage;
+
+fn default_temperature() -> f32 {
+    1.0
+}
+
+fn default_top_p() -> f32 {
+    1.0
+}
+
+fn default_store() -> bool {
+    true
+}
+
+fn default_parallel_tool_calls() -> bool {
+    true
+}
+
+/// Raw `input` payload for a Responses API request.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
+#[serde(untagged)]
+pub enum ResponseInput {
+    Text(String),
+    Items(Vec<serde_json::Value>),
+}
+
+/// Specific tool choice forcing a named function.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
+pub struct ResponseSpecificToolChoice {
+    #[serde(rename = "type")]
+    pub choice_type: String,
+    pub name: String,
+}
+
+/// Backwards-compatible nested tool choice form.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
+pub struct ResponseNestedSpecificToolChoice {
+    #[serde(rename = "type")]
+    pub choice_type: String,
+    pub function: ResponseSpecificToolChoiceFunction,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
+pub struct ResponseSpecificToolChoiceFunction {
+    pub name: String,
+}
+
+/// Tool choice for Responses requests and responses.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
+#[serde(untagged)]
+pub enum ResponseToolChoice {
+    Mode(String),
+    Specific(ResponseSpecificToolChoice),
+    NestedSpecific(ResponseNestedSpecificToolChoice),
+}
+
+impl ResponseToolChoice {
+    pub fn validate(&self) -> Result<(), ApiError> {
+        match self {
+            Self::Mode(mode) => {
+                if !["auto", "none", "required"].contains(&mode.as_str()) {
+                    return Err(ApiError::InvalidRequest(format!(
+                        "invalid tool_choice mode '{}', expected auto/none/required",
+                        mode
+                    )));
+                }
+                Ok(())
+            }
+            Self::Specific(choice) => {
+                if choice.choice_type != "function" {
+                    return Err(ApiError::InvalidRequest(format!(
+                        "unsupported tool_choice type '{}'",
+                        choice.choice_type
+                    )));
+                }
+                if choice.name.is_empty() {
+                    return Err(ApiError::InvalidRequest(
+                        "tool_choice function name must not be empty".into(),
+                    ));
+                }
+                Ok(())
+            }
+            Self::NestedSpecific(choice) => {
+                if choice.choice_type != "function" {
+                    return Err(ApiError::InvalidRequest(format!(
+                        "unsupported tool_choice type '{}'",
+                        choice.choice_type
+                    )));
+                }
+                if choice.function.name.is_empty() {
+                    return Err(ApiError::InvalidRequest(
+                        "tool_choice function name must not be empty".into(),
+                    ));
+                }
+                Ok(())
+            }
+        }
+    }
+
+    pub fn is_none_mode(&self) -> bool {
+        matches!(self, Self::Mode(mode) if mode == "none")
+    }
+
+    pub fn forced_tool_name(&self) -> Option<&str> {
+        match self {
+            Self::Specific(choice) => Some(choice.name.as_str()),
+            Self::NestedSpecific(choice) => Some(choice.function.name.as_str()),
+            Self::Mode(_) => None,
+        }
+    }
+}
+
+/// Supported custom function tool definition for Responses.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
+pub struct ResponseFunctionTool {
+    #[serde(rename = "type")]
+    pub tool_type: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parameters: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strict: Option<bool>,
+}
+
+impl ResponseFunctionTool {
+    pub fn from_value(value: &serde_json::Value) -> Result<Self, ApiError> {
+        let tool: Self = serde_json::from_value(value.clone())?;
+        if tool.tool_type != "function" {
+            return Err(ApiError::InvalidRequest(format!(
+                "responses tool type '{}' is not supported yet",
+                tool.tool_type
+            )));
+        }
+        if tool.name.is_empty() {
+            return Err(ApiError::InvalidRequest(
+                "responses function tool name must not be empty".into(),
+            ));
+        }
+        Ok(tool)
+    }
+
+    pub fn to_tool_definition(&self) -> rvllm_tokenizer::ToolDefinition {
+        rvllm_tokenizer::ToolDefinition {
+            tool_type: self.tool_type.clone(),
+            function: rvllm_tokenizer::FunctionDefinition {
+                name: self.name.clone(),
+                description: self.description.clone(),
+                parameters: self
+                    .parameters
+                    .as_ref()
+                    .and_then(|p| serde_json::from_value(p.clone()).ok()),
+            },
+        }
+    }
+}
+
+/// Create a model response request body.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CreateResponseRequest {
+    pub model: String,
+    #[serde(default)]
+    pub input: Option<ResponseInput>,
+    #[serde(default)]
+    pub instructions: Option<String>,
+    #[serde(default)]
+    pub max_output_tokens: Option<usize>,
+    #[serde(default = "default_temperature")]
+    pub temperature: f32,
+    #[serde(default = "default_top_p")]
+    pub top_p: f32,
+    #[serde(default)]
+    pub stream: bool,
+    #[serde(default = "default_store")]
+    pub store: bool,
+    #[serde(default)]
+    pub previous_response_id: Option<String>,
+    #[serde(default)]
+    pub metadata: BTreeMap<String, String>,
+    #[serde(default)]
+    pub background: Option<bool>,
+    #[serde(default)]
+    pub tools: Option<Vec<serde_json::Value>>,
+    #[serde(default)]
+    pub tool_choice: Option<ResponseToolChoice>,
+    #[serde(default = "default_parallel_tool_calls")]
+    pub parallel_tool_calls: bool,
+    #[serde(default)]
+    pub text: Option<serde_json::Value>,
+    #[serde(default)]
+    pub reasoning: Option<serde_json::Value>,
+    #[serde(default)]
+    pub conversation: Option<serde_json::Value>,
+    #[serde(default)]
+    pub include: Option<Vec<String>>,
+    #[serde(default)]
+    pub truncation: Option<String>,
+}
+
+/// A text input part inside a message item.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
+pub struct ResponseInputTextPart {
+    #[serde(rename = "type")]
+    pub part_type: String,
+    pub text: String,
+}
+
+impl ResponseInputTextPart {
+    pub fn new(text: impl Into<String>) -> Self {
+        Self {
+            part_type: "input_text".to_string(),
+            text: text.into(),
+        }
+    }
+}
+
+/// A message item stored in Responses input.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
+pub struct ResponseInputMessage {
+    pub role: String,
+    pub content: Vec<ResponseInputTextPart>,
+}
+
+impl ResponseInputMessage {
+    pub fn new(role: impl Into<String>, content: Vec<ResponseInputTextPart>) -> Self {
+        Self {
+            role: role.into(),
+            content,
+        }
+    }
+
+    pub fn to_chat_message(&self) -> ChatMessage {
+        ChatMessage {
+            role: self.role.clone(),
+            content: self.content.iter().map(|part| part.text.as_str()).collect(),
+        }
+    }
+}
+
+/// Tool output item supplied back to the model on a follow-up turn.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
+pub struct ResponseFunctionCallOutputItem {
+    pub call_id: String,
+    pub output: serde_json::Value,
+}
+
+impl ResponseFunctionCallOutputItem {
+    pub fn output_text(&self) -> String {
+        match &self.output {
+            serde_json::Value::String(text) => text.clone(),
+            other => serde_json::to_string(other).unwrap_or_else(|_| "null".to_string()),
+        }
+    }
+}
+
+/// Supported normalized input items.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
+#[serde(tag = "type")]
+pub enum ResponseInputItem {
+    #[serde(rename = "message")]
+    Message(ResponseInputMessage),
+    #[serde(rename = "function_call_output")]
+    FunctionCallOutput(ResponseFunctionCallOutputItem),
+}
+
+/// Details about cached prompt tokens.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
+pub struct ResponseInputTokensDetails {
+    pub cached_tokens: usize,
+}
+
+/// Details about generated output tokens.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
+pub struct ResponseOutputTokensDetails {
+    pub reasoning_tokens: usize,
+}
+
+/// Token accounting for a Response object.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
+pub struct ResponseUsage {
+    pub input_tokens: usize,
+    pub input_tokens_details: ResponseInputTokensDetails,
+    pub output_tokens: usize,
+    pub output_tokens_details: ResponseOutputTokensDetails,
+    pub total_tokens: usize,
+}
+
+impl ResponseUsage {
+    pub fn from_request_output(output: &rvllm_core::prelude::RequestOutput) -> Self {
+        let output_tokens = output
+            .outputs
+            .iter()
+            .map(|completion| completion.token_ids.len())
+            .sum();
+        let input_tokens = output.prompt_token_ids.len();
+        Self {
+            input_tokens,
+            input_tokens_details: ResponseInputTokensDetails { cached_tokens: 0 },
+            output_tokens,
+            output_tokens_details: ResponseOutputTokensDetails {
+                reasoning_tokens: 0,
+            },
+            total_tokens: input_tokens + output_tokens,
+        }
+    }
+}
+
+/// Text format returned from a response.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
+pub struct ResponseTextFormat {
+    #[serde(rename = "type")]
+    pub format_type: String,
+}
+
+/// Text settings returned from a response.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
+pub struct ResponseTextConfig {
+    pub format: ResponseTextFormat,
+}
+
+impl Default for ResponseTextConfig {
+    fn default() -> Self {
+        Self {
+            format: ResponseTextFormat {
+                format_type: "text".to_string(),
+            },
+        }
+    }
+}
+
+/// Reasoning summary object present on the top-level response.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema, Default)]
+pub struct ResponseReasoningSummary {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<serde_json::Value>,
+}
+
+/// Output text content returned by the assistant.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
+pub struct ResponseOutputText {
+    #[serde(rename = "type")]
+    pub part_type: String,
+    pub text: String,
+    pub annotations: Vec<serde_json::Value>,
+}
+
+impl ResponseOutputText {
+    pub fn new(text: impl Into<String>) -> Self {
+        Self {
+            part_type: "output_text".to_string(),
+            text: text.into(),
+            annotations: Vec::new(),
+        }
+    }
+}
+
+/// Assistant message item returned in `output`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
+pub struct ResponseOutputMessage {
+    pub id: String,
+    pub status: String,
+    pub role: String,
+    pub content: Vec<ResponseOutputText>,
+}
+
+impl ResponseOutputMessage {
+    pub fn in_progress(id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            status: "in_progress".to_string(),
+            role: "assistant".to_string(),
+            content: Vec::new(),
+        }
+    }
+
+    pub fn completed(id: impl Into<String>, text: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            status: "completed".to_string(),
+            role: "assistant".to_string(),
+            content: vec![ResponseOutputText::new(text)],
+        }
+    }
+
+    pub fn to_chat_message(&self) -> ChatMessage {
+        ChatMessage {
+            role: self.role.clone(),
+            content: self.content.iter().map(|part| part.text.as_str()).collect(),
+        }
+    }
+}
+
+/// Function call item returned in `output`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
+pub struct ResponseFunctionCallItem {
+    pub id: String,
+    pub call_id: String,
+    pub name: String,
+    pub arguments: String,
+    pub status: String,
+}
+
+impl ResponseFunctionCallItem {
+    pub fn in_progress(
+        id: impl Into<String>,
+        call_id: impl Into<String>,
+        name: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            call_id: call_id.into(),
+            name: name.into(),
+            arguments: String::new(),
+            status: "in_progress".to_string(),
+        }
+    }
+
+    pub fn completed(
+        id: impl Into<String>,
+        call_id: impl Into<String>,
+        name: impl Into<String>,
+        arguments: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            call_id: call_id.into(),
+            name: name.into(),
+            arguments: arguments.into(),
+            status: "completed".to_string(),
+        }
+    }
+}
+
+/// Supported normalized output items.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
+#[serde(tag = "type")]
+pub enum ResponseOutputItem {
+    #[serde(rename = "message")]
+    Message(ResponseOutputMessage),
+    #[serde(rename = "function_call")]
+    FunctionCall(ResponseFunctionCallItem),
+}
+
+/// Response object returned by the Responses API.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
+pub struct ResponseObject {
+    pub id: String,
+    pub object: String,
+    pub created_at: u64,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub incomplete_details: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<usize>,
+    pub model: String,
+    pub output: Vec<ResponseOutputItem>,
+    pub parallel_tool_calls: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_response_id: Option<String>,
+    pub reasoning: ResponseReasoningSummary,
+    pub store: bool,
+    pub temperature: f32,
+    pub text: ResponseTextConfig,
+    pub tool_choice: ResponseToolChoice,
+    pub tools: Vec<serde_json::Value>,
+    pub top_p: f32,
+    pub truncation: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<ResponseUsage>,
+    pub metadata: BTreeMap<String, String>,
+}
+
+impl ResponseObject {
+    #[allow(clippy::too_many_arguments)]
+    pub fn in_progress(
+        id: impl Into<String>,
+        model: impl Into<String>,
+        instructions: Option<String>,
+        max_output_tokens: Option<usize>,
+        previous_response_id: Option<String>,
+        store: bool,
+        temperature: f32,
+        top_p: f32,
+        metadata: BTreeMap<String, String>,
+        parallel_tool_calls: bool,
+        tool_choice: ResponseToolChoice,
+        tools: Vec<serde_json::Value>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            object: "response".to_string(),
+            created_at: now_seconds(),
+            status: "in_progress".to_string(),
+            completed_at: None,
+            error: None,
+            incomplete_details: None,
+            instructions,
+            max_output_tokens,
+            model: model.into(),
+            output: Vec::new(),
+            parallel_tool_calls,
+            previous_response_id,
+            reasoning: ResponseReasoningSummary::default(),
+            store,
+            temperature,
+            text: ResponseTextConfig::default(),
+            tool_choice,
+            tools,
+            top_p,
+            truncation: "disabled".to_string(),
+            usage: None,
+            metadata,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn completed(
+        id: impl Into<String>,
+        model: impl Into<String>,
+        instructions: Option<String>,
+        max_output_tokens: Option<usize>,
+        previous_response_id: Option<String>,
+        store: bool,
+        temperature: f32,
+        top_p: f32,
+        metadata: BTreeMap<String, String>,
+        output: Vec<ResponseOutputItem>,
+        usage: ResponseUsage,
+        parallel_tool_calls: bool,
+        tool_choice: ResponseToolChoice,
+        tools: Vec<serde_json::Value>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            object: "response".to_string(),
+            created_at: now_seconds(),
+            status: "completed".to_string(),
+            completed_at: Some(now_seconds()),
+            error: None,
+            incomplete_details: None,
+            instructions,
+            max_output_tokens,
+            model: model.into(),
+            output,
+            parallel_tool_calls,
+            previous_response_id,
+            reasoning: ResponseReasoningSummary::default(),
+            store,
+            temperature,
+            text: ResponseTextConfig::default(),
+            tool_choice,
+            tools,
+            top_p,
+            truncation: "disabled".to_string(),
+            usage: Some(usage),
+            metadata,
+        }
+    }
+}
+
+/// Response list wrapper used by `/input_items`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
+pub struct ResponseInputItemsList {
+    pub object: String,
+    pub data: Vec<ResponseInputItem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_id: Option<String>,
+    pub has_more: bool,
+}
+
+impl CreateResponseRequest {
+    pub fn validate(&self) -> Result<(), ApiError> {
+        if self.model.is_empty() {
+            return Err(ApiError::InvalidRequest("model is required".into()));
+        }
+        if self.background == Some(true) {
+            return Err(ApiError::InvalidRequest(
+                "background responses are not supported".into(),
+            ));
+        }
+        let tools = self.normalize_function_tools()?;
+        if let Some(tool_choice) = &self.tool_choice {
+            tool_choice.validate()?;
+            if tools.is_empty() && !tool_choice.is_none_mode() {
+                return Err(ApiError::InvalidRequest(
+                    "tool_choice requires at least one function tool".into(),
+                ));
+            }
+            if let Some(forced_name) = tool_choice.forced_tool_name() {
+                if !tools.iter().any(|tool| tool.name == forced_name) {
+                    return Err(ApiError::InvalidRequest(format!(
+                        "tool_choice references unknown tool '{}'",
+                        forced_name
+                    )));
+                }
+            }
+        }
+        if self.text.is_some() {
+            return Err(ApiError::InvalidRequest(
+                "structured text output is not supported on /v1/responses yet".into(),
+            ));
+        }
+        if self.reasoning.is_some() {
+            return Err(ApiError::InvalidRequest(
+                "reasoning configuration is not supported on /v1/responses yet".into(),
+            ));
+        }
+        if self.conversation.is_some() {
+            return Err(ApiError::InvalidRequest(
+                "conversation state objects are not supported on /v1/responses yet".into(),
+            ));
+        }
+        if self.include.is_some() {
+            return Err(ApiError::InvalidRequest(
+                "include options are not supported on /v1/responses yet".into(),
+            ));
+        }
+        if let Some(truncation) = &self.truncation {
+            if truncation != "disabled" {
+                return Err(ApiError::InvalidRequest(
+                    "only truncation='disabled' is supported".into(),
+                ));
+            }
+        }
+        if let Some(max_output_tokens) = self.max_output_tokens {
+            if max_output_tokens == 0 {
+                return Err(ApiError::InvalidRequest(
+                    "max_output_tokens must be greater than 0".into(),
+                ));
+            }
+        }
+        if self.temperature < 0.0 || self.temperature > 2.0 {
+            return Err(ApiError::InvalidRequest(
+                "temperature must be between 0.0 and 2.0".into(),
+            ));
+        }
+        if self.top_p < 0.0 || self.top_p > 1.0 {
+            return Err(ApiError::InvalidRequest(
+                "top_p must be between 0.0 and 1.0".into(),
+            ));
+        }
+        if self.input.is_none() && self.previous_response_id.is_none() {
+            return Err(ApiError::InvalidRequest(
+                "input is required unless previous_response_id is provided".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn normalize_function_tools(&self) -> Result<Vec<ResponseFunctionTool>, ApiError> {
+        self.tools
+            .as_ref()
+            .map(|tools| tools.iter().map(ResponseFunctionTool::from_value).collect())
+            .unwrap_or_else(|| Ok(Vec::new()))
+    }
+
+    pub fn effective_tool_choice(&self) -> ResponseToolChoice {
+        if let Some(choice) = &self.tool_choice {
+            return choice.clone();
+        }
+        if self.tools_enabled() {
+            ResponseToolChoice::Mode("auto".to_string())
+        } else {
+            ResponseToolChoice::Mode("none".to_string())
+        }
+    }
+
+    pub fn tools_enabled(&self) -> bool {
+        self.tools.as_ref().is_some_and(|tools| !tools.is_empty())
+            && !matches!(self.tool_choice.as_ref(), Some(choice) if choice.is_none_mode())
+    }
+
+    pub fn to_sampling_params(&self) -> rvllm_core::prelude::SamplingParams {
+        rvllm_core::prelude::SamplingParams {
+            temperature: self.temperature,
+            top_p: self.top_p,
+            max_tokens: self.max_output_tokens.unwrap_or(256),
+            ..Default::default()
+        }
+    }
+
+    pub fn normalize_input_items(&self) -> Result<Vec<ResponseInputItem>, ApiError> {
+        match &self.input {
+            None => Ok(Vec::new()),
+            Some(ResponseInput::Text(text)) => {
+                if text.is_empty() {
+                    return Err(ApiError::InvalidRequest("input must not be empty".into()));
+                }
+                Ok(vec![ResponseInputItem::Message(ResponseInputMessage::new(
+                    "user",
+                    vec![ResponseInputTextPart::new(text.clone())],
+                ))])
+            }
+            Some(ResponseInput::Items(items)) => {
+                if items.is_empty() {
+                    return Err(ApiError::InvalidRequest("input must not be empty".into()));
+                }
+                items.iter().map(normalize_input_item).collect()
+            }
+        }
+    }
+}
+
+fn normalize_input_item(value: &serde_json::Value) -> Result<ResponseInputItem, ApiError> {
+    let Some(map) = value.as_object() else {
+        return Err(ApiError::InvalidRequest(
+            "responses input items must be objects".into(),
+        ));
+    };
+
+    match map
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("message")
+    {
+        "message" => Ok(ResponseInputItem::Message(normalize_message_item(value)?)),
+        "function_call_output" => Ok(ResponseInputItem::FunctionCallOutput(
+            normalize_function_call_output_item(value)?,
+        )),
+        item_type => Err(ApiError::InvalidRequest(format!(
+            "responses input item type '{}' is not supported yet",
+            item_type
+        ))),
+    }
+}
+
+fn normalize_message_item(value: &serde_json::Value) -> Result<ResponseInputMessage, ApiError> {
+    let Some(map) = value.as_object() else {
+        return Err(ApiError::InvalidRequest(
+            "responses input items must be objects".into(),
+        ));
+    };
+
+    let role = map
+        .get("role")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| ApiError::InvalidRequest("responses input items require a role".into()))?;
+    if role.is_empty() {
+        return Err(ApiError::InvalidRequest(
+            "responses input item role must not be empty".into(),
+        ));
+    }
+
+    let content = map.get("content").ok_or_else(|| {
+        ApiError::InvalidRequest("responses input message items require content".into())
+    })?;
+
+    Ok(ResponseInputMessage::new(
+        role,
+        normalize_input_parts(content)?,
+    ))
+}
+
+fn normalize_function_call_output_item(
+    value: &serde_json::Value,
+) -> Result<ResponseFunctionCallOutputItem, ApiError> {
+    let Some(map) = value.as_object() else {
+        return Err(ApiError::InvalidRequest(
+            "responses input items must be objects".into(),
+        ));
+    };
+    let call_id = map
+        .get("call_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            ApiError::InvalidRequest("function_call_output items require call_id".into())
+        })?;
+    if call_id.is_empty() {
+        return Err(ApiError::InvalidRequest(
+            "function_call_output call_id must not be empty".into(),
+        ));
+    }
+    let output = map.get("output").cloned().ok_or_else(|| {
+        ApiError::InvalidRequest("function_call_output items require output".into())
+    })?;
+    Ok(ResponseFunctionCallOutputItem {
+        call_id: call_id.to_string(),
+        output,
+    })
+}
+
+fn normalize_input_parts(
+    value: &serde_json::Value,
+) -> Result<Vec<ResponseInputTextPart>, ApiError> {
+    match value {
+        serde_json::Value::String(text) => {
+            if text.is_empty() {
+                return Err(ApiError::InvalidRequest(
+                    "responses input text must not be empty".into(),
+                ));
+            }
+            Ok(vec![ResponseInputTextPart::new(text.clone())])
+        }
+        serde_json::Value::Array(parts) => {
+            if parts.is_empty() {
+                return Err(ApiError::InvalidRequest(
+                    "responses input content must not be empty".into(),
+                ));
+            }
+            parts
+                .iter()
+                .map(|part| {
+                    let Some(part_map) = part.as_object() else {
+                        return Err(ApiError::InvalidRequest(
+                            "responses input content parts must be objects".into(),
+                        ));
+                    };
+                    let Some(part_type) = part_map.get("type").and_then(serde_json::Value::as_str)
+                    else {
+                        return Err(ApiError::InvalidRequest(
+                            "responses input content parts require a type".into(),
+                        ));
+                    };
+                    if part_type != "input_text" {
+                        return Err(ApiError::InvalidRequest(format!(
+                            "responses input content part type '{}' is not supported yet",
+                            part_type
+                        )));
+                    }
+                    let text = part_map
+                        .get("text")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| {
+                            ApiError::InvalidRequest("input_text parts require a text field".into())
+                        })?;
+                    if text.is_empty() {
+                        return Err(ApiError::InvalidRequest(
+                            "responses input text must not be empty".into(),
+                        ));
+                    }
+                    Ok(ResponseInputTextPart::new(text.to_string()))
+                })
+                .collect()
+        }
+        _ => Err(ApiError::InvalidRequest(
+            "responses input content must be a string or array of content parts".into(),
+        )),
+    }
+}
+
+fn now_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_string_input() {
+        let req = CreateResponseRequest {
+            model: "test".into(),
+            input: Some(ResponseInput::Text("Hello".into())),
+            instructions: None,
+            max_output_tokens: None,
+            temperature: 1.0,
+            top_p: 1.0,
+            stream: false,
+            store: true,
+            previous_response_id: None,
+            metadata: BTreeMap::new(),
+            background: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: true,
+            text: None,
+            reasoning: None,
+            conversation: None,
+            include: None,
+            truncation: None,
+        };
+        let input = req.normalize_input_items().unwrap();
+        assert_eq!(
+            input,
+            vec![ResponseInputItem::Message(ResponseInputMessage::new(
+                "user",
+                vec![ResponseInputTextPart::new("Hello")]
+            ))]
+        );
+    }
+
+    #[test]
+    fn normalize_message_item_input() {
+        let req = CreateResponseRequest {
+            model: "test".into(),
+            input: Some(ResponseInput::Items(vec![serde_json::json!({
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "Hello"},
+                    {"type": "input_text", "text": " there"},
+                ]
+            })])),
+            instructions: None,
+            max_output_tokens: None,
+            temperature: 1.0,
+            top_p: 1.0,
+            stream: false,
+            store: true,
+            previous_response_id: None,
+            metadata: BTreeMap::new(),
+            background: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: true,
+            text: None,
+            reasoning: None,
+            conversation: None,
+            include: None,
+            truncation: None,
+        };
+        let input = req.normalize_input_items().unwrap();
+        match &input[0] {
+            ResponseInputItem::Message(message) => {
+                assert_eq!(message.content.len(), 2);
+                assert_eq!(message.to_chat_message().content, "Hello there");
+            }
+            _ => panic!("expected message item"),
+        }
+    }
+
+    #[test]
+    fn normalize_function_call_output_input() {
+        let req = CreateResponseRequest {
+            model: "test".into(),
+            input: Some(ResponseInput::Items(vec![serde_json::json!({
+                "type": "function_call_output",
+                "call_id": "call_123",
+                "output": {"ok": true}
+            })])),
+            instructions: None,
+            max_output_tokens: None,
+            temperature: 1.0,
+            top_p: 1.0,
+            stream: false,
+            store: true,
+            previous_response_id: None,
+            metadata: BTreeMap::new(),
+            background: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: true,
+            text: None,
+            reasoning: None,
+            conversation: None,
+            include: None,
+            truncation: None,
+        };
+        let input = req.normalize_input_items().unwrap();
+        assert_eq!(
+            input,
+            vec![ResponseInputItem::FunctionCallOutput(
+                ResponseFunctionCallOutputItem {
+                    call_id: "call_123".into(),
+                    output: serde_json::json!({"ok": true}),
+                }
+            )]
+        );
+    }
+
+    #[test]
+    fn rejects_multimodal_parts() {
+        let err = normalize_input_parts(&serde_json::json!([
+            {"type": "input_image", "image_url": "https://example.com/image.png"}
+        ]))
+        .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("responses input content part type 'input_image' is not supported yet"));
+    }
+
+    #[test]
+    fn request_accepts_function_tools() {
+        let req = CreateResponseRequest {
+            model: "test".into(),
+            input: Some(ResponseInput::Text("Hello".into())),
+            instructions: None,
+            max_output_tokens: None,
+            temperature: 1.0,
+            top_p: 1.0,
+            stream: false,
+            store: true,
+            previous_response_id: None,
+            metadata: BTreeMap::new(),
+            background: None,
+            tools: Some(vec![serde_json::json!({
+                "type": "function",
+                "name": "get_weather",
+                "description": "Get current weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "location": {"type": "string"}
+                    }
+                }
+            })]),
+            tool_choice: Some(ResponseToolChoice::Mode("auto".into())),
+            parallel_tool_calls: true,
+            text: None,
+            reasoning: None,
+            conversation: None,
+            include: None,
+            truncation: None,
+        };
+        assert!(req.validate().is_ok());
+        assert!(req.tools_enabled());
+    }
+
+    #[test]
+    fn request_rejects_built_in_tools() {
+        let req = CreateResponseRequest {
+            model: "test".into(),
+            input: Some(ResponseInput::Text("Hello".into())),
+            instructions: None,
+            max_output_tokens: None,
+            temperature: 1.0,
+            top_p: 1.0,
+            stream: false,
+            store: true,
+            previous_response_id: None,
+            metadata: BTreeMap::new(),
+            background: None,
+            tools: Some(vec![serde_json::json!({"type": "web_search_preview"})]),
+            tool_choice: None,
+            parallel_tool_calls: true,
+            text: None,
+            reasoning: None,
+            conversation: None,
+            include: None,
+            truncation: None,
+        };
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn request_rejects_unknown_forced_tool() {
+        let req = CreateResponseRequest {
+            model: "test".into(),
+            input: Some(ResponseInput::Text("Hello".into())),
+            instructions: None,
+            max_output_tokens: None,
+            temperature: 1.0,
+            top_p: 1.0,
+            stream: false,
+            store: true,
+            previous_response_id: None,
+            metadata: BTreeMap::new(),
+            background: None,
+            tools: Some(vec![serde_json::json!({
+                "type": "function",
+                "name": "get_weather"
+            })]),
+            tool_choice: Some(ResponseToolChoice::Specific(ResponseSpecificToolChoice {
+                choice_type: "function".into(),
+                name: "get_time".into(),
+            })),
+            parallel_tool_calls: true,
+            text: None,
+            reasoning: None,
+            conversation: None,
+            include: None,
+            truncation: None,
+        };
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn response_usage_maps_request_output() {
+        let output = rvllm_core::prelude::RequestOutput {
+            request_id: rvllm_core::prelude::RequestId(1),
+            prompt: "Hello".into(),
+            prompt_token_ids: vec![1, 2, 3],
+            prompt_logprobs: None,
+            outputs: vec![rvllm_core::prelude::CompletionOutput {
+                index: 0,
+                text: "world".into(),
+                token_ids: vec![4, 5],
+                cumulative_logprob: -1.0,
+                logprobs: None,
+                finish_reason: Some(rvllm_core::prelude::FinishReason::Stop),
+            }],
+            finished: true,
+        };
+        let usage = ResponseUsage::from_request_output(&output);
+        assert_eq!(usage.input_tokens, 3);
+        assert_eq!(usage.output_tokens, 2);
+        assert_eq!(usage.total_tokens, 5);
+    }
+}

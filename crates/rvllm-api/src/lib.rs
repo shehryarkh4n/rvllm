@@ -4,6 +4,7 @@
 //! Provides an axum-based HTTP server with endpoints matching the OpenAI API:
 //! - `POST /v1/completions` -- text completion
 //! - `POST /v1/chat/completions` -- chat completion
+//! - `POST /v1/responses` -- unified responses API
 //! - `POST /v1/embeddings` -- compute embeddings
 //! - `GET /v1/models` -- list available models
 //! - `POST /v1/batches` -- submit a batch of requests as JSONL

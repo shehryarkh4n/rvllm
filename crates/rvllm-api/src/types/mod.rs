@@ -2,8 +2,10 @@
 
 pub mod request;
 pub mod response;
+pub mod responses;
 pub mod streaming;
 
 pub use request::*;
 pub use response::*;
+pub use responses::*;
 pub use streaming::*;

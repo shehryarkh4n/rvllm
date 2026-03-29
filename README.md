@@ -164,6 +164,16 @@ curl http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"messages":[{"role":"user","content":"Explain quantum computing"}],"max_tokens":200}'
 
+# Responses
+curl http://localhost:8000/v1/responses \
+  -H "Content-Type: application/json" \
+  -d '{"model":"Qwen/Qwen2.5-1.5B","input":"Explain quantum computing","max_output_tokens":200}'
+
+# Responses with custom function tools
+curl http://localhost:8000/v1/responses \
+  -H "Content-Type: application/json" \
+  -d '{"model":"Qwen/Qwen2.5-1.5B","input":"What is the weather in Boston?","tools":[{"type":"function","name":"get_weather","description":"Get current weather","parameters":{"type":"object","properties":{"location":{"type":"string"}}}}],"tool_choice":"auto"}'
+
 # Streaming
 curl http://localhost:8000/v1/completions \
   -H "Content-Type: application/json" \
@@ -192,6 +202,9 @@ rvLLM implements the same OpenAI-compatible API as Python vLLM. Existing clients
 |----------|--------|--------|
 | `/v1/completions` | POST | Working (streaming + non-streaming) |
 | `/v1/chat/completions` | POST | Working (streaming + non-streaming) |
+| `/v1/responses` | POST | Working (text, stored retrieval, custom function tools, tool streaming; built-in tools not yet supported) |
+| `/v1/responses/{id}` | GET | Working for stored responses |
+| `/v1/responses/{id}/input_items` | GET | Working for stored responses |
 | `/v1/models` | GET | Working |
 | `/health` | GET | Working |
 | `/metrics` | GET | Working (Prometheus format) |
@@ -221,6 +234,14 @@ response = client.chat.completions.create(
     max_tokens=50,
 )
 print(response.choices[0].message.content)
+
+# Responses
+response = client.responses.create(
+    model="Qwen/Qwen2.5-1.5B",
+    input="Write a haiku about Rust",
+    max_output_tokens=50,
+)
+print(response.output[0].content[0].text)
 
 # Streaming
 stream = client.completions.create(

@@ -39,3 +39,5 @@ uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 axum-test = "16"
+tempfile = "3"
+tokenizers.workspace = true
