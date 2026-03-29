@@ -162,146 +162,262 @@ mod inner {
                 }
             };
 
-            // 1. Pre-attention RMSNorm f16 (fused with previous layer's residual add if available)
-            let (normed, fused_residual) = if let Some(prev_mlp) = prev_mlp_out {
-                // Fuse: hidden + prev_mlp -> norm in one kernel
-                let (n, r) = Self::fused_residual_rmsnorm_f16(
-                    &self.stream, &self.loader,
-                    hidden_f16, prev_mlp, norm_w,
-                    cfg.rms_norm_eps, num_tokens, hidden,
-                )?;
-                (n, Some(r))
-            } else {
-                // First layer: standalone norm
-                let n = Self::rms_norm_f16(
-                    &self.stream, &self.loader,
-                    hidden_f16, norm_w,
-                    cfg.rms_norm_eps, num_tokens, hidden,
-                )?;
-                (n, None)
-            };
-            // The residual stream: either the fused result or the original hidden_states
-            let residual_ref = fused_residual.as_ref().unwrap_or(hidden_f16);
-            if dbg { dbg_dump("normed", &normed, &self.stream); }
-
-            // 2. QKV projections: hgemm f16 x f16 -> f16
             let q_dim = num_heads * head_dim;
             let kv_dim = num_kv_heads * head_dim;
             let qkv_dim = q_dim + kv_dim + kv_dim;
+            let q_end = num_tokens * q_dim;
+            let k_end = q_end + num_tokens * kv_dim;
 
-            // Fused QKV GEMM outputs [T, qkv_dim] where each row is [Q_t, K_t, V_t].
-            // The downstream split (slice at q_end, k_end) assumes [all_Q | all_K | all_V].
-            // These layouts match only when T=1. For T>1 (prefill), use unfused path.
-            let mut qkv = if let Some(fused_qkv) = weights.fused_qkv {
-                if num_tokens == 1 {
-                    // T=1: [1, qkv_dim] = [Q | K | V], split is correct
-                    Self::hgemm_dispatch(&self.stream, blas, lt, &normed, fused_qkv, num_tokens, qkv_dim, hidden, &self.loader)?
+            // ================================================================
+            // T=1 DECODE: maximally fused path
+            // Fuses: add+norm+QKV GEMV, bias, RoPE+cache_write, attn, add+norm+gateup, silu+down
+            // ================================================================
+            if num_tokens == 1 && !input.is_prefill {
+                // --- Step 1+2: Fused add+norm+QKV GEMV or norm+QKV GEMV ---
+                let (mut qkv, residual_ref) = if let Some(prev_mlp) = prev_mlp_out {
+                    // Try fused add+norm+QKV GEMV (3-way: add + norm + projection)
+                    let fused_qkv_w = weights.fused_qkv.unwrap_or(weights.q_proj);
+                    if let Ok(ref fk) = self.loader.get_func("fused_add_norm_qkv", "fused_cute_add_norm_qkv_gemv") {
+                        let mut qkv_out = unsafe { self.stream.alloc::<f16>(qkv_dim) }
+                            .map_err(|e| LLMError::GpuError(format!("fused qkv alloc: {e}")))?;
+                        let mut residual_out = unsafe { self.stream.alloc::<f16>(hidden) }
+                            .map_err(|e| LLMError::GpuError(format!("fused residual alloc: {e}")))?;
+                        let smem = (hidden * 4 + 8 * 4) as u32;
+                        let rpb = 8u32;
+                        if smem > 49152 {
+                            fk.set_attribute(cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem as i32)
+                                .map_err(|e| LLMError::GpuError(format!("smem attr: {e}")))?;
+                        }
+                        unsafe {
+                            self.stream.launch_builder(fk)
+                                .arg(&mut qkv_out).arg(&mut residual_out)
+                                .arg(hidden_f16).arg(prev_mlp).arg(norm_w).arg(fused_qkv_w)
+                                .arg(&cfg.rms_norm_eps).arg(&(hidden as i32)).arg(&(qkv_dim as i32))
+                                .launch(LaunchConfig { grid_dim: ((qkv_dim as u32 + rpb - 1) / rpb, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: smem })
+                                .map_err(|e| LLMError::GpuError(format!("fused add_norm_qkv: {e}")))?;
+                        }
+                        (qkv_out, residual_out)
+                    } else {
+                        // Fallback: separate add+norm then QKV
+                        let (normed, residual) = Self::fused_residual_rmsnorm_f16(
+                            &self.stream, &self.loader, hidden_f16, prev_mlp, norm_w,
+                            cfg.rms_norm_eps, num_tokens, hidden)?;
+                        let qkv = Self::hgemm_dispatch(&self.stream, blas, lt, &normed, fused_qkv_w, 1, qkv_dim, hidden, &self.loader)?;
+                        (qkv, residual)
+                    }
                 } else {
-                    // T>1: fused GEMM gives [T, qkv_dim] with interleaved Q/K/V per row.
-                    // Use individual weight projections for correct [all_Q | all_K | all_V] layout.
-                    let mut qkv_buf = unsafe { self.stream.alloc::<f16>(num_tokens * qkv_dim) }
-                        .map_err(|e| LLMError::GpuError(format!("qkv f16 alloc: {e}")))?;
-                    let q_end_t = num_tokens * q_dim;
-                    let k_end_t = q_end_t + num_tokens * kv_dim;
-                    {
-                        let mut q_dst = qkv_buf.slice_mut(..q_end_t);
-                        blas.hgemm_into(num_tokens, q_dim, hidden, 1.0, &normed, weights.q_proj, 0.0, &mut q_dst)?;
+                    // First layer: norm+QKV GEMV
+                    let fused_qkv_w = weights.fused_qkv.unwrap_or(weights.q_proj);
+                    if let Ok(ref fk) = self.loader.get_func("fused_norm_qkv", "fused_cute_norm_qkv_gemv") {
+                        let mut qkv_out = unsafe { self.stream.alloc::<f16>(qkv_dim) }
+                            .map_err(|e| LLMError::GpuError(format!("fused qkv alloc: {e}")))?;
+                        let smem = (hidden * 4 + 8 * 4) as u32;
+                        let rpb = 8u32;
+                        if smem > 49152 {
+                            fk.set_attribute(cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem as i32)
+                                .map_err(|e| LLMError::GpuError(format!("smem attr: {e}")))?;
+                        }
+                        unsafe {
+                            self.stream.launch_builder(fk)
+                                .arg(&mut qkv_out).arg(hidden_f16).arg(norm_w).arg(fused_qkv_w)
+                                .arg(&cfg.rms_norm_eps).arg(&(hidden as i32)).arg(&(qkv_dim as i32))
+                                .launch(LaunchConfig { grid_dim: ((qkv_dim as u32 + rpb - 1) / rpb, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: smem })
+                                .map_err(|e| LLMError::GpuError(format!("fused norm_qkv: {e}")))?;
+                        }
+                        let residual = hidden_f16.clone();
+                        (qkv_out, residual)
+                    } else {
+                        let normed = Self::rms_norm_f16(&self.stream, &self.loader, hidden_f16, norm_w, cfg.rms_norm_eps, 1, hidden)?;
+                        let qkv = Self::hgemm_dispatch(&self.stream, blas, lt, &normed, fused_qkv_w, 1, qkv_dim, hidden, &self.loader)?;
+                        let residual = hidden_f16.clone();
+                        (qkv, residual)
                     }
-                    {
-                        let mut k_dst = qkv_buf.slice_mut(q_end_t..k_end_t);
-                        blas.hgemm_into(num_tokens, kv_dim, hidden, 1.0, &normed, weights.k_proj, 0.0, &mut k_dst)?;
-                    }
-                    {
-                        let mut v_dst = qkv_buf.slice_mut(k_end_t..);
-                        blas.hgemm_into(num_tokens, kv_dim, hidden, 1.0, &normed, weights.v_proj, 0.0, &mut v_dst)?;
-                    }
-                    qkv_buf
+                };
+
+                // --- Step 3: QKV bias (if model has it) ---
+                if let Some(bias) = weights.qkv_bias {
+                    let mut qkv_view = qkv.slice_mut(..qkv_dim);
+                    Self::add_bias_f16_view(&self.stream, &self.loader, &mut qkv_view, bias, 1, qkv_dim)?;
                 }
+
+                // --- Step 4+5: Fused RoPE + KV cache write ---
+                if let Ok(ref fk) = self.loader.get_func("fused_rope_cache", "fused_rope_cache_f16_kernel") {
+                    let (mut q_part, mut kv_rest) = qkv.split_at_mut(q_dim);
+                    let (mut k_part, v_part) = kv_rest.split_at_mut(kv_dim);
+                    let v_view = v_part.slice(..kv_dim);
+                    let half_dim = head_dim / 2;
+                    let grid_y = num_heads.max(num_kv_heads) as u32;
+                    unsafe {
+                        self.stream.launch_builder(fk)
+                            .arg(&mut q_part).arg(&mut k_part).arg(&v_view)
+                            .arg(input.key_cache).arg(input.value_cache)
+                            .arg(input.rope_cos).arg(input.rope_sin)
+                            .arg(&input.positions).arg(&input.slot_mapping)
+                            .arg(&(num_tokens as i32)).arg(&(num_heads as i32))
+                            .arg(&(num_kv_heads as i32)).arg(&(head_dim as i32))
+                            .launch(LaunchConfig { grid_dim: (num_tokens as u32, grid_y, 1), block_dim: (half_dim.min(1024) as u32, 1, 1), shared_mem_bytes: 0 })
+                            .map_err(|e| LLMError::GpuError(format!("fused rope+cache: {e}")))?;
+                    }
+                } else {
+                    // Fallback: separate RoPE then cache write
+                    {
+                        let (mut q_part, mut kv_part) = qkv.split_at_mut(q_dim);
+                        let mut k_view = kv_part.slice_mut(..kv_dim);
+                        Self::apply_rotary_embedding_f16_views(
+                            &self.stream, &self.loader, &mut q_part, &mut k_view,
+                            &input.positions, input.rope_cos, input.rope_sin,
+                            num_tokens, num_heads, num_kv_heads, head_dim)?;
+                    }
+                    {
+                        let k_view = qkv.slice(q_dim..q_dim + kv_dim);
+                        let v_view = qkv.slice(q_dim + kv_dim..);
+                        Self::cache_write_f16_views(
+                            &self.stream, &self.loader, &k_view, &v_view,
+                            input.key_cache, input.value_cache, &input.slot_mapping,
+                            num_tokens, num_kv_heads, head_dim)?;
+                    }
+                }
+
+                // --- Step 6: Attention (FA3) ---
+                let attn_out = Self::decode_attention_f16io(
+                    &self.stream, &self.loader,
+                    &qkv.slice(..q_dim),
+                    input.key_cache, input.value_cache,
+                    &input.block_tables, &input.context_lens,
+                    1, input.num_seqs, num_heads, num_kv_heads, head_dim,
+                    input.max_context_len, input.block_size)?;
+
+                // --- Step 7: O projection ---
+                let attn_proj = Self::hgemm_dispatch(&self.stream, blas, lt, &attn_out, weights.o_proj, 1, hidden, q_dim, &self.loader)?;
+
+                // --- Steps 8-10: Fused add+norm+gateup + silu+down (already wired) ---
+                let (residual, mlp_out) = {
+                    let fused_gateup_ok = self.loader.get_func("fused_add_norm_gateup", "fused_cute_add_norm_gateup_gemv").ok();
+                    if let Some(ref fk) = fused_gateup_ok {
+                        let gate_up_dim = intermediate * 2;
+                        let mut gate_up_out = unsafe { self.stream.alloc::<f16>(gate_up_dim) }
+                            .map_err(|e| LLMError::GpuError(format!("fused gateup alloc: {e}")))?;
+                        let mut residual_out2 = unsafe { self.stream.alloc::<f16>(hidden) }
+                            .map_err(|e| LLMError::GpuError(format!("fused residual alloc: {e}")))?;
+                        let smem = (hidden * 4 + 8 * 4) as u32;
+                        let fused_gate_up_w = weights.fused_gate_up.unwrap_or(weights.gate_proj);
+                        let rpb = 8u32;
+                        if smem > 49152 {
+                            fk.set_attribute(cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem as i32)
+                                .map_err(|e| LLMError::GpuError(format!("smem attr: {e}")))?;
+                        }
+                        unsafe {
+                            self.stream.launch_builder(fk)
+                                .arg(&mut gate_up_out).arg(&mut residual_out2)
+                                .arg(&residual_ref).arg(&attn_proj).arg(post_norm_w).arg(fused_gate_up_w)
+                                .arg(&cfg.rms_norm_eps).arg(&(hidden as i32)).arg(&(gate_up_dim as i32))
+                                .launch(LaunchConfig { grid_dim: ((gate_up_dim as u32 + rpb - 1) / rpb, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: smem })
+                                .map_err(|e| LLMError::GpuError(format!("fused add_norm_gateup: {e}")))?;
+                        }
+                        let gate = gate_up_out.slice(..intermediate);
+                        let up = gate_up_out.slice(intermediate..gate_up_dim);
+                        // Fused silu+down GEMV
+                        let mlp = if let Ok(ref sk) = self.loader.get_func("fused_silu_down", "fused_cute_silu_down_gemv") {
+                            let mut down_out = unsafe { self.stream.alloc::<f16>(hidden) }
+                                .map_err(|e| LLMError::GpuError(format!("fused silu_down alloc: {e}")))?;
+                            let sk_smem = (8 * 4) as u32;
+                            unsafe {
+                                self.stream.launch_builder(sk)
+                                    .arg(&mut down_out).arg(&gate).arg(&up).arg(weights.down_proj)
+                                    .arg(&(hidden as i32)).arg(&(intermediate as i32))
+                                    .launch(LaunchConfig { grid_dim: (((hidden as u32) + 7) / 8, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: sk_smem })
+                                    .map_err(|e| LLMError::GpuError(format!("fused silu_down: {e}")))?;
+                            }
+                            down_out
+                        } else {
+                            let fused_act = Self::fused_silu_mul_f16_split(&self.stream, &self.loader, &gate_up_out, intermediate)?;
+                            Self::hgemm_dispatch(&self.stream, blas, lt, &fused_act, weights.down_proj, 1, hidden, intermediate, &self.loader)?
+                        };
+                        (residual_out2, mlp)
+                    } else {
+                        let (normed2, residual2) = Self::fused_residual_rmsnorm_f16(
+                            &self.stream, &self.loader, &residual_ref, &attn_proj, post_norm_w,
+                            cfg.rms_norm_eps, 1, hidden)?;
+                        let gate_up = if let Some(fguw) = weights.fused_gate_up {
+                            Self::hgemm_dispatch(&self.stream, blas, lt, &normed2, fguw, 1, intermediate * 2, hidden, &self.loader)?
+                        } else {
+                            let g = Self::hgemm_dispatch(&self.stream, blas, lt, &normed2, weights.gate_proj, 1, intermediate, hidden, &self.loader)?;
+                            let u = Self::hgemm_dispatch(&self.stream, blas, lt, &normed2, weights.up_proj, 1, intermediate, hidden, &self.loader)?;
+                            let mut buf = unsafe { self.stream.alloc::<f16>(intermediate * 2) }
+                                .map_err(|e| LLMError::GpuError(format!("concat: {e}")))?;
+                            self.stream.memcpy_dtod(&g, &mut buf.slice_mut(..intermediate)).map_err(|e| LLMError::GpuError(format!("g: {e}")))?;
+                            self.stream.memcpy_dtod(&u, &mut buf.slice_mut(intermediate..)).map_err(|e| LLMError::GpuError(format!("u: {e}")))?;
+                            buf
+                        };
+                        let fused_act = Self::fused_silu_mul_f16_split(&self.stream, &self.loader, &gate_up, intermediate)?;
+                        let mlp = Self::hgemm_dispatch(&self.stream, blas, lt, &fused_act, weights.down_proj, 1, hidden, intermediate, &self.loader)?;
+                        (residual2, mlp)
+                    }
+                };
+                return Ok((residual, mlp_out));
+            }
+
+            // ================================================================
+            // T>1 PREFILL: unfused path (cuBLAS GEMMs, separate kernels)
+            // ================================================================
+
+            // 1. Pre-attention RMSNorm
+            let (normed, fused_residual) = if let Some(prev_mlp) = prev_mlp_out {
+                let (n, r) = Self::fused_residual_rmsnorm_f16(
+                    &self.stream, &self.loader, hidden_f16, prev_mlp, norm_w,
+                    cfg.rms_norm_eps, num_tokens, hidden)?;
+                (n, Some(r))
             } else {
+                let n = Self::rms_norm_f16(&self.stream, &self.loader, hidden_f16, norm_w,
+                    cfg.rms_norm_eps, num_tokens, hidden)?;
+                (n, None)
+            };
+            let residual_ref = fused_residual.as_ref().unwrap_or(hidden_f16);
+
+            // 2. QKV projections (unfused for T>1)
+            let mut qkv = {
                 let mut qkv_buf = unsafe { self.stream.alloc::<f16>(num_tokens * qkv_dim) }
-                    .map_err(|e| LLMError::GpuError(format!("qkv f16 alloc: {e}")))?;
-                let q_end = num_tokens * q_dim;
-                let k_end = q_end + num_tokens * kv_dim;
-                {
-                    let mut q_dst = qkv_buf.slice_mut(..q_end);
-                    blas.hgemm_into(num_tokens, q_dim, hidden, 1.0, &normed, weights.q_proj, 0.0, &mut q_dst)?;
-                }
-                {
-                    let mut k_dst = qkv_buf.slice_mut(q_end..k_end);
-                    blas.hgemm_into(num_tokens, kv_dim, hidden, 1.0, &normed, weights.k_proj, 0.0, &mut k_dst)?;
-                }
-                {
-                    let mut v_dst = qkv_buf.slice_mut(k_end..);
-                    blas.hgemm_into(num_tokens, kv_dim, hidden, 1.0, &normed, weights.v_proj, 0.0, &mut v_dst)?;
-                }
+                    .map_err(|e| LLMError::GpuError(format!("qkv alloc: {e}")))?;
+                let q_end_t = num_tokens * q_dim;
+                let k_end_t = q_end_t + num_tokens * kv_dim;
+                { let mut d = qkv_buf.slice_mut(..q_end_t); blas.hgemm_into(num_tokens, q_dim, hidden, 1.0, &normed, weights.q_proj, 0.0, &mut d)?; }
+                { let mut d = qkv_buf.slice_mut(q_end_t..k_end_t); blas.hgemm_into(num_tokens, kv_dim, hidden, 1.0, &normed, weights.k_proj, 0.0, &mut d)?; }
+                { let mut d = qkv_buf.slice_mut(k_end_t..); blas.hgemm_into(num_tokens, kv_dim, hidden, 1.0, &normed, weights.v_proj, 0.0, &mut d)?; }
                 qkv_buf
             };
 
-            if dbg { dbg_dump("qkv", &qkv, &self.stream); }
-
-            // 3. Apply fused QKV bias (f16) in-place
-            let q_end = num_tokens * q_dim;
-            let k_end = q_end + num_tokens * kv_dim;
+            // 3. QKV bias
             if let Some(bias) = weights.qkv_bias {
-                if num_tokens == 1 {
-                    // T=1: layout is [Q, K, V] per row, fused bias matches
-                    let mut qkv_view = qkv.slice_mut(..num_tokens * qkv_dim);
-                    Self::add_bias_f16_view(&self.stream, &self.loader, &mut qkv_view, bias, num_tokens, qkv_dim)?;
-                } else {
-                    // T>1: layout is [all_Q | all_K | all_V], apply bias per section.
-                    // Copy bias slices to temp CudaSlice (bias is tiny, ~2KB).
-                    let mut q_bias_buf = self.stream.alloc_zeros::<f16>(q_dim)
-                        .map_err(|e| LLMError::GpuError(format!("q_bias alloc: {e}")))?;
-                    self.stream.memcpy_dtod(&bias.slice(..q_dim), &mut q_bias_buf)
-                        .map_err(|e| LLMError::GpuError(format!("q_bias copy: {e}")))?;
-                    let mut k_bias_buf = self.stream.alloc_zeros::<f16>(kv_dim)
-                        .map_err(|e| LLMError::GpuError(format!("k_bias alloc: {e}")))?;
-                    self.stream.memcpy_dtod(&bias.slice(q_dim..q_dim + kv_dim), &mut k_bias_buf)
-                        .map_err(|e| LLMError::GpuError(format!("k_bias copy: {e}")))?;
-                    let mut v_bias_buf = self.stream.alloc_zeros::<f16>(kv_dim)
-                        .map_err(|e| LLMError::GpuError(format!("v_bias alloc: {e}")))?;
-                    self.stream.memcpy_dtod(&bias.slice(q_dim + kv_dim..qkv_dim), &mut v_bias_buf)
-                        .map_err(|e| LLMError::GpuError(format!("v_bias copy: {e}")))?;
-                    {
-                        let mut q_view = qkv.slice_mut(..q_end);
-                        Self::add_bias_f16_view(&self.stream, &self.loader, &mut q_view, &q_bias_buf, num_tokens, q_dim)?;
-                    }
-                    {
-                        let mut k_view = qkv.slice_mut(q_end..k_end);
-                        Self::add_bias_f16_view(&self.stream, &self.loader, &mut k_view, &k_bias_buf, num_tokens, kv_dim)?;
-                    }
-                    {
-                        let mut v_view = qkv.slice_mut(k_end..);
-                        Self::add_bias_f16_view(&self.stream, &self.loader, &mut v_view, &v_bias_buf, num_tokens, kv_dim)?;
-                    }
-                }
+                let mut q_bias_buf = self.stream.alloc_zeros::<f16>(q_dim).map_err(|e| LLMError::GpuError(format!("qb: {e}")))?;
+                self.stream.memcpy_dtod(&bias.slice(..q_dim), &mut q_bias_buf).map_err(|e| LLMError::GpuError(format!("qb: {e}")))?;
+                let mut k_bias_buf = self.stream.alloc_zeros::<f16>(kv_dim).map_err(|e| LLMError::GpuError(format!("kb: {e}")))?;
+                self.stream.memcpy_dtod(&bias.slice(q_dim..q_dim+kv_dim), &mut k_bias_buf).map_err(|e| LLMError::GpuError(format!("kb: {e}")))?;
+                let mut v_bias_buf = self.stream.alloc_zeros::<f16>(kv_dim).map_err(|e| LLMError::GpuError(format!("vb: {e}")))?;
+                self.stream.memcpy_dtod(&bias.slice(q_dim+kv_dim..qkv_dim), &mut v_bias_buf).map_err(|e| LLMError::GpuError(format!("vb: {e}")))?;
+                { let mut v = qkv.slice_mut(..q_end); Self::add_bias_f16_view(&self.stream, &self.loader, &mut v, &q_bias_buf, num_tokens, q_dim)?; }
+                { let mut v = qkv.slice_mut(q_end..k_end); Self::add_bias_f16_view(&self.stream, &self.loader, &mut v, &k_bias_buf, num_tokens, kv_dim)?; }
+                { let mut v = qkv.slice_mut(k_end..); Self::add_bias_f16_view(&self.stream, &self.loader, &mut v, &v_bias_buf, num_tokens, kv_dim)?; }
             }
 
-            // 4. RoPE f16 in-place on Q and K regions (split_at_mut avoids double borrow)
+            // 4. RoPE
             {
                 let (mut q_part, mut kv_part) = qkv.split_at_mut(q_end);
                 let mut k_view = kv_part.slice_mut(..num_tokens * kv_dim);
-                Self::apply_rotary_embedding_f16_views(
-                    &self.stream, &self.loader,
-                    &mut q_part, &mut k_view,
-                    &input.positions, input.rope_cos, input.rope_sin,
-                    num_tokens, num_heads, num_kv_heads, head_dim,
-                )?;
+                Self::apply_rotary_embedding_f16_views(&self.stream, &self.loader,
+                    &mut q_part, &mut k_view, &input.positions, input.rope_cos, input.rope_sin,
+                    num_tokens, num_heads, num_kv_heads, head_dim)?;
             }
 
-            // 5. KV cache write: f16 K/V -> f16 cache (pure copy, no conversion)
+            // 5. KV cache write
             {
                 let k_view = qkv.slice(q_end..k_end);
                 let v_view = qkv.slice(k_end..);
-                Self::cache_write_f16_views(
-                    &self.stream, &self.loader,
-                    &k_view, &v_view,
+                Self::cache_write_f16_views(&self.stream, &self.loader, &k_view, &v_view,
                     input.key_cache, input.value_cache, &input.slot_mapping,
-                    num_tokens, num_kv_heads, head_dim,
-                )?;
+                    num_tokens, num_kv_heads, head_dim)?;
             }
 
-            // 6. Attention: f16 Q, f16 KV cache, f16 output
+            // 6. Attention
             let attn_out = if input.is_prefill {
                 // Prefill uses f32 Q kernel (prefill is one-shot, not perf-critical)
                 // Fall back to f32 path for prefill: cast Q f16->f32, run f32 prefill, cast back
@@ -333,120 +449,17 @@ mod inner {
 
             if dbg { dbg_dump("attn_out", &attn_out, &self.stream); }
 
-            // 7. Output projection: hgemm f16
+            // 7. O projection (T>1 prefill path)
             let attn_proj = Self::hgemm_dispatch(&self.stream, blas, lt, &attn_out, weights.o_proj, num_tokens, hidden, q_dim, &self.loader)?;
-            if dbg { dbg_dump("o_proj", &attn_proj, &self.stream); }
 
-            // 8-10. Post-attention: residual add + norm + MLP
-            // For T=1 decode: try CuTE fused kernels that eliminate intermediate buffers.
-            // For T>1 prefill: use separate kernels (cuBLAS GEMM is faster).
-            let (residual, mlp_out) = if num_tokens == 1 {
-                // Try fused add+norm+gateup GEMV (3-way: saves 3 launches + 2 buffers)
-                let fused_gateup_ok = self.loader.get_func("fused_add_norm_gateup", "fused_cute_add_norm_gateup_gemv").ok();
-                if let Some(ref fk) = fused_gateup_ok {
-                    let gate_up_dim = intermediate * 2;
-                    let mut gate_up_out = unsafe { self.stream.alloc::<f16>(gate_up_dim) }
-                        .map_err(|e| LLMError::GpuError(format!("fused gateup alloc: {e}")))?;
-                    let mut residual_out = unsafe { self.stream.alloc::<f16>(hidden) }
-                        .map_err(|e| LLMError::GpuError(format!("fused residual alloc: {e}")))?;
-                    let smem = (hidden * std::mem::size_of::<f32>() + 8 * std::mem::size_of::<f32>()) as u32;
-                    let fused_gate_up_w = weights.fused_gate_up.unwrap_or(weights.gate_proj);
-                    // Warp-per-row: 8 warps = 8 rows per block
-                    let rows_per_block = 8u32;
-                    let launch_cfg = LaunchConfig {
-                        grid_dim: (((gate_up_dim as u32) + rows_per_block - 1) / rows_per_block, 1, 1),
-                        block_dim: (256, 1, 1),
-                        shared_mem_bytes: smem,
-                    };
-                    if smem > 49152 {
-                        fk.set_attribute(
-                            cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                            smem as i32,
-                        ).map_err(|e| LLMError::GpuError(format!("fused smem attr: {e}")))?;
-                    }
-                    unsafe {
-                        self.stream.launch_builder(fk)
-                            .arg(&mut gate_up_out)
-                            .arg(&mut residual_out)
-                            .arg(residual_ref)
-                            .arg(&attn_proj)
-                            .arg(post_norm_w)
-                            .arg(fused_gate_up_w)
-                            .arg(&cfg.rms_norm_eps)
-                            .arg(&(hidden as i32))
-                            .arg(&(gate_up_dim as i32))
-                            .launch(launch_cfg)
-                            .map_err(|e| LLMError::GpuError(format!("fused add_norm_gateup launch: {e}")))?;
-                    }
-                    // Now do silu*mul + down
-                    let gate = gate_up_out.slice(..intermediate);
-                    let up = gate_up_out.slice(intermediate..gate_up_dim);
-                    // Try fused silu+down GEMV
-                    let mlp = if let Ok(ref sk) = self.loader.get_func("fused_silu_down", "fused_cute_silu_down_gemv") {
-                        let mut down_out = unsafe { self.stream.alloc::<f16>(hidden) }
-                            .map_err(|e| LLMError::GpuError(format!("fused silu_down alloc: {e}")))?;
-                        let sk_smem = (8 * std::mem::size_of::<f32>()) as u32;
-                        let sk_cfg = LaunchConfig {
-                            grid_dim: (((hidden as u32) + 7) / 8, 1, 1),
-                            block_dim: (256, 1, 1),
-                            shared_mem_bytes: sk_smem,
-                        };
-                        unsafe {
-                            self.stream.launch_builder(sk)
-                                .arg(&mut down_out)
-                                .arg(&gate).arg(&up)
-                                .arg(weights.down_proj)
-                                .arg(&(hidden as i32))
-                                .arg(&(intermediate as i32))
-                                .launch(sk_cfg)
-                                .map_err(|e| LLMError::GpuError(format!("fused silu_down launch: {e}")))?;
-                        }
-                        down_out
-                    } else {
-                        let fused_act = Self::fused_silu_mul_f16_split(&self.stream, &self.loader, &gate_up_out, intermediate)?;
-                        Self::hgemm_dispatch(&self.stream, blas, lt, &fused_act, weights.down_proj, 1, hidden, intermediate, &self.loader)?
-                    };
-                    (residual_out, mlp)
-                } else {
-                    // Fallback: separate add+norm then separate gate+up GEMV
-                    let (normed2, residual) = Self::fused_residual_rmsnorm_f16(
-                        &self.stream, &self.loader,
-                        residual_ref, &attn_proj, post_norm_w,
-                        cfg.rms_norm_eps, num_tokens, hidden,
-                    )?;
-                    let gate_up = if let Some(fguw) = weights.fused_gate_up {
-                        Self::hgemm_dispatch(&self.stream, blas, lt, &normed2, fguw, 1, intermediate * 2, hidden, &self.loader)?
-                    } else {
-                        let g = Self::hgemm_dispatch(&self.stream, blas, lt, &normed2, weights.gate_proj, 1, intermediate, hidden, &self.loader)?;
-                        let u = Self::hgemm_dispatch(&self.stream, blas, lt, &normed2, weights.up_proj, 1, intermediate, hidden, &self.loader)?;
-                        // concat into one buffer
-                        let mut buf = unsafe { self.stream.alloc::<f16>(intermediate * 2) }
-                            .map_err(|e| LLMError::GpuError(format!("gate_up concat: {e}")))?;
-                        self.stream.memcpy_dtod(&g, &mut buf.slice_mut(..intermediate))
-                            .map_err(|e| LLMError::GpuError(format!("gate copy: {e}")))?;
-                        self.stream.memcpy_dtod(&u, &mut buf.slice_mut(intermediate..))
-                            .map_err(|e| LLMError::GpuError(format!("up copy: {e}")))?;
-                        buf
-                    };
-                    let fused_act = Self::fused_silu_mul_f16_split(&self.stream, &self.loader, &gate_up, intermediate)?;
-                    let mlp = Self::hgemm_dispatch(&self.stream, blas, lt, &fused_act, weights.down_proj, 1, hidden, intermediate, &self.loader)?;
-                    (residual, mlp)
-                }
-            } else {
-                // T>1: separate kernels
-                let (normed2, residual) = Self::fused_residual_rmsnorm_f16(
-                    &self.stream, &self.loader,
-                    residual_ref, &attn_proj, post_norm_w,
-                    cfg.rms_norm_eps, num_tokens, hidden,
-                )?;
-                let gate = Self::hgemm_dispatch(&self.stream, blas, lt, &normed2, weights.gate_proj, num_tokens, intermediate, hidden, &self.loader)?;
-                let up = Self::hgemm_dispatch(&self.stream, blas, lt, &normed2, weights.up_proj, num_tokens, intermediate, hidden, &self.loader)?;
-                let fused_act = Self::fused_silu_mul_f16(&self.stream, &self.loader, &gate, &up, num_tokens * intermediate)?;
-                let mlp = Self::hgemm_dispatch(&self.stream, blas, lt, &fused_act, weights.down_proj, num_tokens, hidden, intermediate, &self.loader)?;
-                (residual, mlp)
-            };
-
-            // 11. Return (residual, mlp_out) -- the add is fused into the NEXT layer's norm
+            // 8-10. Post-attention MLP (T>1 prefill only, separate kernels)
+            let (normed2, residual) = Self::fused_residual_rmsnorm_f16(
+                &self.stream, &self.loader, residual_ref, &attn_proj, post_norm_w,
+                cfg.rms_norm_eps, num_tokens, hidden)?;
+            let gate = Self::hgemm_dispatch(&self.stream, blas, lt, &normed2, weights.gate_proj, num_tokens, intermediate, hidden, &self.loader)?;
+            let up = Self::hgemm_dispatch(&self.stream, blas, lt, &normed2, weights.up_proj, num_tokens, intermediate, hidden, &self.loader)?;
+            let fused_act = Self::fused_silu_mul_f16(&self.stream, &self.loader, &gate, &up, num_tokens * intermediate)?;
+            let mlp_out = Self::hgemm_dispatch(&self.stream, blas, lt, &fused_act, weights.down_proj, num_tokens, hidden, intermediate, &self.loader)?;
             Ok((residual, mlp_out))
         }
 
