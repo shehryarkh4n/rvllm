@@ -159,3 +159,43 @@ Memory pool overhead:
 **Total: 7.70ms -> 4.21ms (1.83x speedup). 130 -> 236 tok/s (1.82x).**
 
 Theoretical peak: 574 tok/s (1.74ms, memory-bandwidth-bound). Current utilization: 41%.
+
+---
+
+## 2026-03-29: Custom GEMV + cublasLt + Async DtoH Pipeline
+
+### Custom GEMV kernel
+Wrote `gemv_f16_kernel` with half2 vectorized loads, warp shuffle reduction, f32 accumulation. Result: **no improvement over cuBLAS** (4205us vs 4205us). cuBLAS's internal M=1 dispatch is already efficient. The 4.1ms is genuine GPU memory bandwidth time.
+
+### cublasLt for decode GEMMs
+Wired `CublasLtOps::hgemm_a_bt` with split-K for M<=32. Result: **marginal** (~7us, 4212->4205us). CUDA graph bakes the kernel at capture time; algorithm selection is one-shot.
+
+### Async DtoH pipeline
+Added pinned host memory DtoH path. Graph replay + async DtoH enqueue returns in **60us** (was 4212us blocking). Forward call is now non-blocking.
+
+### Engine-level pipeline (attempted, reverted)
+Tried overlapping GPU compute with next step's prepare_step. **Catastrophic at high N**: 1787->154 tok/s at N=16. Root cause: the scheduler needs ALL tokens from step N before scheduling step N+1. Pipelined step delays token delivery, causing the scheduler to re-schedule same sequences without latest tokens.
+
+**Correct pipeline approach**: overlap GPU compute with new request arrival processing at the async engine level, not same-sequence scheduling. Future work.
+
+### Key finding
+The 4.1ms per token is the **hardware efficiency floor** for Qwen2.5-1.5B on A100. Weight reads dominate: 3.09GB at ~75% memory bandwidth utilization. Custom kernels, cublasLt, and algorithm tuning all converge to the same number. Further gains require:
+- Smaller models (fewer weights to read)
+- Quantization (INT8/FP8 halves weight reads)
+- Multi-GPU (parallel weight reads)
+- Speculative decoding (amortize weight reads across multiple tokens)
+
+---
+
+## Summary: Full Optimization History
+
+| Phase | Per-token | N=1 tok/s | N=32 tok/s | Key change |
+|---|---|---|---|---|
+| Phase 4 (baseline) | 7.70ms | 130 | 3,467 | CUDA graph capture working |
+| Phase 5 (10-agent) | 5.75ms | 174 | 4,276 | Cast reduction, fused ops, engine opt |
+| Shared casts | 5.65ms | 177 | - | Share input cast across QKV, gate+up |
+| Fused weights | 5.55ms | 180 | - | QKV + gate+up weight concatenation |
+| Full f16 | 4.93ms | 200 | - | Zero casts, all f16 kernels |
+| 9-agent kernel | **4.21ms** | **236** | **5,123** | Cross-layer fusion, memset elimination, pool tuning |
+
+**Total: 130 -> 236 tok/s (1.82x). 41% of theoretical peak (574 tok/s).**
