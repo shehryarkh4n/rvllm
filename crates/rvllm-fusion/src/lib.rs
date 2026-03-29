@@ -5,3 +5,4 @@ pub mod dispatch;
 pub mod ir;
 pub mod jit;
 pub mod matcher;
+pub mod verify;
