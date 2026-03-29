@@ -94,15 +94,15 @@ mod cuda_impl {
 
     /// Pre-allocated f16 scratch buffers for the forward pass.
     /// Sized for max_batch_tokens. Reused across all layers (sequential execution).
-    struct F16LayerScratch {
-        qkv: CudaSlice<f16>,      // [max_tokens * qkv_dim]
-        attn_out: CudaSlice<f16>, // [max_tokens * q_dim]
-        o_proj: CudaSlice<f16>,   // [max_tokens * hidden]
-        normed: CudaSlice<f16>,   // [max_tokens * hidden]
-        residual: CudaSlice<f16>, // [max_tokens * hidden]
-        gate_up: CudaSlice<f16>,  // [max_tokens * intermediate * 2]
-        silu_out: CudaSlice<f16>, // [max_tokens * intermediate]
-        down: CudaSlice<f16>,     // [max_tokens * hidden]
+    pub struct F16LayerScratch {
+        pub qkv: CudaSlice<f16>,      // [max_tokens * qkv_dim]
+        pub attn_out: CudaSlice<f16>, // [max_tokens * q_dim]
+        pub o_proj: CudaSlice<f16>,   // [max_tokens * hidden]
+        pub normed: CudaSlice<f16>,   // [max_tokens * hidden]
+        pub residual: CudaSlice<f16>, // [max_tokens * hidden]
+        pub gate_up: CudaSlice<f16>,  // [max_tokens * intermediate * 2]
+        pub silu_out: CudaSlice<f16>, // [max_tokens * intermediate]
+        pub down: CudaSlice<f16>,     // [max_tokens * hidden]
     }
 
     /// Element offsets into the packed metadata GPU buffer.
@@ -368,7 +368,7 @@ mod cuda_impl {
         /// Sized for max padded batch (256). Since all layers are processed
         /// sequentially, one set of buffers covers every layer.
         fn alloc_scratch(&mut self) -> Result<()> {
-            let max_tokens: usize = 128; // support N>32 with freed f32 memory
+            let max_tokens: usize = 512; // support up to N=512 batch decode
             let hidden = self.config.hidden_size;
             let q_dim = self.config.num_heads * self.config.head_dim;
             let kv_dim = self.config.num_kv_heads * self.config.head_dim;
@@ -827,6 +827,8 @@ mod cuda_impl {
             let meta_packed = self.meta_packed.borrow();
             let packed_buf = meta_packed.slice();
             let offsets = self.meta_packed_offsets.get();
+            let profile = std::env::var("RVLLM_PROFILE").is_ok();
+            let profile_t0 = if profile { self.stream.synchronize().ok(); Some(std::time::Instant::now()) } else { None };
             let mut prev_mlp_out: Option<CudaSlice<f16>> = None;
             for (layer_idx, layer) in self.layers.iter().enumerate() {
                 let (key_cache, value_cache) = &gpu_cache[layer_idx];
@@ -849,8 +851,18 @@ mod cuda_impl {
                 };
                 let weights = self.layer_weights(layer_idx)?;
                 let (residual, mlp_out) = layer.forward(&input, &weights, &self.blas, prev_mlp_out.as_ref(), self.cublaslt_ref())?;
+                if profile && layer_idx == 0 {
+                    self.stream.synchronize().ok();
+                    let el = profile_t0.unwrap().elapsed();
+                    info!("PROFILE layer0 N={num_tokens} {:.3}ms", el.as_secs_f64() * 1000.0);
+                }
                 hidden_f16 = residual;
                 prev_mlp_out = Some(mlp_out);
+            }
+            if let Some(t0) = profile_t0 {
+                self.stream.synchronize().ok();
+                let el = t0.elapsed();
+                info!("PROFILE all_layers N={num_tokens} {:.3}ms ({:.3}ms/layer)", el.as_secs_f64() * 1000.0, el.as_secs_f64() * 1000.0 / num_layers as f64);
             }
 
             // Final: fuse last layer's residual add with final RMSNorm
