@@ -29,6 +29,7 @@ __global__ void reshape_and_cache_f16io_kernel(
     const int tid = threadIdx.x;
     const int kv_dim = num_kv_heads * head_dim;
     const int slot = slot_mapping[token_idx];
+    if (slot < 0) return; // skip padded tokens
 
     const int cache_offset = slot * kv_dim;
     const int src_offset = token_idx * kv_dim;

@@ -115,12 +115,13 @@ impl GraphRunner {
         let mut context_lens = input.attention_metadata.context_lens.clone();
         let mut block_tables = input.attention_metadata.block_tables.clone();
 
-        // Pad with dummy entries
+        // Pad with dummy entries. Use -1 for slot_mapping so cache_write
+        // skips padded tokens (kernel checks slot >= 0).
         for _ in 0..pad_count {
             token_ids.push(0);
             position_ids.push(0);
-            slot_mapping.push(0);
-            context_lens.push(1);
+            slot_mapping.push(u32::MAX); // -1 as u32, kernel interprets as negative i32
+            context_lens.push(0); // 0 context = attention kernel skips this seq
             block_tables.push(vec![0]);
         }
 
