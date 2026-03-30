@@ -209,16 +209,61 @@ pub struct CreateResponseRequest {
 /// A text input part inside a message item.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
 pub struct ResponseInputTextPart {
-    #[serde(rename = "type")]
-    pub part_type: String,
     pub text: String,
 }
 
 impl ResponseInputTextPart {
     pub fn new(text: impl Into<String>) -> Self {
+        Self { text: text.into() }
+    }
+}
+
+/// An image input part inside a message item.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
+pub struct ResponseInputImagePart {
+    pub image_url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+impl ResponseInputImagePart {
+    pub fn new(image_url: impl Into<String>, detail: Option<String>) -> Self {
         Self {
-            part_type: "input_text".to_string(),
-            text: text.into(),
+            image_url: image_url.into(),
+            detail,
+        }
+    }
+}
+
+/// A normalized content part inside a message item.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
+#[serde(tag = "type")]
+pub enum ResponseInputContentPart {
+    #[serde(rename = "input_text")]
+    InputText(ResponseInputTextPart),
+    #[serde(rename = "input_image")]
+    InputImage(ResponseInputImagePart),
+}
+
+impl ResponseInputContentPart {
+    pub fn input_text(text: impl Into<String>) -> Self {
+        Self::InputText(ResponseInputTextPart::new(text))
+    }
+
+    pub fn input_image(image_url: impl Into<String>, detail: Option<String>) -> Self {
+        Self::InputImage(ResponseInputImagePart::new(image_url, detail))
+    }
+
+    fn to_prompt_text(&self) -> String {
+        match self {
+            Self::InputText(part) => part.text.clone(),
+            Self::InputImage(part) => match part.detail.as_deref() {
+                Some(detail) => format!(
+                    "[input_image url={} detail={}]",
+                    part.image_url, detail
+                ),
+                None => format!("[input_image url={}]", part.image_url),
+            },
         }
     }
 }
@@ -227,11 +272,11 @@ impl ResponseInputTextPart {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
 pub struct ResponseInputMessage {
     pub role: String,
-    pub content: Vec<ResponseInputTextPart>,
+    pub content: Vec<ResponseInputContentPart>,
 }
 
 impl ResponseInputMessage {
-    pub fn new(role: impl Into<String>, content: Vec<ResponseInputTextPart>) -> Self {
+    pub fn new(role: impl Into<String>, content: Vec<ResponseInputContentPart>) -> Self {
         Self {
             role: role.into(),
             content,
@@ -241,7 +286,12 @@ impl ResponseInputMessage {
     pub fn to_chat_message(&self) -> ChatMessage {
         ChatMessage {
             role: self.role.clone(),
-            content: self.content.iter().map(|part| part.text.as_str()).collect(),
+            content: self
+                .content
+                .iter()
+                .map(ResponseInputContentPart::to_prompt_text)
+                .collect::<Vec<_>>()
+                .join(""),
         }
     }
 }
@@ -319,6 +369,12 @@ impl ResponseUsage {
 pub struct ResponseTextFormat {
     #[serde(rename = "type")]
     pub format_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strict: Option<bool>,
 }
 
 /// Text settings returned from a response.
@@ -332,6 +388,9 @@ impl Default for ResponseTextConfig {
         Self {
             format: ResponseTextFormat {
                 format_type: "text".to_string(),
+                name: None,
+                schema: None,
+                strict: None,
             },
         }
     }
@@ -499,7 +558,9 @@ impl ResponseObject {
         temperature: f32,
         top_p: f32,
         metadata: BTreeMap<String, String>,
+        reasoning: ResponseReasoningSummary,
         parallel_tool_calls: bool,
+        text: ResponseTextConfig,
         tool_choice: ResponseToolChoice,
         tools: Vec<serde_json::Value>,
     ) -> Self {
@@ -517,10 +578,10 @@ impl ResponseObject {
             output: Vec::new(),
             parallel_tool_calls,
             previous_response_id,
-            reasoning: ResponseReasoningSummary::default(),
+            reasoning,
             store,
             temperature,
-            text: ResponseTextConfig::default(),
+            text,
             tool_choice,
             tools,
             top_p,
@@ -543,7 +604,9 @@ impl ResponseObject {
         metadata: BTreeMap<String, String>,
         output: Vec<ResponseOutputItem>,
         usage: ResponseUsage,
+        reasoning: ResponseReasoningSummary,
         parallel_tool_calls: bool,
+        text: ResponseTextConfig,
         tool_choice: ResponseToolChoice,
         tools: Vec<serde_json::Value>,
     ) -> Self {
@@ -561,10 +624,10 @@ impl ResponseObject {
             output,
             parallel_tool_calls,
             previous_response_id,
-            reasoning: ResponseReasoningSummary::default(),
+            reasoning,
             store,
             temperature,
-            text: ResponseTextConfig::default(),
+            text,
             tool_choice,
             tools,
             top_p,
@@ -593,9 +656,16 @@ impl CreateResponseRequest {
             return Err(ApiError::InvalidRequest("model is required".into()));
         }
         if self.background == Some(true) {
-            return Err(ApiError::InvalidRequest(
-                "background responses are not supported".into(),
-            ));
+            if self.stream {
+                return Err(ApiError::InvalidRequest(
+                    "background responses do not support streaming".into(),
+                ));
+            }
+            if !self.store {
+                return Err(ApiError::InvalidRequest(
+                    "background responses require store=true".into(),
+                ));
+            }
         }
         let tools = self.normalize_function_tools()?;
         if let Some(tool_choice) = &self.tool_choice {
@@ -614,26 +684,14 @@ impl CreateResponseRequest {
                 }
             }
         }
-        if self.text.is_some() {
-            return Err(ApiError::InvalidRequest(
-                "structured text output is not supported on /v1/responses yet".into(),
-            ));
-        }
-        if self.reasoning.is_some() {
-            return Err(ApiError::InvalidRequest(
-                "reasoning configuration is not supported on /v1/responses yet".into(),
-            ));
-        }
+        let _ = self.normalize_text_config()?;
+        let _ = self.normalize_reasoning_config()?;
         if self.conversation.is_some() {
             return Err(ApiError::InvalidRequest(
                 "conversation state objects are not supported on /v1/responses yet".into(),
             ));
         }
-        if self.include.is_some() {
-            return Err(ApiError::InvalidRequest(
-                "include options are not supported on /v1/responses yet".into(),
-            ));
-        }
+        let _ = self.normalize_include()?;
         if let Some(truncation) = &self.truncation {
             if truncation != "disabled" {
                 return Err(ApiError::InvalidRequest(
@@ -690,12 +748,174 @@ impl CreateResponseRequest {
     }
 
     pub fn to_sampling_params(&self) -> rvllm_core::prelude::SamplingParams {
+        let response_format = self
+            .to_response_format()
+            .unwrap_or(rvllm_core::prelude::ResponseFormat::Text);
         rvllm_core::prelude::SamplingParams {
             temperature: self.temperature,
             top_p: self.top_p,
             max_tokens: self.max_output_tokens.unwrap_or(256),
+            response_format,
             ..Default::default()
         }
+    }
+
+    pub fn normalize_text_config(&self) -> Result<ResponseTextConfig, ApiError> {
+        let Some(text) = &self.text else {
+            return Ok(ResponseTextConfig::default());
+        };
+        let Some(map) = text.as_object() else {
+            return Err(ApiError::InvalidRequest(
+                "responses text must be an object".into(),
+            ));
+        };
+        let Some(format) = map.get("format") else {
+            return Ok(ResponseTextConfig::default());
+        };
+        let Some(format_map) = format.as_object() else {
+            return Err(ApiError::InvalidRequest(
+                "responses text.format must be an object".into(),
+            ));
+        };
+        let format_type = format_map
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                ApiError::InvalidRequest("responses text.format.type is required".into())
+            })?;
+
+        match format_type {
+            "text" => Ok(ResponseTextConfig::default()),
+            "json_object" => Ok(ResponseTextConfig {
+                format: ResponseTextFormat {
+                    format_type: "json_object".to_string(),
+                    name: None,
+                    schema: None,
+                    strict: None,
+                },
+            }),
+            "json_schema" => {
+                let schema = format_map.get("schema").cloned().ok_or_else(|| {
+                    ApiError::InvalidRequest(
+                        "responses text.format.schema is required for json_schema".into(),
+                    )
+                })?;
+                let name = format_map
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string);
+                let strict = format_map
+                    .get("strict")
+                    .and_then(serde_json::Value::as_bool);
+                Ok(ResponseTextConfig {
+                    format: ResponseTextFormat {
+                        format_type: "json_schema".to_string(),
+                        name,
+                        schema: Some(schema),
+                        strict,
+                    },
+                })
+            }
+            other => Err(ApiError::InvalidRequest(format!(
+                "responses text.format.type '{}' is not supported yet",
+                other
+            ))),
+        }
+    }
+
+    pub fn to_response_format(&self) -> Result<rvllm_core::prelude::ResponseFormat, ApiError> {
+        let text = self.normalize_text_config()?;
+        match text.format.format_type.as_str() {
+            "text" => Ok(rvllm_core::prelude::ResponseFormat::Text),
+            "json_object" => Ok(rvllm_core::prelude::ResponseFormat::JsonObject),
+            "json_schema" => Ok(rvllm_core::prelude::ResponseFormat::JsonSchema {
+                json_schema: text.format.schema.ok_or_else(|| {
+                    ApiError::InvalidRequest(
+                        "responses text.format.schema is required for json_schema".into(),
+                    )
+                })?,
+            }),
+            other => Err(ApiError::InvalidRequest(format!(
+                "responses text.format.type '{}' is not supported yet",
+                other
+            ))),
+        }
+    }
+
+    pub fn normalize_reasoning_config(&self) -> Result<ResponseReasoningSummary, ApiError> {
+        let Some(reasoning) = &self.reasoning else {
+            return Ok(ResponseReasoningSummary::default());
+        };
+        let Some(map) = reasoning.as_object() else {
+            return Err(ApiError::InvalidRequest(
+                "responses reasoning must be an object".into(),
+            ));
+        };
+
+        let mut normalized = ResponseReasoningSummary::default();
+        for (key, value) in map {
+            match key.as_str() {
+                "effort" => {
+                    if value.is_null() {
+                        continue;
+                    }
+                    let effort = value.as_str().ok_or_else(|| {
+                        ApiError::InvalidRequest(
+                            "responses reasoning.effort must be a string".into(),
+                        )
+                    })?;
+                    match effort {
+                        "minimal" | "low" | "medium" | "high" => {
+                            normalized.effort = Some(effort.to_string());
+                        }
+                        other => {
+                            return Err(ApiError::InvalidRequest(format!(
+                                "responses reasoning.effort '{}' is not supported yet",
+                                other
+                            )));
+                        }
+                    }
+                }
+                other => {
+                    return Err(ApiError::InvalidRequest(format!(
+                        "responses reasoning.{} is not supported yet",
+                        other
+                    )));
+                }
+            }
+        }
+
+        Ok(normalized)
+    }
+
+    pub fn normalize_include(&self) -> Result<Vec<String>, ApiError> {
+        const SUPPORTED_INCLUDES: &[&str] = &[
+            "code_interpreter_call.outputs",
+            "computer_call_output.output.image_url",
+            "file_search_call.results",
+            "message.input_image.image_url",
+            "message.output_text.logprobs",
+            "reasoning.encrypted_content",
+            "web_search_call.action.sources",
+        ];
+
+        let Some(include) = &self.include else {
+            return Ok(Vec::new());
+        };
+
+        include
+            .iter()
+            .map(|value| {
+                if SUPPORTED_INCLUDES.contains(&value.as_str()) {
+                    Ok(value.clone())
+                } else {
+                    Err(ApiError::InvalidRequest(format!(
+                        "responses include value '{}' is not supported yet",
+                        value
+                    )))
+                }
+            })
+            .collect()
     }
 
     pub fn normalize_input_items(&self) -> Result<Vec<ResponseInputItem>, ApiError> {
@@ -707,7 +927,7 @@ impl CreateResponseRequest {
                 }
                 Ok(vec![ResponseInputItem::Message(ResponseInputMessage::new(
                     "user",
-                    vec![ResponseInputTextPart::new(text.clone())],
+                    vec![ResponseInputContentPart::input_text(text.clone())],
                 ))])
             }
             Some(ResponseInput::Items(items)) => {
@@ -800,7 +1020,7 @@ fn normalize_function_call_output_item(
 
 fn normalize_input_parts(
     value: &serde_json::Value,
-) -> Result<Vec<ResponseInputTextPart>, ApiError> {
+) -> Result<Vec<ResponseInputContentPart>, ApiError> {
     match value {
         serde_json::Value::String(text) => {
             if text.is_empty() {
@@ -808,7 +1028,7 @@ fn normalize_input_parts(
                     "responses input text must not be empty".into(),
                 ));
             }
-            Ok(vec![ResponseInputTextPart::new(text.clone())])
+            Ok(vec![ResponseInputContentPart::input_text(text.clone())])
         }
         serde_json::Value::Array(parts) => {
             if parts.is_empty() {
@@ -830,24 +1050,51 @@ fn normalize_input_parts(
                             "responses input content parts require a type".into(),
                         ));
                     };
-                    if part_type != "input_text" {
-                        return Err(ApiError::InvalidRequest(format!(
+                    match part_type {
+                        "input_text" => {
+                            let text = part_map
+                                .get("text")
+                                .and_then(serde_json::Value::as_str)
+                                .ok_or_else(|| {
+                                    ApiError::InvalidRequest(
+                                        "input_text parts require a text field".into(),
+                                    )
+                                })?;
+                            if text.is_empty() {
+                                return Err(ApiError::InvalidRequest(
+                                    "responses input text must not be empty".into(),
+                                ));
+                            }
+                            Ok(ResponseInputContentPart::input_text(text.to_string()))
+                        }
+                        "input_image" => {
+                            let image_url = part_map
+                                .get("image_url")
+                                .and_then(serde_json::Value::as_str)
+                                .ok_or_else(|| {
+                                    ApiError::InvalidRequest(
+                                        "input_image parts require an image_url field".into(),
+                                    )
+                                })?;
+                            if image_url.is_empty() {
+                                return Err(ApiError::InvalidRequest(
+                                    "responses input image_url must not be empty".into(),
+                                ));
+                            }
+                            let detail = part_map
+                                .get("detail")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_string);
+                            Ok(ResponseInputContentPart::input_image(
+                                image_url.to_string(),
+                                detail,
+                            ))
+                        }
+                        _ => Err(ApiError::InvalidRequest(format!(
                             "responses input content part type '{}' is not supported yet",
                             part_type
-                        )));
+                        ))),
                     }
-                    let text = part_map
-                        .get("text")
-                        .and_then(serde_json::Value::as_str)
-                        .ok_or_else(|| {
-                            ApiError::InvalidRequest("input_text parts require a text field".into())
-                        })?;
-                    if text.is_empty() {
-                        return Err(ApiError::InvalidRequest(
-                            "responses input text must not be empty".into(),
-                        ));
-                    }
-                    Ok(ResponseInputTextPart::new(text.to_string()))
                 })
                 .collect()
         }
@@ -896,7 +1143,7 @@ mod tests {
             input,
             vec![ResponseInputItem::Message(ResponseInputMessage::new(
                 "user",
-                vec![ResponseInputTextPart::new("Hello")]
+                vec![ResponseInputContentPart::input_text("Hello")]
             ))]
         );
     }
@@ -980,14 +1227,105 @@ mod tests {
     }
 
     #[test]
-    fn rejects_multimodal_parts() {
-        let err = normalize_input_parts(&serde_json::json!([
-            {"type": "input_image", "image_url": "https://example.com/image.png"}
+    fn accepts_input_image_parts() {
+        let parts = normalize_input_parts(&serde_json::json!([
+            {
+                "type": "input_image",
+                "image_url": "https://example.com/image.png",
+                "detail": "low"
+            }
         ]))
-        .unwrap_err();
+        .unwrap();
+        assert_eq!(
+            parts,
+            vec![ResponseInputContentPart::input_image(
+                "https://example.com/image.png",
+                Some("low".into())
+            )]
+        );
+    }
+
+    #[test]
+    fn image_parts_render_to_prompt_marker() {
+        let message = ResponseInputMessage::new(
+            "user",
+            vec![
+                ResponseInputContentPart::input_text("Look at "),
+                ResponseInputContentPart::input_image(
+                    "https://example.com/image.png",
+                    Some("high".into()),
+                ),
+            ],
+        );
+        assert_eq!(
+            message.to_chat_message().content,
+            "Look at [input_image url=https://example.com/image.png detail=high]"
+        );
+    }
+
+    #[test]
+    fn request_accepts_supported_include_values() {
+        let req = CreateResponseRequest {
+            model: "test".into(),
+            input: Some(ResponseInput::Text("Hello".into())),
+            instructions: None,
+            max_output_tokens: None,
+            temperature: 1.0,
+            top_p: 1.0,
+            stream: false,
+            store: true,
+            previous_response_id: None,
+            metadata: BTreeMap::new(),
+            background: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: true,
+            text: None,
+            reasoning: None,
+            conversation: None,
+            include: Some(vec![
+                "message.input_image.image_url".into(),
+                "reasoning.encrypted_content".into(),
+            ]),
+            truncation: None,
+        };
+        req.validate().unwrap();
+        assert_eq!(
+            req.normalize_include().unwrap(),
+            vec![
+                "message.input_image.image_url".to_string(),
+                "reasoning.encrypted_content".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn request_rejects_unknown_include_values() {
+        let req = CreateResponseRequest {
+            model: "test".into(),
+            input: Some(ResponseInput::Text("Hello".into())),
+            instructions: None,
+            max_output_tokens: None,
+            temperature: 1.0,
+            top_p: 1.0,
+            stream: false,
+            store: true,
+            previous_response_id: None,
+            metadata: BTreeMap::new(),
+            background: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: true,
+            text: None,
+            reasoning: None,
+            conversation: None,
+            include: Some(vec!["message.output_text.foo".into()]),
+            truncation: None,
+        };
+        let err = req.validate().unwrap_err();
         assert!(err
             .to_string()
-            .contains("responses input content part type 'input_image' is not supported yet"));
+            .contains("responses include value 'message.output_text.foo' is not supported yet"));
     }
 
     #[test]
@@ -1083,6 +1421,291 @@ mod tests {
             truncation: None,
         };
         assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn request_accepts_json_object_text_format() {
+        let req = CreateResponseRequest {
+            model: "test".into(),
+            input: Some(ResponseInput::Text("Hello".into())),
+            instructions: None,
+            max_output_tokens: None,
+            temperature: 1.0,
+            top_p: 1.0,
+            stream: false,
+            store: true,
+            previous_response_id: None,
+            metadata: BTreeMap::new(),
+            background: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: true,
+            text: Some(serde_json::json!({
+                "format": {"type": "json_object"}
+            })),
+            reasoning: None,
+            conversation: None,
+            include: None,
+            truncation: None,
+        };
+        req.validate().unwrap();
+        assert_eq!(
+            req.to_response_format().unwrap(),
+            rvllm_core::prelude::ResponseFormat::JsonObject
+        );
+    }
+
+    #[test]
+    fn request_accepts_json_schema_text_format() {
+        let req = CreateResponseRequest {
+            model: "test".into(),
+            input: Some(ResponseInput::Text("Hello".into())),
+            instructions: None,
+            max_output_tokens: None,
+            temperature: 1.0,
+            top_p: 1.0,
+            stream: false,
+            store: true,
+            previous_response_id: None,
+            metadata: BTreeMap::new(),
+            background: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: true,
+            text: Some(serde_json::json!({
+                "format": {
+                    "type": "json_schema",
+                    "name": "answer",
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"}
+                        },
+                        "required": ["name"]
+                    },
+                    "strict": true
+                }
+            })),
+            reasoning: None,
+            conversation: None,
+            include: None,
+            truncation: None,
+        };
+        req.validate().unwrap();
+        let text = req.normalize_text_config().unwrap();
+        assert_eq!(text.format.format_type, "json_schema");
+        assert_eq!(text.format.name.as_deref(), Some("answer"));
+        assert_eq!(text.format.strict, Some(true));
+        assert!(matches!(
+            req.to_response_format().unwrap(),
+            rvllm_core::prelude::ResponseFormat::JsonSchema { .. }
+        ));
+    }
+
+    #[test]
+    fn request_rejects_unknown_text_format() {
+        let req = CreateResponseRequest {
+            model: "test".into(),
+            input: Some(ResponseInput::Text("Hello".into())),
+            instructions: None,
+            max_output_tokens: None,
+            temperature: 1.0,
+            top_p: 1.0,
+            stream: false,
+            store: true,
+            previous_response_id: None,
+            metadata: BTreeMap::new(),
+            background: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: true,
+            text: Some(serde_json::json!({
+                "format": {"type": "xml"}
+            })),
+            reasoning: None,
+            conversation: None,
+            include: None,
+            truncation: None,
+        };
+        let err = req.validate().unwrap_err();
+        assert!(err.to_string().contains("responses text.format.type 'xml'"));
+    }
+
+    #[test]
+    fn request_accepts_background_with_store() {
+        let req = CreateResponseRequest {
+            model: "test".into(),
+            input: Some(ResponseInput::Text("Hello".into())),
+            instructions: None,
+            max_output_tokens: None,
+            temperature: 1.0,
+            top_p: 1.0,
+            stream: false,
+            store: true,
+            previous_response_id: None,
+            metadata: BTreeMap::new(),
+            background: Some(true),
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: true,
+            text: None,
+            reasoning: None,
+            conversation: None,
+            include: None,
+            truncation: None,
+        };
+        assert!(req.validate().is_ok());
+    }
+
+    #[test]
+    fn request_accepts_reasoning_effort() {
+        let req = CreateResponseRequest {
+            model: "test".into(),
+            input: Some(ResponseInput::Text("Hello".into())),
+            instructions: None,
+            max_output_tokens: None,
+            temperature: 1.0,
+            top_p: 1.0,
+            stream: false,
+            store: true,
+            previous_response_id: None,
+            metadata: BTreeMap::new(),
+            background: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: true,
+            text: None,
+            reasoning: Some(serde_json::json!({
+                "effort": "medium"
+            })),
+            conversation: None,
+            include: None,
+            truncation: None,
+        };
+        req.validate().unwrap();
+        assert_eq!(
+            req.normalize_reasoning_config().unwrap(),
+            ResponseReasoningSummary {
+                effort: Some("medium".into()),
+                summary: None,
+            }
+        );
+    }
+
+    #[test]
+    fn request_rejects_unsupported_reasoning_field() {
+        let req = CreateResponseRequest {
+            model: "test".into(),
+            input: Some(ResponseInput::Text("Hello".into())),
+            instructions: None,
+            max_output_tokens: None,
+            temperature: 1.0,
+            top_p: 1.0,
+            stream: false,
+            store: true,
+            previous_response_id: None,
+            metadata: BTreeMap::new(),
+            background: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: true,
+            text: None,
+            reasoning: Some(serde_json::json!({
+                "summary": "auto"
+            })),
+            conversation: None,
+            include: None,
+            truncation: None,
+        };
+        let err = req.validate().unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("responses reasoning.summary is not supported yet"));
+    }
+
+    #[test]
+    fn request_rejects_unknown_reasoning_effort() {
+        let req = CreateResponseRequest {
+            model: "test".into(),
+            input: Some(ResponseInput::Text("Hello".into())),
+            instructions: None,
+            max_output_tokens: None,
+            temperature: 1.0,
+            top_p: 1.0,
+            stream: false,
+            store: true,
+            previous_response_id: None,
+            metadata: BTreeMap::new(),
+            background: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: true,
+            text: None,
+            reasoning: Some(serde_json::json!({
+                "effort": "max"
+            })),
+            conversation: None,
+            include: None,
+            truncation: None,
+        };
+        let err = req.validate().unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("responses reasoning.effort 'max' is not supported yet"));
+    }
+
+    #[test]
+    fn request_rejects_background_without_store() {
+        let req = CreateResponseRequest {
+            model: "test".into(),
+            input: Some(ResponseInput::Text("Hello".into())),
+            instructions: None,
+            max_output_tokens: None,
+            temperature: 1.0,
+            top_p: 1.0,
+            stream: false,
+            store: false,
+            previous_response_id: None,
+            metadata: BTreeMap::new(),
+            background: Some(true),
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: true,
+            text: None,
+            reasoning: None,
+            conversation: None,
+            include: None,
+            truncation: None,
+        };
+        let err = req.validate().unwrap_err();
+        assert!(err.to_string().contains("background responses require store=true"));
+    }
+
+    #[test]
+    fn request_rejects_background_streaming() {
+        let req = CreateResponseRequest {
+            model: "test".into(),
+            input: Some(ResponseInput::Text("Hello".into())),
+            instructions: None,
+            max_output_tokens: None,
+            temperature: 1.0,
+            top_p: 1.0,
+            stream: true,
+            store: true,
+            previous_response_id: None,
+            metadata: BTreeMap::new(),
+            background: Some(true),
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: true,
+            text: None,
+            reasoning: None,
+            conversation: None,
+            include: None,
+            truncation: None,
+        };
+        let err = req.validate().unwrap_err();
+        assert!(err.to_string().contains("do not support streaming"));
     }
 
     #[test]

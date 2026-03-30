@@ -186,6 +186,23 @@ class TestResponses:
         assert data["data"][0]["type"] == "message"
         assert data["data"][0]["content"][0]["type"] == "input_text"
 
+    def test_response_json_object_text_format(self):
+        """Responses accept text.format=json_object and echo it in the response"""
+        r = requests.post(f"{BASE_URL}/v1/responses", json={
+            "model": "test",
+            "input": "Return JSON with an ok field.",
+            "max_output_tokens": 8,
+            "text": {
+                "format": {
+                    "type": "json_object",
+                }
+            },
+        })
+        assert r.status_code == 200
+        data = r.json()
+        assert data["text"]["format"]["type"] == "json_object"
+        assert data["output"][0]["type"] == "message"
+
     def test_response_previous_response_id(self):
         """Responses can chain prior stored turns"""
         first = requests.post(f"{BASE_URL}/v1/responses", json={
@@ -248,6 +265,72 @@ class TestResponses:
         assert data["data"][0]["type"] == "function_call_output"
         assert data["data"][0]["call_id"] == "call_123"
         assert data["data"][0]["output"]["ok"] is True
+
+    def test_response_json_object_text_format(self):
+        """Responses accept structured text.format=json_object"""
+        r = requests.post(f"{BASE_URL}/v1/responses", json={
+            "model": "test",
+            "input": "Return JSON",
+            "text": {
+                "format": {"type": "json_object"}
+            },
+            "max_output_tokens": 8,
+        })
+        assert r.status_code == 200
+        data = r.json()
+        assert data["text"]["format"]["type"] == "json_object"
+
+    def test_response_reasoning_effort(self):
+        """Responses accept reasoning.effort and echo it in the response"""
+        r = requests.post(f"{BASE_URL}/v1/responses", json={
+            "model": "test",
+            "input": "Think briefly",
+            "reasoning": {
+                "effort": "low",
+            },
+            "max_output_tokens": 8,
+        })
+        assert r.status_code == 200
+        data = r.json()
+        assert data["reasoning"]["effort"] == "low"
+
+    def test_response_accepts_include_values(self):
+        """Responses accept documented include values without a validation error"""
+        r = requests.post(f"{BASE_URL}/v1/responses", json={
+            "model": "test",
+            "input": "Hello",
+            "include": [
+                "message.output_text.logprobs",
+                "reasoning.encrypted_content",
+            ],
+        })
+        assert r.status_code == 200
+
+    def test_response_accepts_input_image_parts(self):
+        """Responses accept input_image parts and preserve them in stored input items"""
+        r = requests.post(f"{BASE_URL}/v1/responses", json={
+            "model": "test",
+            "input": [{
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "Look at "},
+                    {
+                        "type": "input_image",
+                        "image_url": "https://example.com/cat.png",
+                        "detail": "low",
+                    },
+                ],
+            }],
+            "store": True,
+        })
+        assert r.status_code == 200
+        response_id = r.json()["id"]
+
+        items = requests.get(f"{BASE_URL}/v1/responses/{response_id}/input_items")
+        assert items.status_code == 200
+        data = items.json()
+        assert data["data"][0]["content"][1]["type"] == "input_image"
+        assert data["data"][0]["content"][1]["image_url"] == "https://example.com/cat.png"
 
     def test_response_rejects_built_in_tools(self):
         """Built-in Responses tools are still rejected explicitly"""
