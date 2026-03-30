@@ -104,10 +104,10 @@ impl CublasLtOps {
         n: usize,
         k: usize,
         alpha: f32,
-        a: &impl DevicePtr<f16>,
-        b: &impl DevicePtr<f16>,
+        a: &CudaSlice<f16>,
+        b: &CudaSlice<f16>,
         beta: f32,
-        c: &mut impl DevicePtrMut<f16>,
+        c: &mut CudaSlice<f16>,
     ) -> Result<()> {
         let cfg = MatmulConfig {
             transa: true,
@@ -189,7 +189,7 @@ impl CublasLtOps {
         use std::ffi::c_void;
 
         unsafe {
-            let handle = self.handle.handle();
+            let handle = *self.handle.handle();
 
             let mut desc: lt_sys::cublasLtMatmulDesc_t = std::ptr::null_mut();
             let s = lt_sys::cublasLtMatmulDescCreate(&mut desc, lt_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F, lt_sys::cudaDataType_t::CUDA_R_32F);
