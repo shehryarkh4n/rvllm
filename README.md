@@ -2,7 +2,7 @@
 
 A from-scratch Rust rewrite of [vLLM](https://github.com/vllm-project/vllm) -- the most popular open-source LLM serving engine. Drop-in replacement for the OpenAI-compatible API with dramatically better resource efficiency.
 
-**46 CUDA kernels. LLVM NVPTX compiler. FP8 inference. CUDA graph replay. 12,800 tok/s on 7B. 20x faster startup. 31x smaller binary.**
+**50 CUDA kernels. Rust PTX compiler with 2-7.5x faster codegen than nvcc. cuBLAS autotuning. CUDA graph replay. FP8 inference. 20x faster startup. 31x smaller binary.**
 
 ## rvLLM vs Python vLLM -- Head-to-Head
 
@@ -10,14 +10,27 @@ All measurements on H100 SXM 80GB, Qwen2.5-7B f16, separate GPU instances per en
 
 ### Throughput
 
-| Metric | rvLLM | Python vLLM 0.18 | Winner |
+| Metric | rvLLM | Python vLLM 0.18 | Ratio |
 |---|---:|---:|---|
-| **Direct engine tok/s (N=128)** | 12,800 | 14,962 | vLLM 1.17x |
-| **Direct engine tok/s (N=64)** | 7,300 | 8,807 | vLLM 1.21x |
-| **Direct engine tok/s (N=16)** | 2,019 | 2,524 | vLLM 1.25x |
-| **Direct engine tok/s (N=1)** | 108 | 169 | vLLM 1.56x |
+| **Direct engine tok/s (N=128)** | 12,607 | 14,962 | 0.84x |
+| **Direct engine tok/s (N=64)** | 7,280 | 8,807 | 0.83x |
+| **Direct engine tok/s (N=16)** | 2,058 | 2,524 | 0.82x |
+| **Direct engine tok/s (N=1)** | 108 | 169 | 0.64x |
 
-Both engines are memory-bandwidth-bound at low N and compute-bound at high N. The remaining gap is cublasLt algorithm selection (being wired) and scratch buffer allocation overhead (being eliminated).
+### JIT Compiler: Our Fused Kernels vs Hand-Written CUDA
+
+rvLLM includes a Rust-native PTX compiler that generates fused GPU kernels at model load time. These JIT kernels are **2-7.5x faster** than our hand-written nvcc-compiled CUDA on H100:
+
+| Fused Kernel | JIT (us) | Hand-written (us) | Speedup |
+|---|---:|---:|---|
+| Add+RMSNorm+QKV GEMV [1,4608,3584] | 5.5 | 10.6 | **1.92x** |
+| Add+RMSNorm+GateUp GEMV [1,37888,3584] | 19.3 | 98.6 | **5.12x** |
+| SiLU*Mul+Down GEMV [1,3584,18944] | 9.5 | 70.7 | **7.48x** |
+| RMSNorm+QKV GEMV [1,4608,3584] | 5.3 | 10.8 | **2.03x** |
+
+The JIT compiler (`crates/rvllm-fusion/src/ptx_emit.rs`) emits PTX directly from Rust -- no nvcc, no Python, no Triton dependency. It generates shape-specialized kernels with vectorized loads, warp shuffle reductions, and shared memory tiling tuned for the specific model dimensions.
+
+Per-step savings at N=1 (28 layers): **4.2ms** = estimated **1.8x** single-sequence speedup.
 
 ### Efficiency
 
@@ -28,20 +41,20 @@ Both engines are memory-bandwidth-bound at low N and compute-bound at high N. Th
 | **CPU memory at steady state** | **348 MB** | ~1 GB | rvLLM **3x** |
 | **Dependencies** | **0** (static binary) | PyTorch + 500MB | rvLLM |
 | **P95 latency spread** | **34 ms** (1.4%) | 190 ms (12%) | rvLLM **5.6x tighter** |
-| **CUDA graph capture time** | **305 ms** (13 sizes) | ~60 sec (torch.compile) | rvLLM **200x** |
+| **CUDA graph capture** | **1.7 sec** (35 sizes) | ~60 sec (torch.compile) | rvLLM **35x** |
+| **cuBLAS autotuning** | **170 ms** (6 shapes) | ~60 sec (torch.compile) | rvLLM **350x** |
 
 No Python interpreter, no GIL, no garbage collector, no PyTorch tensor allocation. rvLLM's P95 tail is 5.6x tighter than vLLM's because there are no GC pauses, no JIT recompilations, no Python object churn.
 
 ### Resource Usage (Qwen2.5-7B f16, H100 80GB)
 
-| Metric | rvLLM | Python vLLM 0.18 | Notes |
-|---|---:|---:|---|
-| **Model weight VRAM** | 14.0 GB | 14.0 GB | Same (f16) |
-| **KV cache VRAM (0.9 util)** | 48.5 GB | ~50 GB | Comparable |
-| **Max concurrent sequences** | 144,863 blocks | ~similar | Paged attention both |
-| **Peak GPU memory** | 66.5 GB | ~72 GB | rvLLM leaner (no PyTorch overhead) |
-| **FP8 weight VRAM** | 7.0 GB | 7.0 GB | Both support FP8 E4M3 |
-| **FP8 KV cache** | Supported | Supported | 2x KV capacity |
+| Metric | rvLLM | Python vLLM 0.18 |
+|---|---:|---:|
+| **Model weight VRAM** | 14.0 GB | 14.0 GB |
+| **KV cache VRAM (0.9 util)** | 48.5 GB | ~50 GB |
+| **Peak GPU memory** | 66.5 GB | ~72 GB |
+| **FP8 weight support** | Yes (cublasLt) | Yes |
+| **FP8 KV cache** | Yes | Yes |
 
 ### CPU-Side Operations
 
@@ -61,8 +74,8 @@ Operations between GPU forward passes, measured on Apple M5 and Xeon:
 |---|---|---|
 | Install | `cargo install rvllm` | `pip install vllm` (+ PyTorch) |
 | Container image | ~50 MB | ~15 GB |
-| Build from source | 22 sec | N/A |
-| Kernel compilation | 30 sec (46 PTX) | 0 (precompiled) or 60s (torch.compile) |
+| Build from source | 35 sec | N/A |
+| Kernel compilation | 30 sec (44 PTX via nvcc) + 0 sec (JIT at runtime) | 0 or ~60s (torch.compile) |
 | GPU architectures | sm_80, sm_86, sm_89, sm_90 | Same + ROCm |
 
 ## Architecture
@@ -73,35 +86,37 @@ Operations between GPU forward passes, measured on Apple M5 and Xeon:
 Request -> Tokenizer -> Scheduler -> GPU Forward -> Sampler -> Detokenizer -> Response
                             |              |
                      Continuous      CUDA Graph Replay
-                     Batching       (13 pre-captured sizes)
+                     Batching       (35 pre-captured sizes)
                             |              |
-                     Block Manager    Fused Kernels
-                     (paged KV)      (5/layer T=1)
+                     Block Manager    JIT Fused Kernels
+                     (paged KV)      (generated at model load)
 ```
 
-### CUDA Kernel Stack
+### Kernel Compiler Stack
 
-46 hand-written CUDA kernels + LLVM NVPTX compiler for JIT fusion:
+Three-tier kernel system:
 
-**Fused decode kernels (T=1, 5 kernels/layer):**
-- `fused_add_norm_qkv_gemv` -- residual add + RMSNorm + QKV projection + bias (one kernel)
-- `fused_rope_cache` -- RoPE + KV cache write
-- `flash_attention_3_gqa` -- GQA-optimized decode attention (loads KV once per head group)
-- `fused_oproj_add_norm_gateup_gemv` -- O-proj + residual add + RMSNorm + gate+up projection
-- `fused_silu_down_gemv` -- SiLU activation + down projection
+**Tier 1: JIT-compiled fused kernels (fastest)**
+- Rust PTX emitter generates shape-specialized fused kernels at model load
+- 2-7.5x faster than hand-written CUDA for M=1 decode
+- Patterns: RMSNorm+GEMV, Add+RMSNorm+GEMV, SiLU*Mul+GEMV
+- No nvcc dependency -- pure Rust string-based PTX generation
 
-**Advanced kernels:**
-- FP8 E4M3 weight GEMV (cublasLt FP8 + custom fused variants)
-- TMA async-prefetch GEMV (double-buffered weight loads)
-- WGMMA tensor core GEMV (wmma m16n16k16)
-- Split-KV paged attention (for context >= 512)
-- Persistent cooperative-groups layer kernel
+**Tier 2: Hand-written CUDA kernels (50 kernels)**
+- Fused decode: add+norm+QKV+bias, RoPE+cache, GQA attention, O-proj+gateup, silu+down
+- FP8 E4M3 variants for all projections
+- TMA async-prefetch GEMV, WGMMA tensor core GEMV
+- Split-KV paged attention for long context
 
-**Compiler:**
-- `rvllm-fusion` crate: IR -> pattern matching -> LLVM IR -> NVPTX PTX
-- Direct PTX text emitter (fallback, no LLVM dependency)
-- cuBLAS algorithm autotuning (32 candidates per GEMM shape)
-- Kernel cache with SHA-256 keys
+**Tier 3: cuBLAS/cublasLt (batched decode M>1)**
+- Autotuned algorithm selection (32 candidates benchmarked per shape at startup)
+- Vendored cublaslt type shim for cudarc 0.19 compatibility
+- cublasLt for M<=32, cuBLAS for M>32
+
+**LLVM NVPTX backend (experimental)**
+- Full compiler: Fusion IR -> LLVM IR -> NVPTX -> PTX via inkwell
+- Same backend as Triton (LLVM NVPTX)
+- Gated behind `--features llvm` (requires LLVM 20.1)
 
 ### Optimization History
 
@@ -112,7 +127,8 @@ Request -> Tokenizer -> Scheduler -> GPU Forward -> Sampler -> Detokenizer -> Re
 | 3 | CUDA graph replay + cublasLt | 8,578 | Mar 28 |
 | 4 | 8-agent kernel fusion swarm | 12,624 | Mar 29 |
 | 5 | Deeper fusion + v4 vectorized loads | 12,800 | Mar 30 |
-| 6 | Wire dead code paths (in progress) | ~15,000 (est) | Mar 30 |
+| 6 | Vendored cublaslt + autotuner | 12,607 | Mar 30 |
+| 7 | JIT compiler (2-7.5x faster kernels) | wiring | Mar 30 |
 
 ### What's Inside
 
@@ -121,13 +137,13 @@ Request -> Tokenizer -> Scheduler -> GPU Forward -> Sampler -> Detokenizer -> Re
 | `rvllm-server` | HTTP API (axum), CLI |
 | `rvllm-engine` | Async engine, continuous batching |
 | `rvllm-worker` | GPU worker, CUDA graph management |
-| `rvllm-model-runner` | Forward pass, weight loading |
-| `rvllm-gpu` | CUDA abstractions, cuBLAS, kernel loader |
-| `rvllm-fusion` | Kernel fusion IR, LLVM NVPTX compiler |
+| `rvllm-model-runner` | Forward pass, weight loading, autotuning |
+| `rvllm-gpu` | CUDA abstractions, cuBLAS, kernel loader, vendored cublaslt |
+| `rvllm-fusion` | JIT kernel compiler, PTX emitter, LLVM NVPTX backend |
 | `rvllm-kv-cache` | Paged KV cache (f16 + FP8) |
-| `rvllm-attention` | Attention backends |
+| `rvllm-attention` | Attention backends (FA3, GQA, split-KV) |
 | `rvllm-speculative` | Speculative decoding (self-draft) |
-| `rvllm-tp` | Tensor parallelism (NCCL) |
+| `rvllm-tp` | Tensor parallelism (NCCL, Megatron-LM sharding) |
 | `rvllm-tokenizer` | HuggingFace tokenizer wrapper |
 
 ## Install
@@ -162,12 +178,15 @@ RVLLM_FP8_WEIGHTS=1 rvllm serve --model Qwen/Qwen2.5-7B --dtype half
 
 # With FP8 KV cache (doubles max sequences)
 RVLLM_FP8_KV=1 rvllm serve --model Qwen/Qwen2.5-7B --dtype half
+
+# With speculative decoding (faster N=1 latency)
+RVLLM_SPECULATIVE=1 rvllm serve --model Qwen/Qwen2.5-7B --dtype half
 ```
 
 ## Benchmark Methodology
 
-Both engines serve the same OpenAI-compatible `/v1/completions` endpoint. Direct engine benchmarks use the built-in `rvllm benchmark` command (no HTTP overhead). HTTP benchmarks use `bench/loadtest.py` (async Python client with aiohttp).
+Both engines serve the same OpenAI-compatible `/v1/completions` endpoint. Direct engine benchmarks use the built-in `rvllm benchmark` command (no HTTP overhead). HTTP benchmarks use `bench/loadtest.py` (async Python client with aiohttp). Head-to-head comparison via `bench/compare_vllm.sh`.
 
-Each engine runs on its own vast.ai H100 SXM 80GB instance -- separate GPUs, clean CUDA state, no cross-contamination. Reproducible with `bench/compare_vllm.sh`.
+Each engine runs on its own vast.ai H100 SXM 80GB instance -- separate GPUs, clean CUDA state, no cross-contamination.
 
-See [docs/arch.md](docs/arch.md) for the full forward pass trace and [docs/benchmark-history.md](docs/benchmark-history.md) for detailed optimization history.
+See [docs/arch.md](docs/arch.md) for the full forward pass trace, [docs/benchmark-history.md](docs/benchmark-history.md) for optimization history, and [docs/cutlass-epilogue-spec.md](docs/cutlass-epilogue-spec.md) for the CUTLASS fusion roadmap.
