@@ -1,203 +1,188 @@
 #!/bin/bash
 set -euo pipefail
 
-INSTANCE_ID=${1:-$(cat deploy/.instance_id 2>/dev/null)}
-MODEL=${MODEL:-"meta-llama/Llama-3.2-1B"}
-NUM_PROMPTS=${NUM_PROMPTS:-200}
-CONCURRENT=${CONCURRENT:-16}
+# Benchmark rvllm vs Python vLLM on SEPARATE H100 instances.
+#
+# CRITICAL: Each engine runs on its own GPU instance. Never run both
+# on the same GPU -- shared CUDA driver state contaminates results.
+#
+# Usage:
+#   ./deploy/vastai-benchmark.sh                    # auto-detect both instances
+#   ./deploy/vastai-benchmark.sh --rvllm-only       # benchmark rvllm only
+#   ./deploy/vastai-benchmark.sh --vllm-only        # benchmark vLLM only
+#
+# Environment:
+#   MODEL          model name (default: Qwen/Qwen2.5-7B)
+#   NUM_PROMPTS    total prompts (default: 500)
+#   CONCURRENT     concurrency level (default: 32)
+#   MAX_TOKENS     max output tokens (default: 256)
 
-echo "Running A100 benchmark comparison on instance $INSTANCE_ID"
-echo "Model: $MODEL"
-echo "Prompts: $NUM_PROMPTS, Concurrency: $CONCURRENT"
+MODEL=${MODEL:-"Qwen/Qwen2.5-7B"}
+NUM_PROMPTS=${NUM_PROMPTS:-500}
+CONCURRENT=${CONCURRENT:-32}
+MAX_TOKENS=${MAX_TOKENS:-256}
+WARMUP_PROMPTS=${WARMUP_PROMPTS:-100}
 
-SSH_CMD="vastai ssh $INSTANCE_ID"
+RVLLM_INSTANCE=${RVLLM_INSTANCE:-$(cat deploy/.instance_id_rvllm 2>/dev/null || echo "")}
+VLLM_INSTANCE=${VLLM_INSTANCE:-$(cat deploy/.instance_id_vllm 2>/dev/null || echo "")}
 
-$SSH_CMD << REMOTE_SCRIPT
+MODE="${1:---both}"
+
+echo "=========================================="
+echo "BENCHMARK CONFIGURATION"
+echo "=========================================="
+echo "Model:       $MODEL"
+echo "Prompts:     $NUM_PROMPTS (warmup: $WARMUP_PROMPTS)"
+echo "Concurrency: $CONCURRENT"
+echo "Max tokens:  $MAX_TOKENS"
+echo ""
+
+# ---------- rvllm benchmark ----------
+run_rvllm_bench() {
+    if [[ -z "$RVLLM_INSTANCE" ]]; then
+        echo "ERROR: No rvllm instance. Set RVLLM_INSTANCE or run vastai-provision.sh --rvllm"
+        return 1
+    fi
+    echo "=========================================="
+    echo "BENCHMARK: rvllm (instance $RVLLM_INSTANCE)"
+    echo "=========================================="
+
+    vastai ssh $RVLLM_INSTANCE << REMOTE
 set -euo pipefail
-export PATH="/root/.cargo/bin:$PATH"
+export PATH="/root/.cargo/bin:\$PATH"
+cd /root/rvllm
 
-cd /root
-
-# Helper: capture memory metrics for a running server
-capture_memory() {
-    local label=\$1
-    local pid=\$2
-    local output=\$3
-
-    echo "Capturing memory metrics for \$label (PID \$pid)..."
-
-    # CPU RSS (in MB)
-    RSS_KB=\$(cat /proc/\$pid/status 2>/dev/null | grep VmRSS | awk '{print \$2}')
-    RSS_MB=\$(echo "scale=1; \${RSS_KB:-0} / 1024" | bc)
-
-    # GPU VRAM via nvidia-smi (sum all GPUs for this PID)
-    GPU_MB=\$(nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader,nounits 2>/dev/null \
-        | grep "^\$pid" | awk -F',' '{sum+=\$2} END {printf "%.1f", sum}')
-    GPU_MB=\${GPU_MB:-0}
-    GPU_GB=\$(echo "scale=1; \$GPU_MB / 1024" | bc)
-
-    echo "  CPU RSS: \${RSS_MB} MB"
-    echo "  GPU VRAM: \${GPU_GB} GB (\${GPU_MB} MB)"
-
-    # Append to JSON
-    python3 -c "
-import json
-with open('\$output') as f:
-    data = json.load(f)
-data['cpu_rss_mb'] = float('\$RSS_MB')
-data['gpu_vram_mb'] = float('\$GPU_MB')
-data['gpu_vram_gb'] = float('\$GPU_GB')
-with open('\$output', 'w') as f:
-    json.dump(data, f, indent=2)
-"
-}
-
-# ========== Benchmark Python vLLM ==========
-echo ""
-echo "=========================================="
-echo "BENCHMARK: Python vLLM"
-echo "=========================================="
-
-# Record startup time
-PYTHON_START=\$(date +%s%N)
-
-python3 -m vllm.entrypoints.openai.api_server \
-    --model $MODEL \
-    --gpu-memory-utilization 0.90 \
-    --port 8001 &
-PYTHON_PID=\$!
-
-# Wait for server
-for i in \$(seq 1 120); do
-    if curl -s http://localhost:8001/health >/dev/null 2>&1; then break; fi
-    sleep 2
-done
-PYTHON_READY=\$(date +%s%N)
-PYTHON_STARTUP_MS=\$(( (PYTHON_READY - PYTHON_START) / 1000000 ))
-echo "Python vLLM server ready (startup: \${PYTHON_STARTUP_MS}ms)"
-
-# Capture memory after model load, before benchmark
+pkill -9 -f "rvllm serve" 2>/dev/null || true
 sleep 2
-nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader 2>/dev/null || true
 
-# Run benchmark
-python3 /root/vllm-rs/deploy/benchmark_client.py \
-    --url http://localhost:8001 \
-    --num-prompts $NUM_PROMPTS \
-    --concurrent $CONCURRENT \
-    --output /root/results_python.json
-
-# Capture memory metrics while server is still loaded
-capture_memory "Python vLLM" \$PYTHON_PID /root/results_python.json
-
-# Add startup time
-python3 -c "
-import json
-with open('/root/results_python.json') as f:
-    data = json.load(f)
-data['startup_ms'] = $PYTHON_STARTUP_MS if '$PYTHON_STARTUP_MS'.isdigit() else \$PYTHON_STARTUP_MS
-with open('/root/results_python.json', 'w') as f:
-    json.dump(data, f, indent=2)
-"
-
-kill \$PYTHON_PID 2>/dev/null || true
-wait \$PYTHON_PID 2>/dev/null || true
-sleep 5
-
-# ========== Benchmark Rust rvllm ==========
-echo ""
-echo "=========================================="
-echo "BENCHMARK: Rust rvllm"
-echo "=========================================="
-
-# Record startup time
-RUST_START=\$(date +%s%N)
-
-/root/vllm-rs/target/release/rvllm serve \
-    --model $MODEL \
-    --gpu-memory-utilization 0.90 \
-    --port 8000 &
-RUST_PID=\$!
+echo "Starting rvllm server..."
+STARTUP_START=\$(date +%s%N)
+target/release/rvllm serve --model $MODEL --gpu-memory-utilization 0.90 --port 8000 > /tmp/rvllm_bench.log 2>&1 &
+PID=\$!
 
 for i in \$(seq 1 120); do
     if curl -s http://localhost:8000/health >/dev/null 2>&1; then break; fi
     sleep 2
 done
-RUST_READY=\$(date +%s%N)
-RUST_STARTUP_MS=\$(( (RUST_READY - RUST_START) / 1000000 ))
-echo "Rust rvllm server ready (startup: \${RUST_STARTUP_MS}ms)"
+STARTUP_END=\$(date +%s%N)
+STARTUP_MS=\$(( (STARTUP_END - STARTUP_START) / 1000000 ))
 
+if ! curl -s http://localhost:8000/health >/dev/null 2>&1; then
+    echo "FAIL: rvllm did not start"
+    tail -30 /tmp/rvllm_bench.log
+    kill \$PID 2>/dev/null || true
+    exit 1
+fi
+echo "rvllm ready (startup: \${STARTUP_MS}ms, PID \$PID)"
+
+nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader
+
+echo ""
+echo "--- Warmup ($WARMUP_PROMPTS prompts) ---"
+python3 deploy/benchmark_client.py --url http://localhost:8000 --num-prompts $WARMUP_PROMPTS --concurrent 16 --max-tokens 128 --output /tmp/rvllm_warmup.json 2>&1 | grep -E "Throughput|Errors"
 sleep 2
-nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader 2>/dev/null || true
 
-python3 /root/vllm-rs/deploy/benchmark_client.py \
-    --url http://localhost:8000 \
-    --num-prompts $NUM_PROMPTS \
-    --concurrent $CONCURRENT \
-    --output /root/results_rust.json
-
-# Capture memory metrics while server is still loaded
-capture_memory "Rust rvllm" \$RUST_PID /root/results_rust.json
-
-# Add startup time
-python3 -c "
-import json
-with open('/root/results_rust.json') as f:
-    data = json.load(f)
-data['startup_ms'] = $RUST_STARTUP_MS if '$RUST_STARTUP_MS'.isdigit() else \$RUST_STARTUP_MS
-with open('/root/results_rust.json', 'w') as f:
-    json.dump(data, f, indent=2)
-"
-
-kill \$RUST_PID 2>/dev/null || true
-wait \$RUST_PID 2>/dev/null || true
-
-# ========== Generate Comparison Report ==========
 echo ""
-python3 /root/vllm-rs/deploy/compare_results.py \
-    --rust /root/results_rust.json \
-    --python /root/results_python.json
+echo "--- Full benchmark ($NUM_PROMPTS prompts, concurrency=$CONCURRENT, max_tokens=$MAX_TOKENS) ---"
+python3 deploy/benchmark_client.py --url http://localhost:8000 --num-prompts $NUM_PROMPTS --concurrent $CONCURRENT --max-tokens $MAX_TOKENS --output /root/results_rvllm.json
 
-# Print memory/startup summary
 echo ""
-echo "=========================================="
-echo "RESOURCE USAGE COMPARISON"
-echo "=========================================="
-python3 -c "
-import json
+echo "Server errors: \$(grep -c ERROR /tmp/rvllm_bench.log 2>/dev/null || echo 0)"
 
-with open('/root/results_rust.json') as f:
-    rust = json.load(f)
-with open('/root/results_python.json') as f:
-    py = json.load(f)
+kill \$PID 2>/dev/null || true
+wait \$PID 2>/dev/null || true
+echo "=== rvllm benchmark done ==="
+REMOTE
 
-print(f\"{'Metric':<25s} {'Rust':>12s} {'Python':>12s} {'Ratio':>12s}\")
-print(f\"{'-'*25} {'-'*12} {'-'*12} {'-'*12}\")
+    echo "Downloading rvllm results..."
+    vastai scp $RVLLM_INSTANCE /root/results_rvllm.json deploy/results_rvllm.json 2>/dev/null || true
+}
 
-# Startup
-rs = rust.get('startup_ms', 0)
-ps = py.get('startup_ms', 0)
-ratio = ps / rs if rs > 0 else 0
-print(f\"{'Startup':<25s} {rs:>10.0f}ms {ps:>10.0f}ms {ratio:>10.1f}x\")
+# ---------- vLLM benchmark ----------
+run_vllm_bench() {
+    if [[ -z "$VLLM_INSTANCE" ]]; then
+        echo "ERROR: No vLLM instance. Set VLLM_INSTANCE or run vastai-provision.sh --vllm"
+        return 1
+    fi
+    echo "=========================================="
+    echo "BENCHMARK: Python vLLM (instance $VLLM_INSTANCE)"
+    echo "=========================================="
 
-# CPU RSS
-rc = rust.get('cpu_rss_mb', 0)
-pc = py.get('cpu_rss_mb', 0)
-ratio = pc / rc if rc > 0 else 0
-print(f\"{'CPU RSS':<25s} {rc:>10.1f}MB {pc:>10.1f}MB {ratio:>10.1f}x\")
+    vastai ssh $VLLM_INSTANCE << REMOTE
+set -euo pipefail
 
-# GPU VRAM
-rg = rust.get('gpu_vram_gb', 0)
-pg = py.get('gpu_vram_gb', 0)
-ratio = pg / rg if rg > 0 else 0
-print(f\"{'GPU VRAM':<25s} {rg:>10.1f}GB {pg:>10.1f}GB {ratio:>10.1f}x\")
-"
+pkill -9 -f "vllm serve" 2>/dev/null || true
+pkill -9 -f "api_server" 2>/dev/null || true
+sleep 3
 
-REMOTE_SCRIPT
+echo "Starting Python vLLM server..."
+STARTUP_START=\$(date +%s%N)
+python3 -m vllm.entrypoints.openai.api_server \
+    --model $MODEL \
+    --gpu-memory-utilization 0.90 \
+    --port 8001 > /tmp/vllm_bench.log 2>&1 &
+PID=\$!
 
-# Download results
-echo "Downloading results..."
-vastai scp $INSTANCE_ID /root/results_python.json deploy/results_python.json
-vastai scp $INSTANCE_ID /root/results_rust.json deploy/results_rust.json
+for i in \$(seq 1 120); do
+    if curl -s http://localhost:8001/health >/dev/null 2>&1; then break; fi
+    sleep 2
+done
+STARTUP_END=\$(date +%s%N)
+STARTUP_MS=\$(( (STARTUP_END - STARTUP_START) / 1000000 ))
 
-echo "Results saved to deploy/"
+if ! curl -s http://localhost:8001/health >/dev/null 2>&1; then
+    echo "FAIL: vLLM did not start"
+    tail -30 /tmp/vllm_bench.log
+    kill \$PID 2>/dev/null || true
+    exit 1
+fi
+echo "vLLM ready (startup: \${STARTUP_MS}ms, PID \$PID)"
+
+nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader
+
+echo ""
+echo "--- Warmup ($WARMUP_PROMPTS prompts) ---"
+python3 /root/rvllm/deploy/benchmark_client.py --url http://localhost:8001 --num-prompts $WARMUP_PROMPTS --concurrent 16 --max-tokens 128 --output /tmp/vllm_warmup.json 2>&1 | grep -E "Throughput|Errors"
+sleep 2
+
+echo ""
+echo "--- Full benchmark ($NUM_PROMPTS prompts, concurrency=$CONCURRENT, max_tokens=$MAX_TOKENS) ---"
+python3 /root/rvllm/deploy/benchmark_client.py --url http://localhost:8001 --num-prompts $NUM_PROMPTS --concurrent $CONCURRENT --max-tokens $MAX_TOKENS --output /root/results_vllm.json
+
+echo ""
+echo "Server errors: \$(grep -c ERROR /tmp/vllm_bench.log 2>/dev/null || echo 0)"
+
+kill \$PID 2>/dev/null || true
+wait \$PID 2>/dev/null || true
+echo "=== vLLM benchmark done ==="
+REMOTE
+
+    echo "Downloading vLLM results..."
+    vastai scp $VLLM_INSTANCE /root/results_vllm.json deploy/results_vllm.json 2>/dev/null || true
+}
+
+# ---------- Run ----------
+if [[ "$MODE" == "--rvllm-only" ]]; then
+    run_rvllm_bench
+elif [[ "$MODE" == "--vllm-only" ]]; then
+    run_vllm_bench
+else
+    run_rvllm_bench
+    echo ""
+    run_vllm_bench
+fi
+
+# ---------- Compare ----------
+if [[ -f deploy/results_rvllm.json && -f deploy/results_vllm.json ]]; then
+    echo ""
+    echo "=========================================="
+    echo "COMPARISON"
+    echo "=========================================="
+    python3 deploy/compare_results.py \
+        --rust deploy/results_rvllm.json \
+        --python deploy/results_vllm.json 2>/dev/null || \
+    echo "(compare_results.py not found or failed -- check results manually)"
+fi
+
+echo ""
+echo "Results saved to deploy/results_rvllm.json and deploy/results_vllm.json"

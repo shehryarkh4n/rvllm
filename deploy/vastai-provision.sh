@@ -1,62 +1,100 @@
 #!/bin/bash
 set -euo pipefail
 
-# Provision A100 80GB on vast.ai for rvllm benchmarks
+# Provision GPU instances on vast.ai for rvllm benchmarks.
 # Requires: vastai CLI (pip install vastai)
-# Usage: ./vastai-provision.sh [--dry-run]
+#
+# IMPORTANT: Always provision TWO separate instances:
+#   1. rvllm instance  -- nvidia/cuda devel image (builds + runs rvllm)
+#   2. vLLM instance   -- vllm/vllm-openai image  (runs Python vLLM)
+#
+# Never run both on the same GPU. Shared CUDA driver state, memory
+# fragmentation, and context residue between runs contaminate results.
+# Each engine gets a clean GPU with no prior allocations.
+#
+# Usage:
+#   ./vastai-provision.sh              # provision rvllm instance
+#   ./vastai-provision.sh --vllm       # provision vLLM instance
+#   ./vastai-provision.sh --both       # provision both
+#   ./vastai-provision.sh --dry-run    # search only
 
 DISK_GB=${DISK_GB:-100}
-GPU_TYPE=${GPU_TYPE:-"A100_SXM4"}  # A100 80GB
-GPU_RAM_MIN=${GPU_RAM_MIN:-75}     # At least 75GB VRAM (filters to 80GB)
-IMAGE="nvidia/cuda:12.4.1-devel-ubuntu22.04"
+GPU_TYPE=${GPU_TYPE:-"H100_SXM"}
+GPU_RAM_MIN=${GPU_RAM_MIN:-75}
 
-echo "Searching for $GPU_TYPE instances (>=${GPU_RAM_MIN}GB VRAM)..."
+RVLLM_IMAGE="nvidia/cuda:12.6.3-devel-ubuntu22.04"
+VLLM_IMAGE="vllm/vllm-openai:latest"
 
-# Search for suitable instances
-vastai search offers \
-    "gpu_name=$GPU_TYPE gpu_ram>=${GPU_RAM_MIN} num_gpus=1 inet_down>200 disk_space>=${DISK_GB}" \
-    --order "dph_total" \
-    --limit 5
+MODE="${1:---rvllm}"
 
-if [[ "${1:-}" == "--dry-run" ]]; then
-    echo "Dry run, not provisioning."
+provision_instance() {
+    local label=$1
+    local image=$2
+    local onstart=$3
+    local id_file=$4
+
+    echo ""
+    echo "=== Provisioning $label instance ==="
+    echo "Image: $image"
+
+    vastai search offers \
+        "gpu_name=$GPU_TYPE gpu_ram>=${GPU_RAM_MIN} num_gpus=1 inet_down>200 disk_space>=${DISK_GB}" \
+        --order "dph_total" \
+        --limit 5
+
+    echo ""
+    read -p "Enter offer ID for $label: " OFFER_ID
+
+    INSTANCE_ID=$(vastai create instance $OFFER_ID \
+        --image "$image" \
+        --disk $DISK_GB \
+        --ssh \
+        --env "RUST_LOG=info" \
+        --onstart-cmd "$onstart" \
+        --raw | jq -r '.new_contract')
+
+    echo "Instance created: $INSTANCE_ID"
+    echo "Waiting for instance to start..."
+
+    for i in $(seq 1 60); do
+        STATUS=$(vastai show instance $INSTANCE_ID --raw | jq -r '.actual_status')
+        if [[ "$STATUS" == "running" ]]; then
+            echo "Instance running!"
+            break
+        fi
+        echo "  Status: $STATUS (attempt $i/60)"
+        sleep 10
+    done
+
+    SSH_INFO=$(vastai ssh-url $INSTANCE_ID)
+    echo "$label ready: $SSH_INFO"
+    echo "$INSTANCE_ID" > "deploy/$id_file"
+}
+
+if [[ "$MODE" == "--dry-run" ]]; then
+    echo "Searching for $GPU_TYPE instances (>=${GPU_RAM_MIN}GB VRAM)..."
+    vastai search offers \
+        "gpu_name=$GPU_TYPE gpu_ram>=${GPU_RAM_MIN} num_gpus=1 inet_down>200 disk_space>=${DISK_GB}" \
+        --order "dph_total" \
+        --limit 5
     exit 0
 fi
 
-echo ""
-read -p "Enter offer ID to provision: " OFFER_ID
+RVLLM_ONSTART="apt-get update && apt-get install -y curl git build-essential pkg-config libssl-dev && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y"
+VLLM_ONSTART="pip install aiohttp numpy"
 
-# Create instance
-INSTANCE_ID=$(vastai create instance $OFFER_ID \
-    --image "$IMAGE" \
-    --disk $DISK_GB \
-    --ssh \
-    --env "RUST_LOG=info" \
-    --onstart-cmd "apt-get update && apt-get install -y curl git build-essential pkg-config libssl-dev && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y" \
-    --raw | jq -r '.new_contract')
+if [[ "$MODE" == "--rvllm" || "$MODE" == "--both" ]]; then
+    provision_instance "rvllm" "$RVLLM_IMAGE" "$RVLLM_ONSTART" ".instance_id_rvllm"
+fi
 
-echo "Instance created: $INSTANCE_ID"
-echo "Waiting for instance to start..."
+if [[ "$MODE" == "--vllm" || "$MODE" == "--both" ]]; then
+    provision_instance "vLLM" "$VLLM_IMAGE" "$VLLM_ONSTART" ".instance_id_vllm"
+fi
 
-# Wait for SSH to be available
-for i in $(seq 1 60); do
-    STATUS=$(vastai show instance $INSTANCE_ID --raw | jq -r '.actual_status')
-    if [[ "$STATUS" == "running" ]]; then
-        echo "Instance running!"
-        break
-    fi
-    echo "  Status: $STATUS (attempt $i/60)"
-    sleep 10
-done
-
-# Get SSH info
-SSH_INFO=$(vastai ssh-url $INSTANCE_ID)
 echo ""
-echo "Instance ready!"
-echo "SSH: $SSH_INFO"
+echo "=== Next steps ==="
+echo "  1. Deploy rvllm:  ./deploy/vastai-deploy.sh"
+echo "  2. Run benchmark: ./deploy/vastai-benchmark.sh"
 echo ""
-echo "Next steps:"
-echo "  1. ./deploy/vastai-deploy.sh $INSTANCE_ID"
-echo "  2. ./deploy/vastai-benchmark.sh $INSTANCE_ID"
-echo ""
-echo "$INSTANCE_ID" > deploy/.instance_id
+echo "REMINDER: rvllm and vLLM must run on SEPARATE instances."
+echo "Never benchmark both engines on the same GPU."
