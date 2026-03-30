@@ -5,7 +5,7 @@
 //! split-K heuristics and a larger algorithm search space.
 
 use cudarc::cublaslt::{CudaBlasLT, Matmul, MatmulConfig, MatmulShared};
-use crate::cublaslt_raw as lt_sys;
+use cudarc::cublaslt::sys as lt_sys;
 use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
 use half::f16;
 use std::sync::Arc;
@@ -26,8 +26,6 @@ const FP8_WORKSPACE_SIZE: usize = 4 * 1024 * 1024;
 pub struct CublasLtOps {
     handle: CudaBlasLT,
     stream: Arc<CudaStream>,
-    algo_cache: std::cell::RefCell<std::collections::HashMap<(usize,usize,usize), lt_sys::cublasLtMatmulAlgo_t>>,
-    autotune_ws: std::cell::RefCell<Option<CudaSlice<u8>>>,
     /// Persistent workspace for cublasLtMatmul (split-K, etc).
     workspace: CudaSlice<u8>,
 }
@@ -38,7 +36,7 @@ impl CublasLtOps {
             .map_err(|e| LLMError::GpuError(format!("CudaBlasLT init failed: {e}")))?;
         let workspace = unsafe { stream.alloc::<u8>(FP8_WORKSPACE_SIZE) }
             .map_err(|e| LLMError::GpuError(format!("cublasLt workspace alloc: {e}")))?;
-        Ok(Self { handle, stream, workspace, algo_cache: std::cell::RefCell::new(std::collections::HashMap::new()), autotune_ws: std::cell::RefCell::new(None) })
+        Ok(Self { handle, stream, workspace })
     }
 
     pub fn stream(&self) -> &Arc<CudaStream> {
@@ -90,43 +88,6 @@ impl CublasLtOps {
             batch_size: None,
         };
 
-        // Use autotuned algo if available
-        {
-            let cache = self.algo_cache.borrow();
-            if let Some(algo) = cache.get(&(m, n, k)) {
-                use std::ffi::c_void;
-                unsafe {
-                    let handle = *self.handle.handle();
-                    let mut desc: lt_sys::cublasLtMatmulDesc_t = std::ptr::null_mut();
-                    lt_sys::cublasLtMatmulDescCreate(&mut desc, lt_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F, lt_sys::cudaDataType_t::CUDA_R_32F);
-                    let ta = lt_sys::cublasOperation_t::CUBLAS_OP_T;
-                    let tb = lt_sys::cublasOperation_t::CUBLAS_OP_N;
-                    lt_sys::cublasLtMatmulDescSetAttribute(desc, lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA, &ta as *const _ as *const c_void, std::mem::size_of_val(&ta));
-                    lt_sys::cublasLtMatmulDescSetAttribute(desc, lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSB, &tb as *const _ as *const c_void, std::mem::size_of_val(&tb));
-                    let f16t = lt_sys::cudaDataType_t::CUDA_R_16F;
-                    let mut la: lt_sys::cublasLtMatrixLayout_t = std::ptr::null_mut();
-                    let mut lb: lt_sys::cublasLtMatrixLayout_t = std::ptr::null_mut();
-                    let mut lc: lt_sys::cublasLtMatrixLayout_t = std::ptr::null_mut();
-                    lt_sys::cublasLtMatrixLayoutCreate(&mut la, f16t, k as u64, n as u64, k as i64);
-                    lt_sys::cublasLtMatrixLayoutCreate(&mut lb, f16t, k as u64, m as u64, k as i64);
-                    lt_sys::cublasLtMatrixLayoutCreate(&mut lc, f16t, n as u64, m as u64, n as i64);
-                    let (b_ptr, _) = DevicePtr::device_ptr(b, &self.stream);
-                    let (a_ptr, _) = DevicePtr::device_ptr(a, &self.stream);
-                    let (c_ptr, _) = DevicePtrMut::device_ptr_mut(c, &self.stream);
-                    let ws_borrow = self.autotune_ws.borrow();
-                    let (ws_ptr, ws_size) = match *ws_borrow {
-                        Some(ref ws) => { let (p, _) = DevicePtr::device_ptr(ws, &self.stream); (p as *mut c_void, ws.len()) }
-                        None => (std::ptr::null_mut(), 0usize)
-                    };
-                    let stream_raw = lt_sys::cu_stream_to_cuda_stream(self.stream.cu_stream());
-                    let s = lt_sys::cublasLtMatmul(handle, desc, &alpha as *const _ as *const c_void, b_ptr as *const c_void, la, a_ptr as *const c_void, lb, &beta as *const _ as *const c_void, c_ptr as *mut c_void, lc, c_ptr as *mut c_void, lc, algo, ws_ptr, ws_size, stream_raw);
-                    lt_sys::cublasLtMatrixLayoutDestroy(la); lt_sys::cublasLtMatrixLayoutDestroy(lb); lt_sys::cublasLtMatrixLayoutDestroy(lc);
-                    lt_sys::cublasLtMatmulDescDestroy(desc);
-                    if s != lt_sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS { return Err(LLMError::GpuError(format!("autotuned matmul: {s:?}"))); }
-                }
-                return Ok(());
-            }
-        }
         unsafe {
             self.handle
                 .matmul(cfg, b, a, c, None, None)
@@ -143,10 +104,10 @@ impl CublasLtOps {
         n: usize,
         k: usize,
         alpha: f32,
-        a: &CudaSlice<f16>,
-        b: &CudaSlice<f16>,
+        a: &impl DevicePtr<f16>,
+        b: &impl DevicePtr<f16>,
         beta: f32,
-        c: &mut CudaSlice<f16>,
+        c: &mut impl DevicePtrMut<f16>,
     ) -> Result<()> {
         let cfg = MatmulConfig {
             transa: true,
@@ -166,43 +127,6 @@ impl CublasLtOps {
             stride_bias: None,
             batch_size: None,
         };
-        // Use autotuned algo if available
-        {
-            let cache = self.algo_cache.borrow();
-            if let Some(algo) = cache.get(&(m, n, k)) {
-                use std::ffi::c_void;
-                unsafe {
-                    let handle = *self.handle.handle();
-                    let mut desc: lt_sys::cublasLtMatmulDesc_t = std::ptr::null_mut();
-                    lt_sys::cublasLtMatmulDescCreate(&mut desc, lt_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F, lt_sys::cudaDataType_t::CUDA_R_32F);
-                    let ta = lt_sys::cublasOperation_t::CUBLAS_OP_T;
-                    let tb = lt_sys::cublasOperation_t::CUBLAS_OP_N;
-                    lt_sys::cublasLtMatmulDescSetAttribute(desc, lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA, &ta as *const _ as *const c_void, std::mem::size_of_val(&ta));
-                    lt_sys::cublasLtMatmulDescSetAttribute(desc, lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSB, &tb as *const _ as *const c_void, std::mem::size_of_val(&tb));
-                    let f16t = lt_sys::cudaDataType_t::CUDA_R_16F;
-                    let mut la: lt_sys::cublasLtMatrixLayout_t = std::ptr::null_mut();
-                    let mut lb: lt_sys::cublasLtMatrixLayout_t = std::ptr::null_mut();
-                    let mut lc: lt_sys::cublasLtMatrixLayout_t = std::ptr::null_mut();
-                    lt_sys::cublasLtMatrixLayoutCreate(&mut la, f16t, k as u64, n as u64, k as i64);
-                    lt_sys::cublasLtMatrixLayoutCreate(&mut lb, f16t, k as u64, m as u64, k as i64);
-                    lt_sys::cublasLtMatrixLayoutCreate(&mut lc, f16t, n as u64, m as u64, n as i64);
-                    let (b_ptr, _) = DevicePtr::device_ptr(b, &self.stream);
-                    let (a_ptr, _) = DevicePtr::device_ptr(a, &self.stream);
-                    let (c_ptr, _) = DevicePtrMut::device_ptr_mut(c, &self.stream);
-                    let ws_borrow = self.autotune_ws.borrow();
-                    let (ws_ptr, ws_size) = match *ws_borrow {
-                        Some(ref ws) => { let (p, _) = DevicePtr::device_ptr(ws, &self.stream); (p as *mut c_void, ws.len()) }
-                        None => (std::ptr::null_mut(), 0usize)
-                    };
-                    let stream_raw = lt_sys::cu_stream_to_cuda_stream(self.stream.cu_stream());
-                    let s = lt_sys::cublasLtMatmul(handle, desc, &alpha as *const _ as *const c_void, b_ptr as *const c_void, la, a_ptr as *const c_void, lb, &beta as *const _ as *const c_void, c_ptr as *mut c_void, lc, c_ptr as *mut c_void, lc, algo, ws_ptr, ws_size, stream_raw);
-                    lt_sys::cublasLtMatrixLayoutDestroy(la); lt_sys::cublasLtMatrixLayoutDestroy(lb); lt_sys::cublasLtMatrixLayoutDestroy(lc);
-                    lt_sys::cublasLtMatmulDescDestroy(desc);
-                    if s != lt_sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS { return Err(LLMError::GpuError(format!("autotuned matmul: {s:?}"))); }
-                }
-                return Ok(());
-            }
-        }
         unsafe {
             self.handle
                 .matmul(cfg, b, a, c, None, None)
@@ -242,43 +166,6 @@ impl CublasLtOps {
             batch_size: None,
         };
 
-        // Use autotuned algo if available
-        {
-            let cache = self.algo_cache.borrow();
-            if let Some(algo) = cache.get(&(m, n, k)) {
-                use std::ffi::c_void;
-                unsafe {
-                    let handle = *self.handle.handle();
-                    let mut desc: lt_sys::cublasLtMatmulDesc_t = std::ptr::null_mut();
-                    lt_sys::cublasLtMatmulDescCreate(&mut desc, lt_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F, lt_sys::cudaDataType_t::CUDA_R_32F);
-                    let ta = lt_sys::cublasOperation_t::CUBLAS_OP_T;
-                    let tb = lt_sys::cublasOperation_t::CUBLAS_OP_N;
-                    lt_sys::cublasLtMatmulDescSetAttribute(desc, lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA, &ta as *const _ as *const c_void, std::mem::size_of_val(&ta));
-                    lt_sys::cublasLtMatmulDescSetAttribute(desc, lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSB, &tb as *const _ as *const c_void, std::mem::size_of_val(&tb));
-                    let f16t = lt_sys::cudaDataType_t::CUDA_R_16F;
-                    let mut la: lt_sys::cublasLtMatrixLayout_t = std::ptr::null_mut();
-                    let mut lb: lt_sys::cublasLtMatrixLayout_t = std::ptr::null_mut();
-                    let mut lc: lt_sys::cublasLtMatrixLayout_t = std::ptr::null_mut();
-                    lt_sys::cublasLtMatrixLayoutCreate(&mut la, f16t, k as u64, n as u64, k as i64);
-                    lt_sys::cublasLtMatrixLayoutCreate(&mut lb, f16t, k as u64, m as u64, k as i64);
-                    lt_sys::cublasLtMatrixLayoutCreate(&mut lc, f16t, n as u64, m as u64, n as i64);
-                    let (b_ptr, _) = DevicePtr::device_ptr(b, &self.stream);
-                    let (a_ptr, _) = DevicePtr::device_ptr(a, &self.stream);
-                    let (c_ptr, _) = DevicePtrMut::device_ptr_mut(c, &self.stream);
-                    let ws_borrow = self.autotune_ws.borrow();
-                    let (ws_ptr, ws_size) = match *ws_borrow {
-                        Some(ref ws) => { let (p, _) = DevicePtr::device_ptr(ws, &self.stream); (p as *mut c_void, ws.len()) }
-                        None => (std::ptr::null_mut(), 0usize)
-                    };
-                    let stream_raw = lt_sys::cu_stream_to_cuda_stream(self.stream.cu_stream());
-                    let s = lt_sys::cublasLtMatmul(handle, desc, &alpha as *const _ as *const c_void, b_ptr as *const c_void, la, a_ptr as *const c_void, lb, &beta as *const _ as *const c_void, c_ptr as *mut c_void, lc, c_ptr as *mut c_void, lc, algo, ws_ptr, ws_size, stream_raw);
-                    lt_sys::cublasLtMatrixLayoutDestroy(la); lt_sys::cublasLtMatrixLayoutDestroy(lb); lt_sys::cublasLtMatrixLayoutDestroy(lc);
-                    lt_sys::cublasLtMatmulDescDestroy(desc);
-                    if s != lt_sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS { return Err(LLMError::GpuError(format!("autotuned matmul: {s:?}"))); }
-                }
-                return Ok(());
-            }
-        }
         unsafe {
             self.handle
                 .matmul(cfg, b, a, c, None, None)
@@ -302,7 +189,7 @@ impl CublasLtOps {
         use std::ffi::c_void;
 
         unsafe {
-            let handle = *self.handle.handle();
+            let handle = self.handle.handle();
 
             let mut desc: lt_sys::cublasLtMatmulDesc_t = std::ptr::null_mut();
             let s = lt_sys::cublasLtMatmulDescCreate(&mut desc, lt_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F, lt_sys::cudaDataType_t::CUDA_R_32F);
@@ -355,7 +242,7 @@ impl CublasLtOps {
                 output_f16_ptr as *mut c_void, layout_c,
                 &heur.algo,
                 ws_ptr as *mut c_void, ws_size,
-                lt_sys::cu_stream_to_cuda_stream(self.stream.cu_stream()),
+                self.stream.cu_stream(),
             );
 
             lt_sys::cublasLtMatmulPreferenceDestroy(pref);
@@ -369,94 +256,5 @@ impl CublasLtOps {
             }
         }
         Ok(())
-    }
-
-
-    /// Store autotuned algorithms for later use in hgemm_a_bt.
-    pub fn set_autotuned(&self, algos: &std::collections::HashMap<(usize,usize,usize), (lt_sys::cublasLtMatmulAlgo_t, usize)>) {
-        let mut cache = self.algo_cache.borrow_mut();
-        let mut max_ws = 0usize;
-        for ((m,n,k), (algo, ws)) in algos {
-            cache.insert((*m,*n,*k), *algo);
-            max_ws = max_ws.max(*ws);
-        }
-        if max_ws > 0 {
-            if let Ok(buf) = unsafe { self.stream.alloc::<u8>(max_ws) } {
-                *self.autotune_ws.borrow_mut() = Some(buf);
-            }
-        }
-    }
-
-    /// Autotune: benchmark cublasLt algorithms for an f16 GEMM shape.
-    pub fn autotune_hgemm(&self, m: usize, n: usize, k: usize) -> Result<(lt_sys::cublasLtMatmulAlgo_t, usize)> {
-        use std::ffi::c_void;
-        unsafe {
-            let handle = *self.handle.handle();
-            let buf_bytes = (m * n).max(m * k).max(n * k) * 2;
-            let mut d_a = self.stream.alloc::<u8>(buf_bytes).map_err(|e| LLMError::GpuError(format!("at: {e}")))?;
-            let mut d_b = self.stream.alloc::<u8>(buf_bytes).map_err(|e| LLMError::GpuError(format!("at: {e}")))?;
-            let mut d_c = self.stream.alloc::<u8>(buf_bytes).map_err(|e| LLMError::GpuError(format!("at: {e}")))?;
-            let mut desc: lt_sys::cublasLtMatmulDesc_t = std::ptr::null_mut();
-            lt_sys::cublasLtMatmulDescCreate(&mut desc, lt_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F, lt_sys::cudaDataType_t::CUDA_R_32F);
-            let ta = lt_sys::cublasOperation_t::CUBLAS_OP_T;
-            let tb = lt_sys::cublasOperation_t::CUBLAS_OP_N;
-            lt_sys::cublasLtMatmulDescSetAttribute(desc, lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA, &ta as *const _ as *const c_void, std::mem::size_of_val(&ta));
-            lt_sys::cublasLtMatmulDescSetAttribute(desc, lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSB, &tb as *const _ as *const c_void, std::mem::size_of_val(&tb));
-            let f16t = lt_sys::cudaDataType_t::CUDA_R_16F;
-            let mut la: lt_sys::cublasLtMatrixLayout_t = std::ptr::null_mut();
-            let mut lb: lt_sys::cublasLtMatrixLayout_t = std::ptr::null_mut();
-            let mut lc: lt_sys::cublasLtMatrixLayout_t = std::ptr::null_mut();
-            lt_sys::cublasLtMatrixLayoutCreate(&mut la, f16t, k as u64, n as u64, k as i64);
-            lt_sys::cublasLtMatrixLayoutCreate(&mut lb, f16t, k as u64, m as u64, k as i64);
-            lt_sys::cublasLtMatrixLayoutCreate(&mut lc, f16t, n as u64, m as u64, n as i64);
-            let mut pref: lt_sys::cublasLtMatmulPreference_t = std::ptr::null_mut();
-            lt_sys::cublasLtMatmulPreferenceCreate(&mut pref);
-            let ws_limit: usize = 32 * 1024 * 1024;
-            lt_sys::cublasLtMatmulPreferenceSetAttribute(pref, lt_sys::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws_limit as *const _ as *const c_void, std::mem::size_of_val(&ws_limit));
-            let mut results = vec![std::mem::zeroed::<lt_sys::cublasLtMatmulHeuristicResult_t>(); 32];
-            let mut nr: i32 = 0;
-            lt_sys::cublasLtMatmulAlgoGetHeuristic(handle, desc, la, lb, lc, lc, pref, 32, results.as_mut_ptr(), &mut nr);
-            if nr == 0 {
-                lt_sys::cublasLtMatmulPreferenceDestroy(pref);
-                lt_sys::cublasLtMatrixLayoutDestroy(la); lt_sys::cublasLtMatrixLayoutDestroy(lb); lt_sys::cublasLtMatrixLayoutDestroy(lc);
-                lt_sys::cublasLtMatmulDescDestroy(desc);
-                return Err(LLMError::GpuError(format!("no algos for [{m},{n},{k}]")));
-            }
-            let mut ws = self.stream.alloc::<u8>(ws_limit).map_err(|e| LLMError::GpuError(format!("ws: {e}")))?;
-            let alpha: f32 = 1.0; let beta: f32 = 0.0;
-            let (ap, _) = DevicePtr::device_ptr(&d_a, &self.stream);
-            let (bp, _) = DevicePtr::device_ptr(&d_b, &self.stream);
-            let (cp, _) = DevicePtrMut::device_ptr_mut(&mut d_c, &self.stream);
-            let (wp, _) = DevicePtrMut::device_ptr_mut(&mut ws, &self.stream);
-            let mut ev0: cudarc::driver::sys::CUevent = std::ptr::null_mut();
-            let mut ev1: cudarc::driver::sys::CUevent = std::ptr::null_mut();
-            cudarc::driver::sys::cuEventCreate(&mut ev0, 0);
-            cudarc::driver::sys::cuEventCreate(&mut ev1, 0);
-            let mut best = results[0].algo;
-            let mut best_ws = results[0].workspaceSize;
-            let mut best_t = f64::MAX;
-            let stream_raw = lt_sys::cu_stream_to_cuda_stream(self.stream.cu_stream());
-            for i in 0..nr as usize {
-                let a = &results[i].algo;
-                let aws = results[i].workspaceSize;
-                if aws > ws_limit { continue; }
-                for _ in 0..3 { lt_sys::cublasLtMatmul(handle, desc, &alpha as *const _ as *const c_void, ap as *const c_void, la, bp as *const c_void, lb, &beta as *const _ as *const c_void, cp as *mut c_void, lc, cp as *mut c_void, lc, a, wp as *mut c_void, aws, stream_raw); }
-                cudarc::driver::sys::cuStreamSynchronize(self.stream.cu_stream());
-                cudarc::driver::sys::cuEventRecord(ev0, self.stream.cu_stream());
-                for _ in 0..10 { lt_sys::cublasLtMatmul(handle, desc, &alpha as *const _ as *const c_void, ap as *const c_void, la, bp as *const c_void, lb, &beta as *const _ as *const c_void, cp as *mut c_void, lc, cp as *mut c_void, lc, a, wp as *mut c_void, aws, stream_raw); }
-                cudarc::driver::sys::cuEventRecord(ev1, self.stream.cu_stream());
-                cudarc::driver::sys::cuStreamSynchronize(self.stream.cu_stream());
-                let mut ms: f32 = 0.0;
-                cudarc::driver::sys::cuEventElapsedTime(&mut ms, ev0, ev1);
-                let t = (ms as f64) * 100.0;
-                if t < best_t { best_t = t; best = *a; best_ws = aws; }
-            }
-            cudarc::driver::sys::cuEventDestroy_v2(ev0); cudarc::driver::sys::cuEventDestroy_v2(ev1);
-            lt_sys::cublasLtMatmulPreferenceDestroy(pref);
-            lt_sys::cublasLtMatrixLayoutDestroy(la); lt_sys::cublasLtMatrixLayoutDestroy(lb); lt_sys::cublasLtMatrixLayoutDestroy(lc);
-            lt_sys::cublasLtMatmulDescDestroy(desc);
-            tracing::info!(m, n, k, algos = nr, us = format!("{best_t:.1}"), "autotuned");
-            Ok((best, best_ws))
-        }
     }
 }
