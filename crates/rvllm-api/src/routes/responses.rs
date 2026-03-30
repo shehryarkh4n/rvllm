@@ -37,6 +37,54 @@ pub struct StoredResponse {
 
 pub type SharedResponseStore = Arc<RwLock<HashMap<String, StoredResponse>>>;
 
+#[derive(Debug, Clone, Default)]
+pub struct StoredConversation {
+    pub items: Vec<StoredConversationItem>,
+}
+
+pub type SharedConversationStore = Arc<RwLock<HashMap<String, StoredConversation>>>;
+
+async fn base_conversation_items(
+    state: &Arc<AppState>,
+    req: &CreateResponseRequest,
+) -> Result<Vec<StoredConversationItem>, ApiError> {
+    if let Some(previous_response_id) = &req.previous_response_id {
+        let store = state.response_store.read().await;
+        let stored = store.get(previous_response_id).ok_or_else(|| {
+            ApiError::InvalidRequest(format!(
+                "previous_response_id '{}' was not found or is not stored",
+                previous_response_id
+            ))
+        })?;
+        return Ok(stored.conversation_items.clone());
+    }
+
+    if let Some(conversation_id) = req.normalize_conversation_id()? {
+        let store = state.conversation_store.read().await;
+        return Ok(store
+            .get(&conversation_id)
+            .map(|conversation| conversation.items.clone())
+            .unwrap_or_default());
+    }
+
+    Ok(Vec::new())
+}
+
+async fn persist_conversation_items(
+    state: &Arc<AppState>,
+    conversation_id: Option<&str>,
+    items: Vec<StoredConversationItem>,
+) {
+    let Some(conversation_id) = conversation_id else {
+        return;
+    };
+    let mut store = state.conversation_store.write().await;
+    store.insert(
+        conversation_id.to_string(),
+        StoredConversation { items },
+    );
+}
+
 async fn collect_response_output(
     engine: Arc<dyn crate::server::InferenceEngine>,
     prompt: String,
@@ -73,18 +121,8 @@ pub async fn create_response(
     }
 
     let input_items = req.normalize_input_items()?;
-    let mut conversation_items = if let Some(previous_response_id) = &req.previous_response_id {
-        let store = state.response_store.read().await;
-        let stored = store.get(previous_response_id).ok_or_else(|| {
-            ApiError::InvalidRequest(format!(
-                "previous_response_id '{}' was not found or is not stored",
-                previous_response_id
-            ))
-        })?;
-        stored.conversation_items.clone()
-    } else {
-        Vec::new()
-    };
+    let conversation_id = req.normalize_conversation_id()?;
+    let mut conversation_items = base_conversation_items(&state, &req).await?;
     conversation_items.extend(
         input_items
             .iter()
@@ -186,6 +224,7 @@ pub async fn create_response(
 
         let engine = state.engine.clone();
         let response_store = state.response_store.clone();
+        let conversation_store_state = state.clone();
         let model = state.model_name.clone();
         let req_clone = req.clone();
         let prompt_clone = prompt.clone();
@@ -197,6 +236,7 @@ pub async fn create_response(
         let response_reasoning_clone = response_reasoning.clone();
         let tool_choice_clone = tool_choice.clone();
         let response_tools_clone = response_tools.clone();
+        let conversation_id_clone = conversation_id.clone();
 
         tokio::spawn(async move {
             let result = collect_response_output(engine, prompt_clone, sampling_params_clone).await;
@@ -228,6 +268,12 @@ pub async fn create_response(
                             .cloned()
                             .map(StoredConversationItem::Output),
                     );
+                    persist_conversation_items(
+                        &conversation_store_state,
+                        conversation_id_clone.as_deref(),
+                        stored_items.clone(),
+                    )
+                    .await;
                     *stored = StoredResponse {
                         response,
                         input_items: input_items_clone,
@@ -270,6 +316,7 @@ pub async fn create_response(
         let model = state.model_name.clone();
         let input_items_clone = input_items.clone();
         let conversation_items_clone = conversation_items.clone();
+        let conversation_store_state = state.clone();
         let req_clone = req.clone();
         let response_store = state.response_store.clone();
         let response_id_clone = response_id.clone();
@@ -277,6 +324,7 @@ pub async fn create_response(
         let response_reasoning_clone = response_reasoning.clone();
         let tool_choice_clone = tool_choice.clone();
         let response_tools_clone = response_tools.clone();
+        let conversation_id_clone = conversation_id.clone();
 
         let (_request_id, mut output_stream) = state
             .engine
@@ -524,6 +572,13 @@ pub async fn create_response(
                 let mut stored_items = conversation_items_clone;
                 stored_items.extend(output_items.into_iter().map(StoredConversationItem::Output));
 
+                persist_conversation_items(
+                    &conversation_store_state,
+                    conversation_id_clone.as_deref(),
+                    stored_items.clone(),
+                )
+                .await;
+
                 let mut store = response_store.write().await;
                 store.insert(
                     response_id_clone,
@@ -559,7 +614,7 @@ pub async fn create_response(
         )?;
 
         if req.store {
-            let mut stored_items = conversation_items;
+            let mut stored_items = conversation_items.clone();
             stored_items.extend(
                 response
                     .output
@@ -567,6 +622,9 @@ pub async fn create_response(
                     .cloned()
                     .map(StoredConversationItem::Output),
             );
+
+            persist_conversation_items(&state, conversation_id.as_deref(), stored_items.clone())
+                .await;
 
             let mut store = state.response_store.write().await;
             store.insert(
@@ -577,6 +635,18 @@ pub async fn create_response(
                     conversation_items: stored_items,
                 },
             );
+        }
+
+        if !req.store {
+            let mut stored_items = conversation_items;
+            stored_items.extend(
+                response
+                    .output
+                    .iter()
+                    .cloned()
+                    .map(StoredConversationItem::Output),
+            );
+            persist_conversation_items(&state, conversation_id.as_deref(), stored_items).await;
         }
 
         Ok(Json(response).into_response())
@@ -608,10 +678,12 @@ async fn stream_tool_response(
 ) -> Result<Response, ApiError> {
     let model = state.model_name.clone();
     let response_store = state.response_store.clone();
+    let conversation_store_state = state.clone();
     let response_text = req.normalize_text_config().ok();
     let response_reasoning = req.normalize_reasoning_config().ok();
     let tool_choice = req.effective_tool_choice();
     let response_tools = req.tools.clone().unwrap_or_default();
+    let conversation_id = req.normalize_conversation_id().ok().flatten();
 
     let (_request_id, mut output_stream) = state
         .engine
@@ -1092,6 +1164,13 @@ async fn stream_tool_response(
             let mut stored_items = conversation_items;
             stored_items.extend(output_items.into_iter().map(StoredConversationItem::Output));
 
+            persist_conversation_items(
+                &conversation_store_state,
+                conversation_id.as_deref(),
+                stored_items.clone(),
+            )
+            .await;
+
             let mut store = response_store.write().await;
             store.insert(
                 response_id,
@@ -1101,6 +1180,15 @@ async fn stream_tool_response(
                     conversation_items: stored_items,
                 },
             );
+        } else {
+            let mut stored_items = conversation_items;
+            stored_items.extend(output_items.into_iter().map(StoredConversationItem::Output));
+            persist_conversation_items(
+                &conversation_store_state,
+                conversation_id.as_deref(),
+                stored_items,
+            )
+            .await;
         }
     });
 
@@ -1916,6 +2004,42 @@ mod tests {
         let input_items = input_items.json::<serde_json::Value>();
         assert_eq!(input_items["data"][0]["type"], "function_call_output");
         assert_eq!(input_items["data"][0]["output"]["temp_c"], 18);
+    }
+
+    #[tokio::test]
+    async fn conversation_id_replays_prior_turns_without_previous_response_id() {
+        let (server, engine) = make_server(vec![
+            vec![request_output("First answer.", true)],
+            vec![request_output("Second answer.", true)],
+        ]);
+
+        let first = server
+            .post("/v1/responses")
+            .json(&serde_json::json!({
+                "model": "test",
+                "conversation": {"id": "conv_test"},
+                "input": "First question",
+                "store": false,
+            }))
+            .await;
+        first.assert_status_ok();
+
+        let second = server
+            .post("/v1/responses")
+            .json(&serde_json::json!({
+                "model": "test",
+                "conversation": {"id": "conv_test"},
+                "input": "Second question",
+                "store": false,
+            }))
+            .await;
+        second.assert_status_ok();
+
+        let prompts = engine.prompts();
+        assert_eq!(prompts.len(), 2);
+        assert!(prompts[1].contains("First question"));
+        assert!(prompts[1].contains("First answer."));
+        assert!(prompts[1].contains("Second question"));
     }
 
     #[tokio::test]

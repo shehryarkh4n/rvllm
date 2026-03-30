@@ -79,6 +79,8 @@ pub struct AppState {
     pub batch_store: Option<crate::routes::batch::SharedBatchStore>,
     /// Stored response objects for Responses API follow-up turns and retrieval.
     pub response_store: crate::routes::responses::SharedResponseStore,
+    /// Stored conversation state for Responses API conversation-based turns.
+    pub conversation_store: crate::routes::responses::SharedConversationStore,
     next_id: AtomicU64,
 }
 
@@ -90,6 +92,7 @@ impl AppState {
             tokenizer: Arc::new(RwLock::new(tokenizer)),
             batch_store: Some(crate::routes::batch::create_batch_store(None)),
             response_store: Arc::new(RwLock::new(HashMap::new())),
+            conversation_store: Arc::new(RwLock::new(HashMap::new())),
             next_id: AtomicU64::new(1),
         }
     }

@@ -332,6 +332,24 @@ class TestResponses:
         assert data["data"][0]["content"][1]["type"] == "input_image"
         assert data["data"][0]["content"][1]["image_url"] == "https://example.com/cat.png"
 
+    def test_response_conversation_reuses_prior_turns(self):
+        """Responses accept conversation ids for multi-turn state without previous_response_id"""
+        first = requests.post(f"{BASE_URL}/v1/responses", json={
+            "model": "test",
+            "conversation": {"id": "conv_test_py"},
+            "input": "First question",
+            "store": False,
+        })
+        assert first.status_code == 200
+
+        second = requests.post(f"{BASE_URL}/v1/responses", json={
+            "model": "test",
+            "conversation": {"id": "conv_test_py"},
+            "input": "Second question",
+            "store": False,
+        })
+        assert second.status_code == 200
+
     def test_response_rejects_built_in_tools(self):
         """Built-in Responses tools are still rejected explicitly"""
         r = requests.post(f"{BASE_URL}/v1/responses", json={

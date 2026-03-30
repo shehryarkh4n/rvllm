@@ -206,6 +206,11 @@ pub struct CreateResponseRequest {
     pub truncation: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
+pub struct ResponseConversationRef {
+    pub id: String,
+}
+
 /// A text input part inside a message item.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
 pub struct ResponseInputTextPart {
@@ -686,9 +691,10 @@ impl CreateResponseRequest {
         }
         let _ = self.normalize_text_config()?;
         let _ = self.normalize_reasoning_config()?;
-        if self.conversation.is_some() {
+        let _ = self.normalize_conversation_id()?;
+        if self.conversation.is_some() && self.previous_response_id.is_some() {
             return Err(ApiError::InvalidRequest(
-                "conversation state objects are not supported on /v1/responses yet".into(),
+                "conversation and previous_response_id cannot both be provided".into(),
             ));
         }
         let _ = self.normalize_include()?;
@@ -716,9 +722,12 @@ impl CreateResponseRequest {
                 "top_p must be between 0.0 and 1.0".into(),
             ));
         }
-        if self.input.is_none() && self.previous_response_id.is_none() {
+        if self.input.is_none()
+            && self.previous_response_id.is_none()
+            && self.normalize_conversation_id()?.is_none()
+        {
             return Err(ApiError::InvalidRequest(
-                "input is required unless previous_response_id is provided".into(),
+                "input is required unless previous_response_id or conversation is provided".into(),
             ));
         }
         Ok(())
@@ -886,6 +895,40 @@ impl CreateResponseRequest {
         }
 
         Ok(normalized)
+    }
+
+    pub fn normalize_conversation_id(&self) -> Result<Option<String>, ApiError> {
+        let Some(conversation) = &self.conversation else {
+            return Ok(None);
+        };
+        match conversation {
+            serde_json::Value::Null => Ok(None),
+            serde_json::Value::String(id) => {
+                if id.is_empty() {
+                    return Err(ApiError::InvalidRequest(
+                        "responses conversation id must not be empty".into(),
+                    ));
+                }
+                Ok(Some(id.clone()))
+            }
+            serde_json::Value::Object(map) => {
+                let id = map
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        ApiError::InvalidRequest("responses conversation.id is required".into())
+                    })?;
+                if id.is_empty() {
+                    return Err(ApiError::InvalidRequest(
+                        "responses conversation id must not be empty".into(),
+                    ));
+                }
+                Ok(Some(id.to_string()))
+            }
+            _ => Err(ApiError::InvalidRequest(
+                "responses conversation must be a string or object".into(),
+            )),
+        }
     }
 
     pub fn normalize_include(&self) -> Result<Vec<String>, ApiError> {
@@ -1297,6 +1340,65 @@ mod tests {
                 "reasoning.encrypted_content".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn request_accepts_conversation_string_id() {
+        let req = CreateResponseRequest {
+            model: "test".into(),
+            input: None,
+            instructions: None,
+            max_output_tokens: None,
+            temperature: 1.0,
+            top_p: 1.0,
+            stream: false,
+            store: false,
+            previous_response_id: None,
+            metadata: BTreeMap::new(),
+            background: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: true,
+            text: None,
+            reasoning: None,
+            conversation: Some(serde_json::json!("conv_123")),
+            include: None,
+            truncation: None,
+        };
+        req.validate().unwrap();
+        assert_eq!(
+            req.normalize_conversation_id().unwrap(),
+            Some("conv_123".into())
+        );
+    }
+
+    #[test]
+    fn request_rejects_conversation_with_previous_response_id() {
+        let req = CreateResponseRequest {
+            model: "test".into(),
+            input: Some(ResponseInput::Text("Hello".into())),
+            instructions: None,
+            max_output_tokens: None,
+            temperature: 1.0,
+            top_p: 1.0,
+            stream: false,
+            store: true,
+            previous_response_id: Some("resp_123".into()),
+            metadata: BTreeMap::new(),
+            background: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: true,
+            text: None,
+            reasoning: None,
+            conversation: Some(serde_json::json!({"id": "conv_123"})),
+            include: None,
+            truncation: None,
+        };
+        let err = req.validate().unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("conversation and previous_response_id cannot both be provided"));
     }
 
     #[test]
