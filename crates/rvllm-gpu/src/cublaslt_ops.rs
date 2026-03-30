@@ -15,7 +15,9 @@ use crate::{LLMError, Result};
 /// Threshold: use cublasLt for decode-sized GEMMs (M <= this value).
 /// Above this we fall back to standard cuBLAS which has less overhead
 /// for large batch prefill shapes.
-pub const CUBLASLT_M_THRESHOLD: usize = 256;
+// cublasLt at M=128 is slightly slower than cuBLAS without autotuning.
+// Keep threshold at 32 until autotuner wires the best algo per shape.
+pub const CUBLASLT_M_THRESHOLD: usize = 32;
 
 /// 4 MiB workspace for split-K heuristics in cublasLt.
 const FP8_WORKSPACE_SIZE: usize = 4 * 1024 * 1024;

@@ -744,7 +744,14 @@ mod inner {
                         cfg.rms_norm_eps, num_tokens, hidden, s.normed)?;
                     residual_from_fused = false;
                 };
-                let residual_ref = if residual_from_fused { &*s.residual } else { hidden_f16 };
+                // Use down buffer as temp for residual ref to avoid aliasing with s.residual output
+                let residual_ref: &CudaSlice<f16> = if residual_from_fused {
+                    self.stream.memcpy_dtod(&*s.residual, s.down)
+                        .map_err(|e| LLMError::GpuError(format!("residual copy: {e}")))?;
+                    &*s.down
+                } else {
+                    hidden_f16
+                };
 
                 // 2. QKV GEMM into scratch
                 if let Some(fused_qkv) = weights.fused_qkv {
@@ -836,7 +843,7 @@ mod inner {
                         let total = n_elems as u32;
                         unsafe {
                             self.stream.launch_builder(silu_fn)
-                                .arg(s.silu_out).arg(&*s.gate_up)
+                                .arg(&mut *s.silu_out).arg(&*s.gate_up)
                                 .arg(&(num_tokens as i32)).arg(&(intermediate as i32))
                                 .launch(LaunchConfig { grid_dim: ((total + 255) / 256, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 })
                                 .map_err(|e| LLMError::GpuError(format!("silu_interleaved: {e}")))?;
