@@ -1776,6 +1776,39 @@ impl GpuWorker {
         Ok(())
     }
 
+    pub fn num_layers(&self) -> usize {
+        self.config.num_layers
+    }
+
+    pub fn forward_logits_partial(
+        &mut self,
+        metadata: &[SequenceGroupMetadata],
+        max_layers: usize,
+    ) -> Result<Vec<f32>> {
+        if metadata.is_empty() {
+            return Ok(Vec::new());
+        }
+        let model_input = input::prepare_input(metadata, self.config.block_size)?;
+        #[cfg(feature = "cuda")]
+        {
+            let runner = self.gpu_model_runner.as_ref().ok_or_else(|| {
+                LLMError::GpuError("GPU model runner not initialized".into())
+            })?;
+            return runner.forward_partial(
+                &model_input.token_ids,
+                &model_input.position_ids,
+                &model_input.attention_metadata,
+                model_input.is_prefill,
+                max_layers,
+            );
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = max_layers;
+            Err(LLMError::GpuError("requires --features cuda".into()))
+        }
+    }
+
     pub fn device_id(&self) -> usize {
         self.device_id
     }

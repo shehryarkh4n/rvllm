@@ -6,7 +6,11 @@ license.workspace = true
 description = "Kernel fusion IR and compiler for rvLLM"
 authors.workspace = true
 
+[features]
+default = []
+llvm = ["inkwell"]
+
 [dependencies]
-inkwell = { version = "0.8", features = ["llvm20-1", "target-nvptx"] }
+inkwell = { version = "0.8", features = ["llvm20-1", "target-nvptx"], optional = true }
 serde = { version = "1", features = ["derive"] }
 tracing.workspace = true

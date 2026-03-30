@@ -6,6 +6,7 @@ use std::process::Command;
 use std::time::Instant;
 
 use crate::ir::FusedKernel;
+#[cfg(feature = "llvm")]
 use crate::llvm_backend::LlvmPtxCompiler;
 
 // ---------------------------------------------------------------------------
@@ -219,6 +220,7 @@ impl JitCompiler {
 // LLVM-based compilation (no nvcc dependency)
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "llvm")]
 impl JitCompiler {
     /// Compile a fused kernel to PTX via the LLVM NVPTX backend.
     /// Falls back to nvcc-based compilation if LLVM compilation fails.

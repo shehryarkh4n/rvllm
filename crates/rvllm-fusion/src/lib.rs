@@ -4,6 +4,8 @@ pub mod compiler;
 pub mod dispatch;
 pub mod ir;
 pub mod jit;
+#[cfg(feature = "llvm")]
 pub mod llvm_backend;
 pub mod matcher;
+pub mod ptx_emit;
 pub mod verify;
