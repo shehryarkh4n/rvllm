@@ -37,6 +37,27 @@ pub struct StoredResponse {
 
 pub type SharedResponseStore = Arc<RwLock<HashMap<String, StoredResponse>>>;
 
+async fn collect_response_output(
+    engine: Arc<dyn crate::server::InferenceEngine>,
+    prompt: String,
+    sampling_params: rvllm_core::prelude::SamplingParams,
+) -> Result<rvllm_core::prelude::RequestOutput, ApiError> {
+    let (_request_id, mut output_stream) = engine
+        .generate(prompt, sampling_params)
+        .await
+        .map_err(ApiError::from)?;
+
+    let mut last_output = None;
+    while let Some(output) = output_stream.next().await {
+        last_output = Some(output.clone());
+        if output.finished {
+            break;
+        }
+    }
+
+    last_output.ok_or_else(|| ApiError::Internal("engine produced no output".into()))
+}
+
 /// POST /v1/responses -- create a unified response.
 pub async fn create_response(
     State(state): State<Arc<AppState>>,
@@ -125,11 +146,108 @@ pub async fn create_response(
     info!(
         model = %req.model,
         stream = req.stream,
+        background = req.background.unwrap_or(false),
         store = req.store,
         tools = req.tools_enabled(),
         previous_response = req.previous_response_id.as_deref().unwrap_or("none"),
         "responses request"
     );
+
+    if req.background == Some(true) {
+        let initial = ResponseObject::in_progress(
+            response_id.clone(),
+            state.model_name.clone(),
+            req.instructions.clone(),
+            req.max_output_tokens,
+            req.previous_response_id.clone(),
+            true,
+            req.temperature,
+            req.top_p,
+            req.metadata.clone(),
+            req.parallel_tool_calls,
+            response_text.clone(),
+            tool_choice.clone(),
+            response_tools.clone(),
+        );
+
+        {
+            let mut store = state.response_store.write().await;
+            store.insert(
+                response_id.clone(),
+                StoredResponse {
+                    response: initial.clone(),
+                    input_items: input_items.clone(),
+                    conversation_items: conversation_items.clone(),
+                },
+            );
+        }
+
+        let engine = state.engine.clone();
+        let response_store = state.response_store.clone();
+        let model = state.model_name.clone();
+        let req_clone = req.clone();
+        let prompt_clone = prompt.clone();
+        let sampling_params_clone = sampling_params.clone();
+        let response_id_clone = response_id.clone();
+        let input_items_clone = input_items.clone();
+        let conversation_items_clone = conversation_items.clone();
+        let function_tools_clone = function_tools.clone();
+        let tool_choice_clone = tool_choice.clone();
+        let response_tools_clone = response_tools.clone();
+
+        tokio::spawn(async move {
+            let result = collect_response_output(engine, prompt_clone, sampling_params_clone).await;
+
+            let mut store = response_store.write().await;
+            let Some(stored) = store.get_mut(&response_id_clone) else {
+                return;
+            };
+
+            match result.and_then(|output| {
+                response_from_output(
+                    &response_id_clone,
+                    &model,
+                    &req_clone,
+                    &output,
+                    &function_tools_clone,
+                    tool_choice_clone.clone(),
+                    response_tools_clone.clone(),
+                )
+                .map(|response| (response, output))
+            }) {
+                Ok((response, _output)) => {
+                    let mut stored_items = conversation_items_clone;
+                    stored_items.extend(
+                        response
+                            .output
+                            .iter()
+                            .cloned()
+                            .map(StoredConversationItem::Output),
+                    );
+                    *stored = StoredResponse {
+                        response,
+                        input_items: input_items_clone,
+                        conversation_items: stored_items,
+                    };
+                }
+                Err(err) => {
+                    stored.response.status = "failed".to_string();
+                    stored.response.error = Some(serde_json::json!({
+                        "message": err.to_string(),
+                        "type": "internal_error",
+                    }));
+                    stored.response.completed_at = Some(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs(),
+                    );
+                }
+            }
+        });
+
+        return Ok(Json(initial).into_response());
+    }
 
     if req.stream {
         if req.tools_enabled() {
@@ -419,22 +537,7 @@ pub async fn create_response(
             .unwrap()
             .into_response())
     } else {
-        let (_request_id, mut output_stream) = state
-            .engine
-            .generate(prompt, sampling_params)
-            .await
-            .map_err(ApiError::from)?;
-
-        let mut last_output = None;
-        while let Some(output) = output_stream.next().await {
-            last_output = Some(output.clone());
-            if output.finished {
-                break;
-            }
-        }
-
-        let output =
-            last_output.ok_or_else(|| ApiError::Internal("engine produced no output".into()))?;
+        let output = collect_response_output(state.engine.clone(), prompt, sampling_params).await?;
 
         let response = response_from_output(
             &response_id,
@@ -1562,6 +1665,60 @@ mod tests {
         let body = response.json::<serde_json::Value>();
         assert_eq!(body["object"], "response");
         assert_eq!(body["text"]["format"]["type"], "json_object");
+    }
+
+    #[tokio::test]
+    async fn background_response_returns_in_progress_then_completes() {
+        let (server, _) = make_server(vec![vec![request_output("done", true)]]);
+
+        let created = server
+            .post("/v1/responses")
+            .json(&serde_json::json!({
+                "model": "test",
+                "input": "Hello",
+                "store": true,
+                "background": true,
+            }))
+            .await;
+
+        created.assert_status_ok();
+        let created = created.json::<serde_json::Value>();
+        assert_eq!(created["status"], "in_progress");
+        let response_id = created["id"].as_str().unwrap().to_string();
+
+        let mut retrieved = None;
+        for _ in 0..20 {
+            let response = server.get(&format!("/v1/responses/{response_id}")).await;
+            response.assert_status_ok();
+            let body = response.json::<serde_json::Value>();
+            if body["status"] == "completed" {
+                retrieved = Some(body);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        let retrieved = retrieved.expect("background response did not complete in time");
+        assert_eq!(retrieved["output"][0]["type"], "message");
+        assert_eq!(retrieved["output"][0]["content"][0]["text"], "done");
+    }
+
+    #[tokio::test]
+    async fn background_response_rejects_streaming() {
+        let (server, _) = make_server(vec![vec![request_output("done", true)]]);
+
+        let response = server
+            .post("/v1/responses")
+            .json(&serde_json::json!({
+                "model": "test",
+                "input": "Hello",
+                "store": true,
+                "background": true,
+                "stream": true,
+            }))
+            .await;
+
+        assert_eq!(response.status_code(), 400);
     }
 
     #[tokio::test]

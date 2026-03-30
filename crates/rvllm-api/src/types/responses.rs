@@ -604,9 +604,16 @@ impl CreateResponseRequest {
             return Err(ApiError::InvalidRequest("model is required".into()));
         }
         if self.background == Some(true) {
-            return Err(ApiError::InvalidRequest(
-                "background responses are not supported".into(),
-            ));
+            if self.stream {
+                return Err(ApiError::InvalidRequest(
+                    "background responses do not support streaming".into(),
+                ));
+            }
+            if !self.store {
+                return Err(ApiError::InvalidRequest(
+                    "background responses require store=true".into(),
+                ));
+            }
         }
         let tools = self.normalize_function_tools()?;
         if let Some(tool_choice) = &self.tool_choice {
@@ -1284,6 +1291,86 @@ mod tests {
         };
         let err = req.validate().unwrap_err();
         assert!(err.to_string().contains("responses text.format.type 'xml'"));
+    }
+
+    #[test]
+    fn request_accepts_background_with_store() {
+        let req = CreateResponseRequest {
+            model: "test".into(),
+            input: Some(ResponseInput::Text("Hello".into())),
+            instructions: None,
+            max_output_tokens: None,
+            temperature: 1.0,
+            top_p: 1.0,
+            stream: false,
+            store: true,
+            previous_response_id: None,
+            metadata: BTreeMap::new(),
+            background: Some(true),
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: true,
+            text: None,
+            reasoning: None,
+            conversation: None,
+            include: None,
+            truncation: None,
+        };
+        assert!(req.validate().is_ok());
+    }
+
+    #[test]
+    fn request_rejects_background_without_store() {
+        let req = CreateResponseRequest {
+            model: "test".into(),
+            input: Some(ResponseInput::Text("Hello".into())),
+            instructions: None,
+            max_output_tokens: None,
+            temperature: 1.0,
+            top_p: 1.0,
+            stream: false,
+            store: false,
+            previous_response_id: None,
+            metadata: BTreeMap::new(),
+            background: Some(true),
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: true,
+            text: None,
+            reasoning: None,
+            conversation: None,
+            include: None,
+            truncation: None,
+        };
+        let err = req.validate().unwrap_err();
+        assert!(err.to_string().contains("background responses require store=true"));
+    }
+
+    #[test]
+    fn request_rejects_background_streaming() {
+        let req = CreateResponseRequest {
+            model: "test".into(),
+            input: Some(ResponseInput::Text("Hello".into())),
+            instructions: None,
+            max_output_tokens: None,
+            temperature: 1.0,
+            top_p: 1.0,
+            stream: true,
+            store: true,
+            previous_response_id: None,
+            metadata: BTreeMap::new(),
+            background: Some(true),
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: true,
+            text: None,
+            reasoning: None,
+            conversation: None,
+            include: None,
+            truncation: None,
+        };
+        let err = req.validate().unwrap_err();
+        assert!(err.to_string().contains("do not support streaming"));
     }
 
     #[test]
