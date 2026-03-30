@@ -45,10 +45,10 @@ PROMPTS = [
 ]
 
 
-async def send_request(session, url, prompt, max_tokens=128):
+async def send_request(session, url, prompt, max_tokens=128, model="default"):
     """Send a non-streaming completion request and measure wall-clock latency."""
     payload = {
-        "model": "default",
+        "model": model,
         "prompt": prompt,
         "max_tokens": max_tokens,
         "temperature": 0.8,
@@ -80,7 +80,7 @@ async def send_request(session, url, prompt, max_tokens=128):
     }
 
 
-async def run_benchmark(url, num_prompts, concurrency, max_tokens=128):
+async def run_benchmark(url, num_prompts, concurrency, max_tokens=128, model="default"):
     prompts = [PROMPTS[i % len(PROMPTS)] for i in range(num_prompts)]
     semaphore = asyncio.Semaphore(concurrency)
     results = []
@@ -89,7 +89,7 @@ async def run_benchmark(url, num_prompts, concurrency, max_tokens=128):
     async def limited_request(session, prompt):
         nonlocal errors
         async with semaphore:
-            result = await send_request(session, url, prompt, max_tokens)
+            result = await send_request(session, url, prompt, max_tokens, model)
             if result is None:
                 errors += 1
             else:
@@ -143,6 +143,7 @@ def main():
         description="Benchmark client for rvllm and Python vLLM (non-streaming)"
     )
     parser.add_argument("--url", required=True, help="Server URL")
+    parser.add_argument("--model", default="default", help="Model name for request payload")
     parser.add_argument("--num-prompts", type=int, default=200)
     parser.add_argument("--concurrent", type=int, default=16)
     parser.add_argument("--max-tokens", type=int, default=128)
@@ -150,10 +151,11 @@ def main():
     args = parser.parse_args()
 
     print(f"Benchmarking {args.url} (non-streaming)")
+    print(f"  Model: {args.model}")
     print(f"  Prompts: {args.num_prompts}, Concurrency: {args.concurrent}, Max tokens: {args.max_tokens}")
 
     result = asyncio.run(
-        run_benchmark(args.url, args.num_prompts, args.concurrent, args.max_tokens)
+        run_benchmark(args.url, args.num_prompts, args.concurrent, args.max_tokens, args.model)
     )
 
     if result:
