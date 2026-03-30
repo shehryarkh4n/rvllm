@@ -50,16 +50,6 @@ mod inner {
         pub fused_gate_up: Option<&'a CudaSlice<f16>>,
         /// Fused QKV bias (f16). None if model has no QKV bias.
         pub qkv_bias: Option<&'a CudaSlice<f16>>,
-        // FP8 quantized weight variants (u8 data + f16 per-row scales).
-        // Present when RVLLM_FP8_WEIGHTS=1.
-        pub fused_qkv_fp8: Option<&'a CudaSlice<u8>>,
-        pub fused_qkv_fp8_scale: Option<&'a CudaSlice<f16>>,
-        pub o_proj_fp8: Option<&'a CudaSlice<u8>>,
-        pub o_proj_scale: Option<&'a CudaSlice<f16>>,
-        pub fused_gate_up_fp8: Option<&'a CudaSlice<u8>>,
-        pub fused_gate_up_scale: Option<&'a CudaSlice<f16>>,
-        pub down_proj_fp8: Option<&'a CudaSlice<u8>>,
-        pub down_proj_scale: Option<&'a CudaSlice<f16>>,
     }
 
     /// Metadata needed for a single layer forward pass.
@@ -187,35 +177,8 @@ mod inner {
                 let (mut qkv, residual_ref, bias_fused) = if let Some(prev_mlp) = prev_mlp_out {
                     // Try fused add+norm+QKV GEMV (3-way: add + norm + projection)
                     let fused_qkv_w = weights.fused_qkv.unwrap_or(weights.q_proj);
-                    // FP8 fused add+norm+QKV GEMV (highest throughput when FP8 weights available)
-                    if let (Some(qkv_fp8), Some(qkv_scale), Ok(ref fk)) = (
-                        weights.fused_qkv_fp8,
-                        weights.fused_qkv_fp8_scale,
-                        self.loader.get_func("gemv_fp8", "fused_add_norm_fp8_gemv_kernel"),
-                    ) {
-                        let mut qkv_out = unsafe { self.stream.alloc::<f16>(qkv_dim) }
-                            .map_err(|e| LLMError::GpuError(format!("fp8 fused qkv alloc: {e}")))?;
-                        let mut residual_out = unsafe { self.stream.alloc::<f16>(hidden) }
-                            .map_err(|e| LLMError::GpuError(format!("fp8 fused residual alloc: {e}")))?;
-                        let smem = (hidden * 4 + 8 * 4) as u32;
-                        let rpb = 8u32;
-                        if smem > 49152 {
-                            fk.set_attribute(cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem as i32)
-                                .map_err(|e| LLMError::GpuError(format!("fp8 smem attr: {e}")))?;
-                        }
-                        unsafe {
-                            self.stream.launch_builder(fk)
-                                .arg(&mut qkv_out).arg(&mut residual_out)
-                                .arg(hidden_f16).arg(prev_mlp).arg(norm_w).arg(qkv_fp8)
-                                .arg(qkv_scale)
-                                .arg(&cfg.rms_norm_eps).arg(&(hidden as i32)).arg(&(qkv_dim as i32))
-                                .launch(LaunchConfig { grid_dim: ((qkv_dim as u32 + rpb - 1) / rpb, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: smem })
-                                .map_err(|e| LLMError::GpuError(format!("fused add_norm_fp8_qkv: {e}")))?;
-                        }
-                        (qkv_out, residual_out, false)
-                    }
                     // Try bias-fused variant first if model has QKV bias
-                    else if let (Some(qkv_bias), Ok(ref fk)) = (weights.qkv_bias, self.loader.get_func("fused_add_norm_qkv_gemv", "fused_cute_add_norm_qkv_bias_gemv")) {
+                    if let (Some(qkv_bias), Ok(ref fk)) = (weights.qkv_bias, self.loader.get_func("fused_add_norm_qkv_gemv", "fused_cute_add_norm_qkv_bias_gemv")) {
                         let mut qkv_out = unsafe { self.stream.alloc::<f16>(qkv_dim) }
                             .map_err(|e| LLMError::GpuError(format!("fused qkv alloc: {e}")))?;
                         let mut residual_out = unsafe { self.stream.alloc::<f16>(hidden) }
@@ -267,33 +230,8 @@ mod inner {
                 } else {
                     // First layer: norm+QKV GEMV
                     let fused_qkv_w = weights.fused_qkv.unwrap_or(weights.q_proj);
-                    // FP8 fused norm+QKV GEMV (first layer, no residual add)
-                    if let (Some(qkv_fp8), Some(qkv_scale), Ok(ref fk)) = (
-                        weights.fused_qkv_fp8,
-                        weights.fused_qkv_fp8_scale,
-                        self.loader.get_func("gemv_fp8", "fused_norm_fp8_gemv_kernel"),
-                    ) {
-                        let mut qkv_out = unsafe { self.stream.alloc::<f16>(qkv_dim) }
-                            .map_err(|e| LLMError::GpuError(format!("fp8 fused qkv alloc: {e}")))?;
-                        let smem = (hidden * 4 + 8 * 4) as u32;
-                        let rpb = 8u32;
-                        if smem > 49152 {
-                            fk.set_attribute(cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem as i32)
-                                .map_err(|e| LLMError::GpuError(format!("fp8 smem attr: {e}")))?;
-                        }
-                        unsafe {
-                            self.stream.launch_builder(fk)
-                                .arg(&mut qkv_out).arg(hidden_f16).arg(norm_w).arg(qkv_fp8)
-                                .arg(qkv_scale)
-                                .arg(&cfg.rms_norm_eps).arg(&(hidden as i32)).arg(&(qkv_dim as i32))
-                                .launch(LaunchConfig { grid_dim: ((qkv_dim as u32 + rpb - 1) / rpb, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: smem })
-                                .map_err(|e| LLMError::GpuError(format!("fused norm_fp8_qkv: {e}")))?;
-                        }
-                        let residual = hidden_f16.clone();
-                        (qkv_out, residual, false)
-                    }
                     // Try bias-fused variant first if model has QKV bias
-                    else if let (Some(qkv_bias), Ok(ref fk)) = (weights.qkv_bias, self.loader.get_func("fused_add_norm_qkv_gemv", "fused_cute_norm_qkv_bias_gemv")) {
+                    if let (Some(qkv_bias), Ok(ref fk)) = (weights.qkv_bias, self.loader.get_func("fused_add_norm_qkv_gemv", "fused_cute_norm_qkv_bias_gemv")) {
                         let mut qkv_out = unsafe { self.stream.alloc::<f16>(qkv_dim) }
                             .map_err(|e| LLMError::GpuError(format!("fused qkv alloc: {e}")))?;
                         let smem = (hidden * 4 + 8 * 4) as u32;
@@ -784,64 +722,8 @@ mod inner {
             let mut output = unsafe { stream.alloc::<f16>(m * n) }
                 .map_err(|e| LLMError::GpuError(format!("hgemm_dispatch: {e}")))?;
 
-            // M=1: custom GEMV kernels (best to worst bandwidth utilization)
-            // Priority: TMA GEMV -> WGMMA GEMV -> plain GEMV -> cublasLt -> cuBLAS
+            // M=1: custom GEMV kernel (vectorized half2, warp shuffle reduction)
             if m == 1 {
-                // TMA GEMV: uses Tensor Memory Accelerator for optimal bandwidth
-                if let Ok(kernel) = loader.get_func("tma_gemv_fp16", "tma_gemv_fp16_kernel") {
-                    let smem = (k * 2 + 256) as u32; // input tile + reduction scratch
-                    let cfg = LaunchConfig {
-                        grid_dim: (((n as u32) + 7) / 8, 1, 1),
-                        block_dim: (256, 1, 1),
-                        shared_mem_bytes: smem,
-                    };
-                    if smem > 49152 {
-                        kernel.set_attribute(
-                            cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                            smem as i32,
-                        ).map_err(|e| LLMError::GpuError(format!("tma_gemv smem attr: {e}")))?;
-                    }
-                    unsafe {
-                        stream.launch_builder(&kernel)
-                            .arg(&mut output)
-                            .arg(input)
-                            .arg(weight)
-                            .arg(&(n as i32))
-                            .arg(&(k as i32))
-                            .launch(cfg)
-                            .map_err(|e| LLMError::GpuError(format!("tma_gemv_fp16 launch: {e}")))?;
-                    }
-                    return Ok(output);
-                }
-
-                // WGMMA GEMV: warpgroup MMA, fallback when TMA unavailable
-                if let Ok(kernel) = loader.get_func("wgmma_gemv", "wgmma_gemv_fp16_kernel") {
-                    let smem = (k * 2 + 256) as u32;
-                    let cfg = LaunchConfig {
-                        grid_dim: (((n as u32) + 7) / 8, 1, 1),
-                        block_dim: (256, 1, 1),
-                        shared_mem_bytes: smem,
-                    };
-                    if smem > 49152 {
-                        kernel.set_attribute(
-                            cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                            smem as i32,
-                        ).map_err(|e| LLMError::GpuError(format!("wgmma_gemv smem attr: {e}")))?;
-                    }
-                    unsafe {
-                        stream.launch_builder(&kernel)
-                            .arg(&mut output)
-                            .arg(input)
-                            .arg(weight)
-                            .arg(&(n as i32))
-                            .arg(&(k as i32))
-                            .launch(cfg)
-                            .map_err(|e| LLMError::GpuError(format!("wgmma_gemv launch: {e}")))?;
-                    }
-                    return Ok(output);
-                }
-
-                // Plain GEMV: vectorized half2 + warp shuffle
                 if let Ok(kernel) = loader.get_func("gemv_f16", "gemv_f16_kernel") {
                     let cfg = LaunchConfig {
                         grid_dim: (n as u32, 1, 1),
@@ -860,7 +742,7 @@ mod inner {
                     }
                     return Ok(output);
                 }
-                // Fallthrough to cuBLAS if no GEMV kernel loaded
+                // Fallthrough to cuBLAS if kernel not loaded
             }
 
             #[cfg(feature = "cublaslt")]
@@ -1138,91 +1020,6 @@ mod inner {
                             .launch(cfg)
                             .map_err(|e| LLMError::GpuError(format!("FA3 GQA decode launch: {e}")))?;
                     }
-                    return Ok(output);
-                }
-            }
-
-            // Split-KV attention: distribute KV tiles across multiple thread blocks for
-            // long-context decode (512+ tokens). Each block computes a partial softmax +
-            // output, then a combine kernel reduces across splits.
-            const SPLIT_KV_THRESHOLD: u32 = 512;
-            if max_context_len >= SPLIT_KV_THRESHOLD {
-                if let (Ok(split_kernel), Ok(combine_kernel)) = (
-                    loader.get_func("split_kv_attention", "split_kv_decode_f16io_kernel"),
-                    loader.get_func("split_kv_attention", "split_kv_combine_f16io_kernel"),
-                ) {
-                    const SKV_BC: usize = 64;
-                    const SKV_THREADS: u32 = 128;
-
-                    let total_tiles = (max_context_len as usize + SKV_BC - 1) / SKV_BC;
-                    let num_splits = total_tiles.min(16).max(2) as i32;
-
-                    let smem = (2 * SKV_BC * head_dim + SKV_BC + 4) * std::mem::size_of::<f32>();
-                    let shared_mem_bytes = smem as u32;
-
-                    let ws_out_len = num_splits as usize * num_seqs * num_heads * head_dim;
-                    let ws_scalar_len = num_splits as usize * num_seqs * num_heads;
-                    let partial_out = unsafe { stream.alloc::<f32>(ws_out_len) }
-                        .map_err(|e| LLMError::GpuError(format!("split_kv partial_out alloc: {e}")))?;
-                    let partial_max = unsafe { stream.alloc::<f32>(ws_scalar_len) }
-                        .map_err(|e| LLMError::GpuError(format!("split_kv partial_max alloc: {e}")))?;
-                    let partial_sum = unsafe { stream.alloc::<f32>(ws_scalar_len) }
-                        .map_err(|e| LLMError::GpuError(format!("split_kv partial_sum alloc: {e}")))?;
-
-                    let p_num_seqs = num_seqs as i32;
-
-                    if shared_mem_bytes > 49152 {
-                        split_kernel.set_attribute(
-                            cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                            shared_mem_bytes as i32,
-                        ).map_err(|e| LLMError::GpuError(format!("split_kv set max shared mem: {e}")))?;
-                    }
-
-                    let split_cfg = LaunchConfig {
-                        grid_dim: (num_seqs as u32, num_heads as u32, num_splits as u32),
-                        block_dim: (SKV_THREADS, 1, 1),
-                        shared_mem_bytes,
-                    };
-
-                    unsafe {
-                        stream.launch_builder(&split_kernel)
-                            .arg(&partial_out)
-                            .arg(&partial_max)
-                            .arg(&partial_sum)
-                            .arg(q)
-                            .arg(key_cache).arg(value_cache)
-                            .arg(block_tables).arg(context_lens)
-                            .arg(&scale)
-                            .arg(&p_num_seqs)
-                            .arg(&p_num_heads).arg(&p_num_kv_heads)
-                            .arg(&p_head_dim).arg(&p_block_size)
-                            .arg(&p_max_blocks)
-                            .arg(&num_splits)
-                            .launch(split_cfg)
-                            .map_err(|e| LLMError::GpuError(format!("split_kv decode launch: {e}")))?;
-                    }
-
-                    let combine_cfg = LaunchConfig {
-                        grid_dim: (num_seqs as u32, num_heads as u32, 1),
-                        block_dim: (head_dim as u32, 1, 1),
-                        shared_mem_bytes: 0,
-                    };
-
-                    unsafe {
-                        stream.launch_builder(&combine_kernel)
-                            .arg(&mut output)
-                            .arg(&partial_out)
-                            .arg(&partial_max)
-                            .arg(&partial_sum)
-                            .arg(context_lens)
-                            .arg(&p_num_seqs)
-                            .arg(&p_num_heads)
-                            .arg(&p_head_dim)
-                            .arg(&num_splits)
-                            .launch(combine_cfg)
-                            .map_err(|e| LLMError::GpuError(format!("split_kv combine launch: {e}")))?;
-                    }
-
                     return Ok(output);
                 }
             }
