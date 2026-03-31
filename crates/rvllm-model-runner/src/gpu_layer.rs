@@ -1930,38 +1930,208 @@ mod inner {
             let p_block_size = block_size as i32;
             let p_max_blocks = (block_tables.len() / num_seqs.max(1)) as i32;
 
-            // GQA-optimized FA3 kernel: one block per KV head, processes all query heads
-            // in the group. Reduces KV cache loads by heads_per_group (e.g. 6x for Qwen2.5-1.5B).
-            // Only used when GQA is active (num_heads != num_kv_heads) and ratio <= 8.
             let heads_per_group = if num_kv_heads > 0 { num_heads / num_kv_heads } else { 1 };
+
+            // ---- FA3 v3: split-KV + cp.async double-buffered (SM 8.0+) ----
+            // Split-KV heuristic: 1 split for short context, more for longer
+            let num_splits: i32 = if max_context_len <= 512 { 1 }
+                else if max_context_len <= 2048 { 2 }
+                else if max_context_len <= 8192 { 4 }
+                else { 8 };
+
+            // v3 GQA kernel (requires head_dim % 8 == 0 for cp.async 16-byte alignment)
+            if num_heads != num_kv_heads && heads_per_group <= 8 && head_dim % 8 == 0 {
+                if let Ok(v3_gqa) = loader.get_func("flash_attention_3_v3", "fa3_v3_decode_gqa_kernel") {
+                    const V3_BC: usize = 64;
+                    const V3_THREADS: u32 = 256;
+                    const V3_MAX_HPG: usize = 8;
+                    const V3_SCORE_STRIDE: usize = V3_BC + 1;
+
+                    // Double-buffered smem: 2 * BC * hd * sizeof(half) + scores + warp
+                    let smem = 2 * V3_BC * head_dim * std::mem::size_of::<u16>()
+                             + V3_MAX_HPG * V3_SCORE_STRIDE * std::mem::size_of::<f32>()
+                             + 8 * std::mem::size_of::<f32>();
+                    let shared_mem_bytes = smem as u32;
+                    let p_max_context = max_context_len as i32;
+
+                    if shared_mem_bytes > 49152 {
+                        v3_gqa.set_attribute(
+                            cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                            shared_mem_bytes as i32,
+                        ).map_err(|e| LLMError::GpuError(format!("v3 GQA set smem: {e}")))?;
+                    }
+
+                    if num_splits == 1 {
+                        // Single split: write f16 directly, no workspace needed
+                        let dummy = unsafe { stream.alloc::<f32>(1) }
+                            .map_err(|e| LLMError::GpuError(format!("v3 dummy: {e}")))?;
+                        let cfg = LaunchConfig {
+                            grid_dim: (num_seqs as u32, num_kv_heads as u32, 1),
+                            block_dim: (V3_THREADS, 1, 1),
+                            shared_mem_bytes,
+                        };
+                        unsafe {
+                            stream.launch_builder(&v3_gqa)
+                                .arg(&mut output).arg(&dummy).arg(&dummy).arg(&dummy)
+                                .arg(q).arg(key_cache).arg(value_cache)
+                                .arg(block_tables).arg(context_lens)
+                                .arg(&scale).arg(&p_num_heads).arg(&p_num_kv_heads)
+                                .arg(&p_head_dim).arg(&p_block_size)
+                                .arg(&p_max_context).arg(&p_max_blocks).arg(&num_splits)
+                                .launch(cfg)
+                                .map_err(|e| LLMError::GpuError(format!("v3 GQA decode: {e}")))?;
+                        }
+                        return Ok(output);
+                    } else {
+                        // Multi-split: workspace + combine kernel
+                        let ws_size = (num_splits as usize) * num_seqs * num_heads;
+                        let mut p_out = unsafe { stream.alloc::<f32>(ws_size * head_dim) }
+                            .map_err(|e| LLMError::GpuError(format!("v3 p_out: {e}")))?;
+                        let mut p_max = unsafe { stream.alloc::<f32>(ws_size) }
+                            .map_err(|e| LLMError::GpuError(format!("v3 p_max: {e}")))?;
+                        let mut p_sum = unsafe { stream.alloc::<f32>(ws_size) }
+                            .map_err(|e| LLMError::GpuError(format!("v3 p_sum: {e}")))?;
+
+                        let cfg = LaunchConfig {
+                            grid_dim: (num_seqs as u32, num_kv_heads as u32, num_splits as u32),
+                            block_dim: (V3_THREADS, 1, 1),
+                            shared_mem_bytes,
+                        };
+                        unsafe {
+                            stream.launch_builder(&v3_gqa)
+                                .arg(&mut output).arg(&mut p_out).arg(&mut p_max).arg(&mut p_sum)
+                                .arg(q).arg(key_cache).arg(value_cache)
+                                .arg(block_tables).arg(context_lens)
+                                .arg(&scale).arg(&p_num_heads).arg(&p_num_kv_heads)
+                                .arg(&p_head_dim).arg(&p_block_size)
+                                .arg(&p_max_context).arg(&p_max_blocks).arg(&num_splits)
+                                .launch(cfg)
+                                .map_err(|e| LLMError::GpuError(format!("v3 GQA decode: {e}")))?;
+                        }
+
+                        // Combine partials -> f16 output
+                        let combine = loader.get_func("flash_attention_3_v3", "fa3_v3_combine_f16_kernel")
+                            .map_err(|e| LLMError::GpuError(format!("v3 combine missing: {e}")))?;
+                        let p_num_seqs = num_seqs as i32;
+                        unsafe {
+                            stream.launch_builder(&combine)
+                                .arg(&mut output).arg(&p_out).arg(&p_max).arg(&p_sum)
+                                .arg(context_lens)
+                                .arg(&p_num_seqs).arg(&p_num_heads).arg(&p_head_dim).arg(&num_splits)
+                                .launch(LaunchConfig {
+                                    grid_dim: (num_seqs as u32, num_heads as u32, 1),
+                                    block_dim: (head_dim as u32, 1, 1),
+                                    shared_mem_bytes: 0,
+                                })
+                                .map_err(|e| LLMError::GpuError(format!("v3 combine: {e}")))?;
+                        }
+                        return Ok(output);
+                    }
+                }
+            }
+
+            // v3 non-GQA kernel (MHA fallback with cp.async)
+            if head_dim % 8 == 0 {
+                if let Ok(v3_kernel) = loader.get_func("flash_attention_3_v3", "fa3_v3_decode_kernel") {
+                    const V3_BC: usize = 64;
+                    const V3_THREADS: u32 = 256;
+                    let smem = 2 * V3_BC * head_dim * std::mem::size_of::<u16>()
+                             + (V3_BC + 8) * std::mem::size_of::<f32>();
+                    let shared_mem_bytes = smem as u32;
+
+                    if shared_mem_bytes > 49152 {
+                        v3_kernel.set_attribute(
+                            cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                            shared_mem_bytes as i32,
+                        ).map_err(|e| LLMError::GpuError(format!("v3 set smem: {e}")))?;
+                    }
+
+                    if num_splits == 1 {
+                        let dummy = unsafe { stream.alloc::<f32>(1) }
+                            .map_err(|e| LLMError::GpuError(format!("v3 dummy: {e}")))?;
+                        unsafe {
+                            stream.launch_builder(&v3_kernel)
+                                .arg(&mut output).arg(&dummy).arg(&dummy).arg(&dummy)
+                                .arg(q).arg(key_cache).arg(value_cache)
+                                .arg(block_tables).arg(context_lens)
+                                .arg(&scale).arg(&p_num_heads).arg(&p_num_kv_heads)
+                                .arg(&p_head_dim).arg(&p_block_size)
+                                .arg(&p_max_blocks).arg(&num_splits)
+                                .launch(LaunchConfig {
+                                    grid_dim: (num_seqs as u32, num_heads as u32, 1),
+                                    block_dim: (V3_THREADS, 1, 1),
+                                    shared_mem_bytes,
+                                })
+                                .map_err(|e| LLMError::GpuError(format!("v3 decode: {e}")))?;
+                        }
+                        return Ok(output);
+                    } else {
+                        let ws_size = (num_splits as usize) * num_seqs * num_heads;
+                        let mut p_out = unsafe { stream.alloc::<f32>(ws_size * head_dim) }
+                            .map_err(|e| LLMError::GpuError(format!("v3 p_out: {e}")))?;
+                        let mut p_max = unsafe { stream.alloc::<f32>(ws_size) }
+                            .map_err(|e| LLMError::GpuError(format!("v3 p_max: {e}")))?;
+                        let mut p_sum = unsafe { stream.alloc::<f32>(ws_size) }
+                            .map_err(|e| LLMError::GpuError(format!("v3 p_sum: {e}")))?;
+                        unsafe {
+                            stream.launch_builder(&v3_kernel)
+                                .arg(&mut output).arg(&mut p_out).arg(&mut p_max).arg(&mut p_sum)
+                                .arg(q).arg(key_cache).arg(value_cache)
+                                .arg(block_tables).arg(context_lens)
+                                .arg(&scale).arg(&p_num_heads).arg(&p_num_kv_heads)
+                                .arg(&p_head_dim).arg(&p_block_size)
+                                .arg(&p_max_blocks).arg(&num_splits)
+                                .launch(LaunchConfig {
+                                    grid_dim: (num_seqs as u32, num_heads as u32, num_splits as u32),
+                                    block_dim: (V3_THREADS, 1, 1),
+                                    shared_mem_bytes,
+                                })
+                                .map_err(|e| LLMError::GpuError(format!("v3 decode: {e}")))?;
+                        }
+                        let combine = loader.get_func("flash_attention_3_v3", "fa3_v3_combine_f16_kernel")
+                            .map_err(|e| LLMError::GpuError(format!("v3 combine missing: {e}")))?;
+                        let p_num_seqs = num_seqs as i32;
+                        unsafe {
+                            stream.launch_builder(&combine)
+                                .arg(&mut output).arg(&p_out).arg(&p_max).arg(&p_sum)
+                                .arg(context_lens)
+                                .arg(&p_num_seqs).arg(&p_num_heads).arg(&p_head_dim).arg(&num_splits)
+                                .launch(LaunchConfig {
+                                    grid_dim: (num_seqs as u32, num_heads as u32, 1),
+                                    block_dim: (head_dim as u32, 1, 1),
+                                    shared_mem_bytes: 0,
+                                })
+                                .map_err(|e| LLMError::GpuError(format!("v3 combine: {e}")))?;
+                        }
+                        return Ok(output);
+                    }
+                }
+            }
+
+            // ---- Fallback: FA3 v2 GQA ----
             if num_heads != num_kv_heads && heads_per_group <= 8 {
                 if let Ok(gqa_kernel) = loader.get_func("flash_attention_3", "flash_attention_3_decode_gqa_f16io_kernel") {
                     const GQA_BC: usize = 64;
                     const GQA_THREADS: u32 = 256;
                     const GQA_MAX_HPG: usize = 8;
                     const GQA_SCORE_STRIDE: usize = GQA_BC + 1;
-                    let gqa_kv_stride = head_dim + 2; // bank conflict padding
-                    // f16 smem: s_kv[BC*(D+2)]*half + s_scores[HPG*(BC+1)]*f32 + s_warp[8]*f32
+                    let gqa_kv_stride = head_dim + 2;
                     let smem = GQA_BC * gqa_kv_stride * std::mem::size_of::<u16>()
                              + GQA_MAX_HPG * GQA_SCORE_STRIDE * std::mem::size_of::<f32>()
                              + 8 * std::mem::size_of::<f32>();
                     let shared_mem_bytes = smem as u32;
-
                     let p_max_context = max_context_len as i32;
-
                     let cfg = LaunchConfig {
                         grid_dim: (num_seqs as u32, num_kv_heads as u32, 1),
                         block_dim: (GQA_THREADS, 1, 1),
                         shared_mem_bytes,
                     };
-
                     if shared_mem_bytes > 49152 {
                         gqa_kernel.set_attribute(
                             cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
                             shared_mem_bytes as i32,
                         ).map_err(|e| LLMError::GpuError(format!("FA3 GQA set max shared mem: {e}")))?;
                     }
-
                     unsafe {
                         stream.launch_builder(&gqa_kernel)
                             .arg(&mut output)
@@ -1980,29 +2150,25 @@ mod inner {
                 }
             }
 
-            // FA3 kernel: 256 threads, f16 smem, half2 loads, warp-parallel reductions.
+            // Fallback: FA3 v2 non-GQA
             if let Ok(fa3_kernel) = loader.get_func("flash_attention_3", "flash_attention_3_decode_f16io_kernel") {
                 const FA3_BC: usize = 64;
                 const FA3_THREADS: u32 = 256;
-                let fa3_kv_stride = head_dim + 2; // bank conflict padding
-                // f16 smem: s_kv[BC*(D+2)]*half + s_score[BC]*f32 + s_warp[8]*f32
+                let fa3_kv_stride = head_dim + 2;
                 let smem = FA3_BC * fa3_kv_stride * std::mem::size_of::<u16>()
                          + (FA3_BC + 8) * std::mem::size_of::<f32>();
                 let shared_mem_bytes = smem as u32;
-
                 let cfg = LaunchConfig {
                     grid_dim: (num_seqs as u32, num_heads as u32, 1),
                     block_dim: (FA3_THREADS, 1, 1),
                     shared_mem_bytes,
                 };
-
                 if shared_mem_bytes > 49152 {
                     fa3_kernel.set_attribute(
                         cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
                         shared_mem_bytes as i32,
                     ).map_err(|e| LLMError::GpuError(format!("FA3 set max shared mem: {e}")))?;
                 }
-
                 unsafe {
                     stream.launch_builder(&fa3_kernel)
                         .arg(&mut output)

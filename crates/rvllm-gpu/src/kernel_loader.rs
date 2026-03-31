@@ -62,6 +62,10 @@ static KERNEL_FUNCTIONS: &[(&str, &[&str])] = &[
         &["flash_attention_3_prefill_f16io_kernel"],
     ),
     (
+        "flash_attention_3_v3",
+        &["fa3_v3_decode_gqa_kernel", "fa3_v3_decode_kernel", "fa3_v3_combine_f16_kernel"],
+    ),
+    (
         "fp8_kv",
         &[
             "quantize_kv_kernel",
