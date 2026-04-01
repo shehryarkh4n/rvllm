@@ -617,7 +617,7 @@ mod cuda_impl {
             let meta_packed = self.meta_packed.borrow();
             let packed_buf = meta_packed.slice();
             let offsets = self.meta_packed_offsets.get();
-            let use_scratch = num_tokens > 1 && !is_prefill;
+            let use_scratch = num_tokens > 1 || is_prefill;
             let mut scratch_borrow = self.f16_scratch.borrow_mut();
             let mut prev_mlp_out: Option<CudaSlice<f16>> = None;
 
@@ -839,7 +839,7 @@ mod cuda_impl {
             let layers_to_run = max_layers.min(self.layers.len());
             let mut prev_mlp_out: Option<CudaSlice<f16>> = None;
             let path = self.resolve_forward_path(num_tokens, is_prefill);
-            let use_scratch = num_tokens > 1 && !is_prefill;
+            let use_scratch = num_tokens > 1 || is_prefill;
             let mut scratch_borrow = self.f16_scratch.borrow_mut();
 
             // For Batched path: copy embedding into residual_a for double-buffer read
@@ -1101,7 +1101,7 @@ mod cuda_impl {
             let packed_buf = meta_packed.slice();
             let offsets = self.meta_packed_offsets.get();
             // Double-buffered scratch for T>1 decode: zero per-layer allocations.
-            let use_scratch = num_tokens > 1 && !is_prefill;
+            let use_scratch = num_tokens > 1 || is_prefill;
             let mut scratch_borrow = self.f16_scratch.borrow_mut();
             let mut prev_mlp_out: Option<CudaSlice<f16>> = None;
             let path = self.resolve_forward_path(num_tokens, is_prefill);
@@ -1326,7 +1326,7 @@ mod cuda_impl {
             let packed_buf = meta_packed.slice();
             let offsets = self.meta_packed_offsets.get();
             // Double-buffered scratch for T>1 decode: zero per-layer allocations.
-            let use_scratch = num_tokens > 1 && !is_prefill;
+            let use_scratch = num_tokens > 1 || is_prefill;
             let mut scratch_borrow = self.f16_scratch.borrow_mut();
             let mut prev_mlp_out: Option<CudaSlice<f16>> = None;
             let path = self.resolve_forward_path(num_tokens, is_prefill);
