@@ -28,3 +28,4 @@ build/
 *.fls
 *.fdb_latexmk
 *.synctex.gz
+zig/.zig-cache/
