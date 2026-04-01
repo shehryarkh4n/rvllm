@@ -1703,8 +1703,7 @@ mod cuda_impl {
             let mut scratch_gpu = unsafe { self.stream.alloc::<u8>(scratch_bytes) }
                 .map_err(|e| LLMError::GpuError(format!("mk scratch: {e}")))?;
 
-            // Copy embedding into residual_a slot in scratch
-            // residual_a starts at offset: qkv*2 + q_dim*2 + hidden*2 + gate_up_dim*2 + hidden*2
+            // Copy embedding into residual_a slot in scratch via raw memcpy
             let q_dim = num_heads * head_dim;
             let kv_dim = num_kv_heads * head_dim;
             let qkv_dim = q_dim + 2 * kv_dim;
@@ -1712,10 +1711,14 @@ mod cuda_impl {
             let res_a_byte_offset = (qkv_dim + q_dim + hidden + gate_up_dim + hidden) * 2;
             {
                 let embed_bytes = num_tokens * hidden * 2;
-                let src_u8: &CudaSlice<u8> = unsafe { std::mem::transmute(embedding) };
-                let mut dst_slice = scratch_gpu.slice_mut(res_a_byte_offset..res_a_byte_offset + embed_bytes);
-                self.stream.memcpy_dtod(&src_u8.slice(..embed_bytes), &mut dst_slice)
-                    .map_err(|e| LLMError::GpuError(format!("mk embed->scratch: {e}")))?;
+                let src_ptr = DevicePtr::device_ptr(embedding, &self.stream).0;
+                let dst_ptr = DevicePtr::device_ptr(&scratch_gpu, &self.stream).0 + res_a_byte_offset as u64;
+                unsafe {
+                    cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
+                        dst_ptr, src_ptr, embed_bytes as usize,
+                        self.stream.cu_stream(),
+                    ).result().map_err(|e| LLMError::GpuError(format!("mk embed copy: {e}")))?;
+                }
             }
 
             // Sync counters (zeroed)
