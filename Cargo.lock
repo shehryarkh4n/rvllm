@@ -2748,6 +2748,7 @@ dependencies = [
  "cudarc",
  "hf-hub",
  "metrics-exporter-prometheus",
+ "parking_lot",
  "rvllm-block-manager",
  "rvllm-config",
  "rvllm-core",
