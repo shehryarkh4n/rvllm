@@ -26,6 +26,7 @@ pub use cudarc::cublaslt::sys::{
     cublasLtMatrixLayoutCreate,
     cublasLtMatrixLayoutDestroy,
     cublasLtMatrixLayout_t,
+    cublasLtEpilogue_t,
     cublasStatus_t,
     cudaDataType_t,
     cublasLtMatmul,

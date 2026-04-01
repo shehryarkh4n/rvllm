@@ -15,11 +15,7 @@
 #include <cutlass/gemm/kernel/gemm_universal.hpp>
 #include <cutlass/gemm/collective/collective_builder.hpp>
 #include <cutlass/epilogue/collective/collective_builder.hpp>
-#include <cutlass/epilogue/fusion/sm90_callbacks_tma_warpspecialized.hpp>
-#include <cutlass/epilogue/fusion/sm90_visitor_tma_warpspecialized.hpp>
-#include <cutlass/epilogue/fusion/sm90_visitor_load_tma_warpspecialized.hpp>
-#include <cutlass/epilogue/fusion/sm90_visitor_compute_tma_warpspecialized.hpp>
-#include <cutlass/epilogue/fusion/sm90_visitor_store_tma_warpspecialized.hpp>
+#include <cutlass/epilogue/fusion/operations.hpp>
 #include <cute/tensor.hpp>
 #include <cutlass/util/packed_stride.hpp>
 #include <cuda_fp16.h>
@@ -49,62 +45,25 @@ using TileShape    = Shape<_128, _128, _64>;
 using ClusterShape = Shape<_1, _1, _1>;
 
 // ============================================================================
-// Epilogue Visitor Tree: D = alpha * accum + bias[N]
-//
-// Tree structure:
-//   Store(D) <- Compute(Add) <- (Compute(Multiply) <- (Scalar(alpha), Accum),
-//                                 Load(bias))
+// Epilogue: D = alpha * accum + beta * C + bias[N]
+// Using built-in LinCombPerColBias (beta=0, alpha=1.0)
 // ============================================================================
 
-using namespace cutlass::epilogue::fusion;
-
-// Leaf: scalar alpha
-using Alpha = Sm90ScalarBroadcast<ElementCompute>;
-
-// Leaf: accumulator
-using Accum = Sm90AccFetch;
-
-// Compute: alpha * accum
-using AlphaAccum = Sm90Compute<cutlass::multiplies, ElementCompute, ElementCompute,
-    cutlass::FloatRoundStyle::round_to_nearest>;
-
-// Leaf: per-column bias loaded from global memory, broadcast across M
-// ColumnBroadcast loads a [1, N] vector and broadcasts to [M, N]
-using BiasLoad = Sm90ColBroadcast<
-    0,             // stages
-    TileShape,
-    ElementC,      // bias element type
-    cute::Stride<cute::Int<0>, cute::Int<1>, cute::Int<0>>  // stride: broadcast over M, step over N
+using FusionOp = cutlass::epilogue::fusion::LinCombPerColBias<
+    ElementD,        // output
+    ElementCompute,  // compute
+    ElementC         // bias element type
 >;
-
-// Compute: alpha * accum + bias
-using AccumPlusBias = Sm90Compute<cutlass::plus, ElementCompute, ElementCompute,
-    cutlass::FloatRoundStyle::round_to_nearest>;
-
-// Store result to D
-using StoreD = Sm90AuxStore<
-    0,             // stages
-    ElementD,
-    cutlass::FloatRoundStyle::round_to_nearest,
-    cute::Stride<int64_t, cute::Int<1>, cute::Int<0>>
->;
-
-// Build the EVT: Store(Add(Multiply(alpha, accum), bias))
-using EVT = Sm90EVT<StoreD, Sm90EVT<AccumPlusBias, Sm90EVT<AlphaAccum, Alpha, Accum>, BiasLoad>>;
-
-// ============================================================================
-// Collective epilogue with EVT
-// ============================================================================
 
 using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
     cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp,
     TileShape, ClusterShape,
     cutlass::epilogue::collective::EpilogueTileAuto,
     ElementAccum, ElementCompute,
-    ElementD, LayoutD, 8,  // C (unused, set same as D)
+    ElementD, LayoutD, 8,  // C (unused, beta=0)
     ElementD, LayoutD, 8,  // D
-    cutlass::epilogue::collective::EpilogueScheduleAuto,
-    EVT
+    cutlass::epilogue::TmaWarpSpecialized,
+    FusionOp
 >::CollectiveOp;
 
 // ============================================================================
@@ -161,25 +120,10 @@ int cutlass_qkv_bias_gemm(
     auto stride_D = cutlass::make_cute_packed_stride(
         typename Gemm::GemmKernel::StrideD{}, {M, N, 1});
 
-    // EVT argument tree mirrors the EVT type tree (inside out):
-    // StoreD { Add { Multiply { alpha, accum }, bias } }
-    typename EVT::Arguments evt_args{
-        {   // StoreD args
-            reinterpret_cast<ElementD*>(output),   // ptr
-            stride_D                                // stride
-        },
-        {   // AccumPlusBias args
-            {},  // compute (plus) args -- empty
-            {    // AlphaAccum args
-                {},  // compute (multiply) args -- empty
-                {ElementCompute(1.0f)},  // Alpha scalar
-                {}                        // Accum -- no args
-            },
-            {   // BiasLoad args
-                reinterpret_cast<const ElementC*>(bias)  // bias ptr
-            }
-        }
-    };
+    typename CollectiveEpilogue::FusionCallbacks::Arguments fusion_args;
+    fusion_args.alpha = ElementCompute(1.0f);
+    fusion_args.beta = ElementCompute(0.0f);
+    fusion_args.bias_ptr = reinterpret_cast<const ElementC*>(bias);
 
     typename Gemm::Arguments args{
         cutlass::gemm::GemmUniversalMode::kGemm,
@@ -188,10 +132,10 @@ int cutlass_qkv_bias_gemm(
             reinterpret_cast<const ElementA*>(input), stride_A,
             reinterpret_cast<const ElementB*>(weight), stride_B,
         },
-        {   // epilogue args -- EVT
-            evt_args,
-            nullptr, stride_D,  // C ptr and stride (unused but required)
-            nullptr, stride_D   // D ptr and stride (unused, EVT stores directly)
+        {   // epilogue args
+            fusion_args,
+            nullptr, stride_D,  // C ptr and stride (unused, beta=0)
+            reinterpret_cast<ElementD*>(output), stride_D   // D
         }
     };
 
@@ -218,16 +162,16 @@ size_t cutlass_qkv_bias_workspace_size(int M, int N, int K) {
     auto stride_D = cutlass::make_cute_packed_stride(
         typename Gemm::GemmKernel::StrideD{}, {M, N, 1});
 
-    typename EVT::Arguments evt_args{
-        {nullptr, stride_D},
-        {{}, {{}, {ElementCompute(1.0f)}, {}}, {nullptr}}
-    };
+    typename CollectiveEpilogue::FusionCallbacks::Arguments fusion_args;
+    fusion_args.alpha = ElementCompute(1.0f);
+    fusion_args.beta = ElementCompute(0.0f);
+    fusion_args.bias_ptr = nullptr;
 
     typename Gemm::Arguments args{
         cutlass::gemm::GemmUniversalMode::kGemm,
         prob_shape,
         {nullptr, stride_A, nullptr, stride_B},
-        {evt_args, nullptr, stride_D, nullptr, stride_D}
+        {fusion_args, nullptr, stride_D, nullptr, stride_D}
     };
 
     Gemm gemm_op;

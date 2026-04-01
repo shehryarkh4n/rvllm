@@ -190,21 +190,25 @@ else
 fi
 
 # ============================================================
-# Step 1b: Compile CUTLASS kernels (optional)
+# Step 1b: Compile CUTLASS shared library (fused epilogues)
 # ============================================================
-if [[ "$WITH_CUTLASS" -eq 1 ]]; then
-    step "Step 1b: Compile CUTLASS kernels (${ARCH})"
+if [[ "$SKIP_COMPILE" -eq 0 ]]; then
+    step "Step 1b: Compile CUTLASS shared library (${ARCH})"
 
     if [ ! -d "$CUTLASS_DIR/include/cutlass" ]; then
         echo "CUTLASS not found at $CUTLASS_DIR, cloning..."
         git clone --depth 1 https://github.com/NVIDIA/cutlass "$CUTLASS_DIR"
     fi
 
-    CUTLASS_BUILD="$REPO_DIR/kernels/build_cutlass.sh"
-    if [[ -x "$CUTLASS_BUILD" ]] || [[ -f "$CUTLASS_BUILD" ]]; then
-        bash "$CUTLASS_BUILD" "$ARCH" "$CUTLASS_DIR"
+    CUTLASS_SO_BUILD="$REPO_DIR/kernels/build_cutlass_so.sh"
+    if [[ -f "$CUTLASS_SO_BUILD" ]]; then
+        if bash "$CUTLASS_SO_BUILD" "$ARCH" "$CUTLASS_DIR"; then
+            pass "CUTLASS shared library built"
+        else
+            warn "CUTLASS .so build failed (fused epilogues will be unavailable)"
+        fi
     else
-        warn "build_cutlass.sh not found at $CUTLASS_BUILD"
+        warn "build_cutlass_so.sh not found"
     fi
     echo ""
 fi

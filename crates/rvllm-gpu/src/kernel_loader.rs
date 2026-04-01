@@ -611,6 +611,32 @@ impl KernelLoader {
         })
     }
 
+    /// Launch a cubin kernel cooperatively (all blocks must be co-resident).
+    ///
+    /// Uses `cuLaunchCooperativeKernel` so grid-level synchronization via
+    /// `cooperative_groups::grid_group::sync()` is available inside the kernel.
+    ///
+    /// # Safety
+    /// Caller must ensure kernel args exactly match the kernel signature.
+    pub unsafe fn launch_cooperative_cubin(
+        &self,
+        module: &str,
+        function: &str,
+        grid: (u32, u32, u32),
+        block: (u32, u32, u32),
+        shared_mem: u32,
+        args: &mut [*mut std::ffi::c_void],
+    ) -> Result<()> {
+        let cu_func = self.get_cubin_func(module, function)?;
+        self.context
+            .bind_to_thread()
+            .map_err(|e| crate::LLMError::GpuError(format!("CUDA bind failed: {e}")))?;
+        crate::cooperative::launch_cooperative(cu_func, grid, block, shared_mem, self.stream.cu_stream(), args)
+            .map_err(|e| crate::LLMError::GpuError(format!(
+                "cooperative cubin launch {module}::{function} failed: {e}"
+            )))
+    }
+
     /// Returns a reference to the underlying CUDA context.
     pub fn context(&self) -> &Arc<CudaContext> {
         &self.context

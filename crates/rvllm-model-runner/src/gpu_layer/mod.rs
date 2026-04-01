@@ -6,11 +6,12 @@
 //! - `batched.rs`: T>=1 batched decode / prefill path (cuBLAS/CUTLASS GEMMs)
 
 #[cfg(feature = "cuda")]
+mod decode;
+#[cfg(feature = "cuda")]
+mod batched;
+
+#[cfg(feature = "cuda")]
 mod inner {
-    #[path = "../decode.rs"]
-    mod decode;
-    #[path = "../batched.rs"]
-    mod batched;
     use std::sync::Arc;
 
     use cudarc::driver::{CudaSlice, CudaStream, CudaView, CudaViewMut, DevicePtr, DevicePtrMut, DeviceSlice, LaunchConfig};
@@ -107,6 +108,9 @@ mod inner {
         Fp8Decode,
         /// T=1 decode with fused f16 GEMV kernels.
         FusedDecode,
+        /// T=1 decode: single cooperative kernel executes the entire transformer layer.
+        /// Requires persistent_layer_decode cubin. Eliminates ~6 kernel launches per layer.
+        PersistentDecode,
         /// T>=1 batched decode or prefill with cuBLAS/CUTLASS GEMMs.
         /// Always requires scratch buffers.
         Batched,
@@ -127,9 +131,9 @@ mod inner {
     // ===================================================================
 
     pub struct GpuTransformerLayer {
-        config: GpuLayerConfig,
-        stream: Arc<CudaStream>,
-        loader: Arc<KernelLoader>,
+        pub(crate) config: GpuLayerConfig,
+        pub(crate) stream: Arc<CudaStream>,
+        pub(crate) loader: Arc<KernelLoader>,
     }
 
     impl GpuTransformerLayer {
@@ -167,6 +171,9 @@ mod inner {
                 }
                 ForwardPath::FusedDecode => {
                     Ok(Some(self.forward_fused_decode(input, weights, blas, lt, prev_mlp_out)?))
+                }
+                ForwardPath::PersistentDecode => {
+                    Ok(Some(self.forward_persistent_decode(input, weights, prev_mlp_out)?))
                 }
                 ForwardPath::Batched => {
                     let scratch = scratch.expect("Batched path requires scratch buffers");
@@ -716,7 +723,8 @@ mod inner {
                 const V3_MAX_HPG: usize = 8;
                 const V3_SCORE_STRIDE: usize = V3_BC + 1;
 
-                let smem = V3_BC * head_dim * std::mem::size_of::<u16>()
+                // Double-buffered: 2x KV tile buffers (K + V)
+                let smem = 2 * V3_BC * head_dim * std::mem::size_of::<u16>()
                          + V3_MAX_HPG * V3_SCORE_STRIDE * std::mem::size_of::<f32>()
                          + 8 * std::mem::size_of::<f32>();
                 let shared_mem_bytes = smem as u32;
@@ -741,7 +749,8 @@ mod inner {
                 let v3_kernel = loader.get_func("flash_attention_3_v3", "fa3_v3_decode_kernel")?;
                 const V3_BC: usize = 64;
                 const V3_THREADS: u32 = 256;
-                let smem = V3_BC * head_dim * std::mem::size_of::<u16>()
+                // Double-buffered: 2x KV tile buffers (K + V)
+                let smem = 2 * V3_BC * head_dim * std::mem::size_of::<u16>()
                          + (V3_BC + 8) * std::mem::size_of::<f32>();
                 let shared_mem_bytes = smem as u32;
 

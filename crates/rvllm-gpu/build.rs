@@ -149,20 +149,31 @@ fn compile_kernels(nvcc: &Path, kernel_dir: &Path, out_dir: &Path) {
                 let cubin_path = ptx_dir.join(&cubin_name);
                 let mut nvcc_cmd = Command::new(nvcc);
                 nvcc_cmd.args(["-cubin", &arch_flag, "-O3", "-rdc=true", "--use_fast_math"]);
+                nvcc_cmd.arg("-Xptxas");
+                nvcc_cmd.arg("-v");
                 nvcc_cmd.arg("-o").arg(&cubin_path).arg(&path);
-                let status = nvcc_cmd.status();
-                match status {
-                    Ok(s) if s.success() => {
+                let output = nvcc_cmd.output();
+                match output {
+                    Ok(o) if o.status.success() => {
                         println!(
                             "cargo:warning=Compiled kernel: {}.cu -> {} (cubin, {})",
                             stem, cubin_name, arch
                         );
+                        // Surface register usage / spill stats from nvcc -Xptxas -v
+                        let stderr = String::from_utf8_lossy(&o.stderr);
+                        for line in stderr.lines() {
+                            println!("cargo:warning=[ptxas] {}", line);
+                        }
                     }
-                    Ok(s) => {
+                    Ok(o) => {
                         println!(
                             "cargo:warning=nvcc cubin failed for {}.cu [{}] (exit {}), skipping",
-                            stem, arch, s.code().unwrap_or(-1)
+                            stem, arch, o.status.code().unwrap_or(-1)
                         );
+                        let stderr = String::from_utf8_lossy(&o.stderr);
+                        for line in stderr.lines() {
+                            println!("cargo:warning=[nvcc stderr] {}", line);
+                        }
                     }
                     Err(e) => {
                         println!(

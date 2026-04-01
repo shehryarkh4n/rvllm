@@ -2534,19 +2534,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rtriton"
-version = "0.1.0"
-dependencies = [
- "cudarc",
- "half",
- "parking_lot",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tracing",
-]
-
-[[package]]
 name = "rust-ini"
 version = "0.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

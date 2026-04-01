@@ -1,4 +1,4 @@
-.PHONY: build build-cuda check check-cuda test test-cuda kernels bench bench-python bench-compare docker deploy-provision deploy-push deploy-bench deploy-teardown a100-bench loc clean
+.PHONY: build build-cuda check check-cuda test test-cuda kernels bench bench-python bench-compare docker deploy-provision deploy-push deploy-bench deploy-teardown a100-bench validate validate-full validate-kernels loc clean
 
 # Local development (Mac, mock-gpu)
 build:
@@ -39,6 +39,18 @@ bench-python:
 # Compare Rust vs Python benchmarks
 bench-compare: bench bench-python
 	python3 benches/compare.py
+
+# Local build validation (no GPU required, runs in Docker)
+validate:
+	bash scripts/validate-local.sh
+
+# Full validation including release binary
+validate-full:
+	bash scripts/validate-local.sh --full
+
+# Kernel-only validation (fastest)
+validate-kernels:
+	bash scripts/validate-local.sh --kernels
 
 # Build Docker image
 docker:

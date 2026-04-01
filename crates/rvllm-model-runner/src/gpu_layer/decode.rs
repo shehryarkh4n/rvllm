@@ -1,12 +1,13 @@
 //! T=1 single-token decode forward paths.
 //!
-//! Two deterministic paths, selected by ForwardPath enum at the call site:
+//! Three deterministic paths, selected by ForwardPath enum at the call site:
 //! - `forward_fp8_decode`: cublasLt FP8 GEMMs (requires FP8 weights + cublaslt feature)
 //! - `forward_fused_decode`: maximally fused f16 GEMV kernels
+//! - `forward_persistent_decode`: single cooperative kernel for the entire layer
 
 use std::sync::Arc;
 
-use cudarc::driver::{CudaSlice, CudaStream, CudaViewMut, DevicePtr, DevicePtrMut, LaunchConfig};
+use cudarc::driver::{CudaSlice, CudaStream, CudaViewMut, DevicePtr, DevicePtrMut, DeviceSlice, LaunchConfig};
 use half::f16;
 use tracing::info;
 
@@ -83,14 +84,15 @@ impl GpuTransformerLayer {
         let mut qkv = unsafe { self.stream.alloc::<f16>(qkv_dim) }
             .map_err(|e| LLMError::GpuError(format!("fp8 qkv alloc: {e}")))?;
         let (qkv_out_ptr, _qog) = DevicePtrMut::device_ptr_mut(&mut qkv, &self.stream);
-        lt.fp8_gemm_a_bt_raw(1, qkv_dim, hidden, fp8_scratch_ptr, qkv_w_ptr, qkv_out_ptr)?;
+        if let Some(bias) = weights.qkv_bias {
+            let (bias_ptr, _biag) = DevicePtr::device_ptr(bias, &self.stream);
+            lt.fp8_gemm_a_bt_bias_raw(1, qkv_dim, hidden, fp8_scratch_ptr, qkv_w_ptr, bias_ptr, qkv_out_ptr)?;
+        } else {
+            lt.fp8_gemm_a_bt_raw(1, qkv_dim, hidden, fp8_scratch_ptr, qkv_w_ptr, qkv_out_ptr)?;
+        }
         drop(_qog);
 
-        // Step 3: QKV bias
-        if let Some(bias) = weights.qkv_bias {
-            let mut qkv_view = qkv.slice_mut(..qkv_dim);
-            Self::add_bias_f16_view(&self.stream, &self.loader, &mut qkv_view, bias, 1, qkv_dim)?;
-        }
+        // Step 3: QKV bias -- fused into GEMM above, no separate kernel needed
 
         // Step 4: Fused RoPE + KV cache write
         Self::fused_rope_cache_write(&self.stream, &self.loader, &mut qkv,
@@ -487,6 +489,168 @@ impl GpuTransformerLayer {
         }
         let mlp = self.fused_silu_down(weights, &gate_up_out, hidden, intermediate)?;
         Ok((residual_out2, mlp))
+    }
+
+    // ================================================================
+    // PATH 3: Persistent cooperative-groups decode (T=1)
+    // ================================================================
+
+    /// Single cooperative kernel launch that executes an entire transformer layer.
+    /// Eliminates ~6 kernel launches per layer vs FusedDecode.
+    /// Requires persistent_layer_decode.cubin compiled with -rdc=true.
+    pub(crate) fn forward_persistent_decode(
+        &self,
+        input: &GpuLayerInput<'_>,
+        weights: &GpuLayerWeights<'_>,
+        prev_mlp_out: Option<&CudaSlice<f16>>,
+    ) -> Result<(CudaSlice<f16>, CudaSlice<f16>)> {
+        use std::ffi::c_void;
+
+        let cfg = &self.config;
+        let hidden = cfg.hidden_size;
+        let num_heads = cfg.num_heads;
+        let num_kv_heads = cfg.num_kv_heads;
+        let head_dim = cfg.head_dim;
+        let intermediate = cfg.intermediate_size;
+        let q_dim = num_heads * head_dim;
+        let kv_dim = num_kv_heads * head_dim;
+        let qkv_dim = q_dim + kv_dim + kv_dim;
+        let gate_up_dim = intermediate * 2;
+        let attn_scale = 1.0f32 / (head_dim as f32).sqrt();
+
+        // Shared memory: max of attention phase and norm+gemv phase
+        // PLD_FA_BC=64, PLD_FA_MAX_HPG=8 (matches kernel defines)
+        let smem = (64 * head_dim * 4 + 8 * 64 * 4 + 32).max(hidden * 4 + 32) as u32;
+
+        let fused_qkv = weights.fused_qkv
+            .ok_or_else(|| LLMError::GpuError("PersistentDecode requires fused_qkv weight".into()))?;
+        let fused_gate_up = weights.fused_gate_up
+            .ok_or_else(|| LLMError::GpuError("PersistentDecode requires fused_gate_up weight".into()))?;
+
+        // Raise max dynamic shared memory limit if needed (default cap is 48 KB)
+        if smem > 49152 {
+            let cu_func = self.loader.get_cubin_func(
+                "persistent_layer_decode", "persistent_layer_decode_f16")?;
+            unsafe {
+                cudarc::driver::sys::cuFuncSetAttribute(
+                    cu_func,
+                    cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    smem as i32,
+                ).result().map_err(|e| LLMError::GpuError(format!("pld set smem: {e}")))?;
+            }
+        }
+
+        // Output and scratch buffers
+        let mlp_out        = unsafe { self.stream.alloc::<f16>(hidden)       }.map_err(|e| LLMError::GpuError(format!("pld alloc: {e}")))?;
+        let residual_out   = unsafe { self.stream.alloc::<f16>(hidden)       }.map_err(|e| LLMError::GpuError(format!("pld alloc: {e}")))?;
+        let qkv_scratch    = unsafe { self.stream.alloc::<f16>(qkv_dim)     }.map_err(|e| LLMError::GpuError(format!("pld alloc: {e}")))?;
+        let attn_scratch   = unsafe { self.stream.alloc::<f16>(q_dim)       }.map_err(|e| LLMError::GpuError(format!("pld alloc: {e}")))?;
+        let oproj_scratch  = unsafe { self.stream.alloc::<f16>(hidden)       }.map_err(|e| LLMError::GpuError(format!("pld alloc: {e}")))?;
+        let gateup_scratch = unsafe { self.stream.alloc::<f16>(gate_up_dim) }.map_err(|e| LLMError::GpuError(format!("pld alloc: {e}")))?;
+
+        // Allocate + zero sync flags for atomic phase sync (6 ints)
+        let sync_flags = self.stream.htod_copy(vec![0i32; 6])
+            .map_err(|e| LLMError::GpuError(format!("dag sync alloc: {e}")))?;
+
+        // CUdeviceptr values (u64) for all kernel pointer arguments
+        let p_mlp_out        = DevicePtr::device_ptr(&mlp_out,                         &self.stream).0;
+        let p_residual_out   = DevicePtr::device_ptr(&residual_out,                    &self.stream).0;
+        let p_prev_residual  = DevicePtr::device_ptr(input.hidden_states,              &self.stream).0;
+        let null: u64        = 0;
+        let p_prev_mlp       = prev_mlp_out.map(|s| DevicePtr::device_ptr(s, &self.stream).0).unwrap_or(null);
+        let p_key_cache      = DevicePtr::device_ptr(input.key_cache,                  &self.stream).0;
+        let p_value_cache    = DevicePtr::device_ptr(input.value_cache,                &self.stream).0;
+        let p_block_tables   = DevicePtr::device_ptr(&input.block_tables,              &self.stream).0;
+        let p_context_lens   = DevicePtr::device_ptr(&input.context_lens,              &self.stream).0;
+        let p_positions      = DevicePtr::device_ptr(&input.positions,                 &self.stream).0;
+        let p_slot_mapping   = DevicePtr::device_ptr(&input.slot_mapping,              &self.stream).0;
+        let p_rope_cos       = DevicePtr::device_ptr(input.rope_cos,                   &self.stream).0;
+        let p_rope_sin       = DevicePtr::device_ptr(input.rope_sin,                   &self.stream).0;
+        let p_norm_w         = DevicePtr::device_ptr(weights.input_layernorm,           &self.stream).0;
+        let p_qkv_w          = DevicePtr::device_ptr(fused_qkv,                         &self.stream).0;
+        let p_qkv_bias       = weights.qkv_bias.map(|s| DevicePtr::device_ptr(s, &self.stream).0).unwrap_or(null);
+        let p_o_w            = DevicePtr::device_ptr(weights.o_proj,                   &self.stream).0;
+        let p_post_norm_w    = DevicePtr::device_ptr(weights.post_attention_layernorm, &self.stream).0;
+        let p_gateup_w       = DevicePtr::device_ptr(fused_gate_up,                     &self.stream).0;
+        let p_down_w         = DevicePtr::device_ptr(weights.down_proj,                 &self.stream).0;
+        let p_qkv_scratch    = DevicePtr::device_ptr(&qkv_scratch,                     &self.stream).0;
+        let p_attn_scratch   = DevicePtr::device_ptr(&attn_scratch,                    &self.stream).0;
+        let p_oproj_scratch  = DevicePtr::device_ptr(&oproj_scratch,                   &self.stream).0;
+        let p_gateup_scratch = DevicePtr::device_ptr(&gateup_scratch,                  &self.stream).0;
+        let p_sync_flags     = DevicePtr::device_ptr(&sync_flags,                     &self.stream).0;
+
+        // Scalar args
+        let eps            = cfg.rms_norm_eps;
+        let i_hidden       = hidden as i32;
+        let i_q_dim        = q_dim as i32;
+        let i_kv_dim       = kv_dim as i32;
+        let i_qkv_dim      = qkv_dim as i32;
+        let i_num_heads    = num_heads as i32;
+        let i_num_kv_heads = num_kv_heads as i32;
+        let i_head_dim     = head_dim as i32;
+        let i_intermediate = intermediate as i32;
+        let i_gate_up_dim  = gate_up_dim as i32;
+        let i_block_size   = input.block_size as i32;
+        let i_max_ctx      = input.max_context_len as i32;
+        let i_max_blocks   = (DeviceSlice::len(&input.block_tables) / input.num_seqs.max(1)) as i32;
+
+        // kernelParams: each element is *mut c_void pointing to the actual arg value
+        #[allow(clippy::cast_ptr_alignment)]
+        let mut args: [*mut c_void; 38] = [
+            &p_mlp_out        as *const u64 as *mut c_void,
+            &p_residual_out   as *const u64 as *mut c_void,
+            &p_prev_residual  as *const u64 as *mut c_void,
+            &p_prev_mlp       as *const u64 as *mut c_void,
+            &p_key_cache      as *const u64 as *mut c_void,
+            &p_value_cache    as *const u64 as *mut c_void,
+            &p_block_tables   as *const u64 as *mut c_void,
+            &p_context_lens   as *const u64 as *mut c_void,
+            &p_positions      as *const u64 as *mut c_void,
+            &p_slot_mapping   as *const u64 as *mut c_void,
+            &p_rope_cos       as *const u64 as *mut c_void,
+            &p_rope_sin       as *const u64 as *mut c_void,
+            &p_norm_w         as *const u64 as *mut c_void,
+            &p_qkv_w          as *const u64 as *mut c_void,
+            &p_qkv_bias       as *const u64 as *mut c_void,
+            &p_o_w            as *const u64 as *mut c_void,
+            &p_post_norm_w    as *const u64 as *mut c_void,
+            &p_gateup_w       as *const u64 as *mut c_void,
+            &p_down_w         as *const u64 as *mut c_void,
+            &p_qkv_scratch    as *const u64 as *mut c_void,
+            &p_attn_scratch   as *const u64 as *mut c_void,
+            &p_oproj_scratch  as *const u64 as *mut c_void,
+            &p_gateup_scratch as *const u64 as *mut c_void,
+            &eps              as *const f32 as *mut c_void,
+            &attn_scale       as *const f32 as *mut c_void,
+            &i_hidden         as *const i32 as *mut c_void,
+            &i_q_dim          as *const i32 as *mut c_void,
+            &i_kv_dim         as *const i32 as *mut c_void,
+            &i_qkv_dim        as *const i32 as *mut c_void,
+            &i_num_heads      as *const i32 as *mut c_void,
+            &i_num_kv_heads   as *const i32 as *mut c_void,
+            &i_head_dim       as *const i32 as *mut c_void,
+            &i_intermediate   as *const i32 as *mut c_void,
+            &i_gate_up_dim    as *const i32 as *mut c_void,
+            &i_block_size     as *const i32 as *mut c_void,
+            &i_max_ctx        as *const i32 as *mut c_void,
+            &i_max_blocks     as *const i32 as *mut c_void,
+            &p_sync_flags     as *const u64 as *mut c_void,  // sync_flags
+        ];
+
+        // Grid of 256 blocks -- all must fit simultaneously on the GPU
+        // (H100 SXM has 132 SMs x 2 blocks/SM = 264 capacity at this smem size)
+        unsafe {
+            self.loader.launch_cooperative_cubin(
+                "persistent_layer_decode",
+                "persistent_layer_decode_f16",
+                (256, 1, 1),
+                (256, 1, 1), // PLD_THREADS
+                smem,
+                &mut args,
+            )?;
+        }
+
+        Ok((residual_out, mlp_out))
     }
 
     /// Fused SiLU + Down projection GEMV (shared by both mega and fallback paths).

@@ -1245,6 +1245,11 @@ mod cuda_impl {
 
         fn resolve_forward_path(&self, num_tokens: usize, is_prefill: bool) -> ForwardPath {
             if num_tokens == 1 && !is_prefill {
+                // DAG persistent decode: single cooperative kernel per layer
+                // Enable with RVLLM_PERSISTENT=1
+                if std::env::var("RVLLM_PERSISTENT").map_or(false, |v| v == "1") {
+                    return ForwardPath::PersistentDecode;
+                }
                 #[cfg(feature = "cublaslt")]
                 if self.blas_lt.is_some()
                     && self.weights.has_fp8_weights()

@@ -213,7 +213,7 @@ impl GpuTransformerLayer {
     // Batched-path QKV helpers
     // ----------------------------------------------------------------
 
-    /// Try CUTLASS fused QKV+bias GEMM (T=1 only, requires CUTLASS + fused QKV + bias).
+    /// Try CUTLASS fused QKV+bias GEMM (requires CUTLASS + fused QKV + bias).
     /// Returns true if CUTLASS was used and QKV is written to scratch.qkv.
     fn batched_qkv_cutlass(
         &self,
@@ -226,7 +226,6 @@ impl GpuTransformerLayer {
         q_dim: usize,
         kv_dim: usize,
     ) -> Result<bool> {
-        if num_tokens != 1 { return Ok(false); }
         let (fused_qkv, bias, ck) = match (weights.fused_qkv, weights.qkv_bias, cutlass) {
             (Some(q), Some(b), Some(c)) => (q, b, c),
             _ => return Ok(false),
@@ -249,6 +248,23 @@ impl GpuTransformerLayer {
         Ok(true)
     }
 
+    /// GEMM + bias via cublasLt BIAS epilogue. Caller should skip separate bias add.
+    #[cfg(feature = "cublaslt")]
+    fn hgemm_dispatch_fp8_bias_into(
+        stream: &Arc<CudaStream>,
+        lt: &crate::CublasLtRef,
+        a: &CudaSlice<f16>,
+        b: &CudaSlice<f16>,
+        bias: &CudaSlice<f16>,
+        m: usize,
+        n: usize,
+        k: usize,
+        c: &mut CudaSlice<f16>,
+    ) -> Result<()> {
+        let (bias_ptr, _bg) = DevicePtr::device_ptr(bias, stream);
+        lt.hgemm_a_bt_bias_into(m, n, k, 1.0, a, b, bias_ptr, c)
+    }
+
     /// cuBLAS/cublasLt QKV GEMM + bias into scratch.qkv.
     fn batched_qkv_gemm(
         &self,
@@ -262,11 +278,23 @@ impl GpuTransformerLayer {
         q_dim: usize,
         kv_dim: usize,
     ) -> Result<()> {
+        #[allow(unused_mut, unused_assignments)]
+        let mut bias_fused = false;
+
         if let Some(fused_qkv) = weights.fused_qkv {
             if num_tokens == 1 {
-                Self::hgemm_dispatch_fp8_into(&self.stream, blas, lt, &*scratch.normed, fused_qkv,
-                    num_tokens, qkv_dim, hidden, &self.loader,
-                    weights.fused_qkv_fp8, scratch.qkv)?;
+                #[cfg(feature = "cublaslt")]
+                if let (Some(lt_ops), Some(bias)) = (lt, weights.qkv_bias) {
+                    Self::hgemm_dispatch_fp8_bias_into(
+                        &self.stream, lt_ops, &*scratch.normed, fused_qkv,
+                        bias, num_tokens, qkv_dim, hidden, scratch.qkv)?;
+                    bias_fused = true;
+                }
+                if !bias_fused {
+                    Self::hgemm_dispatch_fp8_into(&self.stream, blas, lt, &*scratch.normed, fused_qkv,
+                        num_tokens, qkv_dim, hidden, &self.loader,
+                        weights.fused_qkv_fp8, scratch.qkv)?;
+                }
             } else {
                 // Fused GEMM into gate_up (temp) + deinterleave into qkv
                 Self::hgemm_dispatch_fp8_into(&self.stream, blas, lt, &*scratch.normed, fused_qkv,
@@ -294,7 +322,8 @@ impl GpuTransformerLayer {
             { let mut d = scratch.qkv.slice_mut(k_end_t..k_end_t + num_tokens * kv_dim); Self::hgemm_dispatch_into(blas, lt, &*scratch.normed, weights.v_proj, num_tokens, kv_dim, hidden, &mut d)?; }
         }
 
-        // Bias add
+        // Bias add (skip if already fused into GEMM)
+        if !bias_fused {
         if let Some(bias) = weights.qkv_bias {
             if num_tokens == 1 {
                 let bk = self.loader.get_func("add_bias_broadcast", "add_bias_broadcast_f16_kernel")
@@ -317,6 +346,7 @@ impl GpuTransformerLayer {
                 { let mut d = scratch.qkv.slice_mut(q_end_t..k_end_t); Self::add_bias_f16_view_from_slice(&self.stream, &self.loader, &mut d, &k_bias, num_tokens, kv_dim)?; }
                 { let mut d = scratch.qkv.slice_mut(k_end_t..k_end_t + num_tokens * kv_dim); Self::add_bias_f16_view_from_slice(&self.stream, &self.loader, &mut d, &v_bias, num_tokens, kv_dim)?; }
             }
+        }
         }
 
         Ok(())
