@@ -89,11 +89,14 @@ mod cuda_impl {
             }
             let have = self.buf.as_ref().map_or(0, |b| b.len());
             if have < need {
-                assert!(
-                    !self.frozen,
-                    "ReusableGpuBuf: overflow after freeze (need {need}, have {have}). \
-                     Pre-allocation in prepare_for_graph_capture() is too small."
-                );
+                if self.frozen {
+                    tracing::warn!(
+                        need, have,
+                        "ReusableGpuBuf: realloc after freeze -- CUDA graph pointers invalidated. \
+                         Increase pre-allocation in prepare_for_graph_capture()."
+                    );
+                    self.frozen = false; // unfreeze to allow realloc
+                }
                 let cap = need.max(have * 2).max(64);
                 self.buf = Some(stream.alloc_zeros::<i32>(cap)?);
             }
