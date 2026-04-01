@@ -55,9 +55,9 @@ struct __align__(64) MkInstr {
     int      gmem_in;         // input offset
     int      gmem_out;        // output offset
     int      gmem_aux;        // auxiliary (residual, rope, etc.)
-    int      gmem_aux2;       // second auxiliary
+    int      gmem_aux2;       // load barrier counter / layer index for cache ops
 
-    float    eps;
+    float    eps;             // also used as attn_scale for attention
 };
 
 // ============================================================================
@@ -101,12 +101,18 @@ __device__ __forceinline__ float mk_silu(float x) {
 // Loads prev_residual + prev_mlp (or just prev_residual for layer 0)
 // into shared memory, computes RMSNorm, applies norm weights.
 // Block 0 writes pre-norm residual to global memory if flags & 8.
+//
+// RACE AVOIDANCE: When gmem_in == gmem_out (in-place residual update),
+// all blocks must finish loading into smem before block 0 overwrites.
+// If gmem_aux2 >= 0, it encodes a sync counter index used to barrier
+// between the load and the write (signal+wait on that counter).
 // ============================================================================
 __device__ void exec_add_rmsnorm(
     float* smem, float* s_scratch,
     const MkInstr* instr,
     __half* scratch,
-    const __half* const* weight_ptrs
+    const __half* const* weight_ptrs,
+    int* sync_counters
 ) {
     const int tid = threadIdx.x;
     const int hidden = instr->dim_in;
@@ -157,9 +163,18 @@ __device__ void exec_add_rmsnorm(
     float rms_scale = s_scratch[0];
 
     // Block 0 writes pre-norm residual
-    if (blockIdx.x == 0 && (instr->flags & 8)) {
-        for (int i = tid; i < hidden; i += MK_THREADS)
-            residual_out[i] = __float2half(smem[i]);
+    if (instr->flags & 8) {
+        // Race avoidance: if gmem_aux2 >= 0, all blocks must barrier
+        // before block 0 overwrites gmem_out (which may alias gmem_in).
+        const int load_sync = instr->gmem_aux2;
+        if (load_sync >= 0) {
+            mk_signal(sync_counters, load_sync);
+            mk_wait(sync_counters, load_sync, (int)gridDim.x);
+        }
+        if (blockIdx.x == 0) {
+            for (int i = tid; i < hidden; i += MK_THREADS)
+                residual_out[i] = __float2half(smem[i]);
+        }
     }
 
     // Apply norm weights
@@ -174,7 +189,7 @@ __device__ void exec_add_rmsnorm(
 // All blocks participate.
 // ============================================================================
 __device__ void exec_gemv_strided(
-    const float* smem_in, float* s_scratch,
+    float* smem_in, float* s_scratch,
     const MkInstr* instr,
     __half* scratch,
     const __half* const* weight_ptrs
@@ -184,6 +199,18 @@ __device__ void exec_gemv_strided(
     const int out_dim = instr->dim_out;
     const int hidden  = instr->dim_in;
     const int h2 = hidden / 2;
+
+    // Load global memory input into shared memory before GEMV (e.g. O-projection)
+    if (instr->flags & 16) {
+        const __half* src = (__half*)(scratch + instr->gmem_in / 2);
+        const half2* src2 = (const half2*)src;
+        for (int i = tid; i < h2; i += MK_THREADS) {
+            half2 a = src2[i];
+            smem_in[i * 2]     = __half2float(a.x);
+            smem_in[i * 2 + 1] = __half2float(a.y);
+        }
+        __syncthreads();
+    }
     const __half* weight = weight_ptrs[instr->weight_idx];
     __half* output = (__half*)(scratch + instr->gmem_out / 2);
 
@@ -223,20 +250,16 @@ __device__ void exec_gemv_chunked(
     const int warp_id = threadIdx.x / 32;
     const int lane_id = threadIdx.x % 32;
     const int hidden = instr->dim_out;       // output dim (hidden_size)
-    const int chunk_size = instr->dim_in;    // cols this chunk
+    const int chunk_size = instr->dim_in;    // cols this chunk (4736)
     const int chunk_id = instr->dim_aux;
-    const int intermediate = chunk_size;
+    const int full_intermediate = chunk_size * 4; // 18944
     const bool clear = (instr->flags & 4);
 
     const __half* gateup = (__half*)(scratch + instr->gmem_in / 2);
     const __half* gate = gateup + chunk_id * chunk_size;
-    const __half* up   = gateup + (instr->gmem_aux / 2 > 0 ? instr->gmem_aux / 2 : 0);
+    const __half* up   = gateup + full_intermediate + chunk_id * chunk_size;
     const __half* down_w = weight_ptrs[instr->weight_idx];
     __half* output = (__half*)(scratch + instr->gmem_out / 2);
-
-    // Offset weight to this chunk's columns
-    // down_weight is [hidden, full_intermediate], we want columns [chunk_id*chunk_size .. (chunk_id+1)*chunk_size]
-    const int full_intermediate = chunk_size * 4; // MK_DOWN_CHUNKS
 
     for (int base = blockIdx.x * MK_RPB; base < hidden; base += gridDim.x * MK_RPB) {
         int row = base + warp_id;
@@ -293,37 +316,39 @@ __device__ void exec_rope_cache(
 
     __half* qkv = (__half*)(scratch + instr->gmem_in / 2);
     const int total_heads = num_heads + 2 * num_kv_heads;
-
-    // Optional bias
-    if ((instr->flags & 2) && instr->bias_idx >= 0) {
-        const __half* bias = weight_ptrs[instr->bias_idx];
-        int qkv_dim = q_dim + 2 * kv_dim;
-        for (int i = bid * MK_THREADS + tid; i < qkv_dim; i += gridDim.x * MK_THREADS)
-            qkv[i] = __float2half(__half2float(qkv[i]) + __half2float(bias[i]));
-        // Need all blocks to finish bias before RoPE
-        // (handled by caller's sync design -- bias and RoPE are in same instruction)
-    }
+    const bool has_bias = (instr->flags & 2) && instr->bias_idx >= 0;
+    const __half* bias = has_bias ? weight_ptrs[instr->bias_idx] : nullptr;
 
     if (bid < num_heads) {
-        // Q head: RoPE only
+        // Q head: per-head bias + RoPE
         __half* q_head = qkv + bid * head_dim;
+        const __half* q_bias = has_bias ? (bias + bid * head_dim) : nullptr;
         for (int i = tid; i < half_dim; i += MK_THREADS) {
             float c = rope_cos[pos * half_dim + i];
             float s = rope_sin[pos * half_dim + i];
             float q0 = __half2float(q_head[2*i]);
             float q1 = __half2float(q_head[2*i+1]);
+            if (has_bias) {
+                q0 += __half2float(q_bias[2*i]);
+                q1 += __half2float(q_bias[2*i+1]);
+            }
             q_head[2*i]   = __float2half(q0*c - q1*s);
             q_head[2*i+1] = __float2half(q0*s + q1*c);
         }
     } else if (bid < num_heads + num_kv_heads) {
-        // K head: RoPE + cache write
+        // K head: per-head bias + RoPE + cache write
         int h = bid - num_heads;
         __half* k_head = qkv + q_dim + h * head_dim;
+        const __half* k_bias = has_bias ? (bias + q_dim + h * head_dim) : nullptr;
         for (int i = tid; i < half_dim; i += MK_THREADS) {
             float c = rope_cos[pos * half_dim + i];
             float s = rope_sin[pos * half_dim + i];
             float k0 = __half2float(k_head[2*i]);
             float k1 = __half2float(k_head[2*i+1]);
+            if (has_bias) {
+                k0 += __half2float(k_bias[2*i]);
+                k1 += __half2float(k_bias[2*i+1]);
+            }
             float k0r = k0*c - k1*s, k1r = k0*s + k1*c;
             k_head[2*i]   = __float2half(k0r);
             k_head[2*i+1] = __float2half(k1r);
@@ -334,9 +359,14 @@ __device__ void exec_rope_cache(
             }
         }
     } else if (bid < total_heads) {
-        // V head: cache write (no RoPE)
+        // V head: per-head bias + cache write (no RoPE)
         int h = bid - num_heads - num_kv_heads;
         __half* v_head = qkv + q_dim + kv_dim + h * head_dim;
+        const __half* v_bias = has_bias ? (bias + q_dim + kv_dim + h * head_dim) : nullptr;
+        if (has_bias) {
+            for (int i = tid; i < head_dim; i += MK_THREADS)
+                v_head[i] = __float2half(__half2float(v_head[i]) + __half2float(v_bias[i]));
+        }
         if (slot >= 0) {
             int off = (slot * num_kv_heads + h) * head_dim;
             for (int i = tid; i < head_dim; i += MK_THREADS)
@@ -576,8 +606,8 @@ megakernel_decode_f16(
     const __half* const* __restrict__ weight_ptrs,
     __half*              __restrict__ scratch,
     int*                              sync_counters,
-    __half*              __restrict__ key_cache,
-    __half*              __restrict__ value_cache,
+    __half* const*       __restrict__ key_caches,      // [num_layers] per-layer cache ptrs
+    __half* const*       __restrict__ value_caches,
     const int*           __restrict__ block_tables,
     const int*           __restrict__ context_lens,
     const int*           __restrict__ positions,
@@ -607,7 +637,7 @@ megakernel_decode_f16(
         // Dispatch
         switch (instr->type) {
         case INSTR_ADD_RMSNORM:
-            exec_add_rmsnorm(smem, s_scratch, instr, scratch, weight_ptrs);
+            exec_add_rmsnorm(smem, s_scratch, instr, scratch, weight_ptrs, sync_counters);
             break;
         case INSTR_GEMV_STRIDED:
             exec_gemv_strided(smem, s_scratch, instr, scratch, weight_ptrs);
@@ -615,14 +645,17 @@ megakernel_decode_f16(
         case INSTR_GEMV_CHUNKED:
             exec_gemv_chunked(instr, scratch, weight_ptrs);
             break;
-        case INSTR_ROPE_CACHE:
+        case INSTR_ROPE_CACHE: {
+            int li = instr->weight_idx; // layer index for cache
             exec_rope_cache(instr, scratch, weight_ptrs,
-                key_cache, value_cache, block_tables,
+                key_caches[li], value_caches[li], block_tables,
                 positions, slot_mapping, rope_cos, rope_sin);
             break;
-        case INSTR_GQA_ATTENTION:
+        }
+        case INSTR_GQA_ATTENTION: {
+            int li = instr->weight_idx; // layer index for cache
             exec_gqa_attention(smem, s_scratch, instr, scratch,
-                key_cache, value_cache, block_tables, context_lens,
+                key_caches[li], value_caches[li], block_tables, context_lens,
                 block_size);
             break;
         case INSTR_ARGMAX:
