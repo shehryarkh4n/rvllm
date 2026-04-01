@@ -1267,7 +1267,7 @@ mod cuda_impl {
                 }
                 #[cfg(feature = "cublaslt")]
                 if self.blas_lt.is_some()
-                    && self.weights.has_fp8_weights()
+                    && !self.fp8_fused_qkv.is_empty()
                     && self.fp8_input_scratch.is_some()
                 {
                     return ForwardPath::Fp8Decode;

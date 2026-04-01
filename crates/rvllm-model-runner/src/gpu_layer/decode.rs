@@ -167,7 +167,7 @@ impl GpuTransformerLayer {
             .map_err(|e| LLMError::GpuError(format!("fp8 down alloc: {e}")))?;
         let (mlp_ptr, _mlp_guard) = DevicePtrMut::device_ptr_mut(&mut mlp_out, &self.stream);
         lt.fp8_gemm_a_bt_raw(1, hidden, intermediate, fp8_scratch_ptr, d_w_ptr, mlp_ptr)?;
-        drop((_fag, _dg));
+        drop((_fag, _dg, _mlp_guard));
 
         Ok((residual, mlp_out))
     }
