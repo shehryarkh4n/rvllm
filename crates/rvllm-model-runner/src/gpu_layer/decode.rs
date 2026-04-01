@@ -549,7 +549,7 @@ impl GpuTransformerLayer {
         let gateup_scratch = unsafe { self.stream.alloc::<f16>(gate_up_dim) }.map_err(|e| LLMError::GpuError(format!("pld alloc: {e}")))?;
 
         // Allocate + zero sync flags for atomic phase sync (6 ints)
-        let sync_flags = self.stream.htod_copy(vec![0i32; 6])
+        let sync_flags = self.stream.clone_htod(&[0i32; 6])
             .map_err(|e| LLMError::GpuError(format!("dag sync alloc: {e}")))?;
 
         // CUdeviceptr values (u64) for all kernel pointer arguments
