@@ -155,6 +155,7 @@ mod inner {
         prompt: String,
         prompt_token_ids: Vec<TokenId>,
         sampling_params: SamplingParams,
+        emit_intermediate: bool,
         seq_states: Vec<SequenceOutputState>,
     }
 
@@ -211,6 +212,7 @@ mod inner {
         pub request_id: RequestId,
         pub prompt: String,
         pub params: SamplingParams,
+        pub emit_intermediate: bool,
     }
 
     pub struct GpuLLMEngine {
@@ -381,6 +383,7 @@ mod inner {
             request_id: RequestId,
             prompt: String,
             params: SamplingParams,
+            emit_intermediate: bool,
         ) -> Result<()> {
             info!(%request_id, prompt_len = prompt.len(), "GpuLLMEngine: add_request");
 
@@ -393,7 +396,13 @@ mod inner {
                 ));
             }
 
-            self.insert_request(request_id, prompt, prompt_token_ids, params)
+            self.insert_request(
+                request_id,
+                prompt,
+                prompt_token_ids,
+                params,
+                emit_intermediate,
+            )
         }
 
         pub fn add_request_auto_id(
@@ -402,7 +411,7 @@ mod inner {
             params: SamplingParams,
         ) -> Result<RequestId> {
             let request_id = RequestId(self.next_request_id.fetch_add(1, Ordering::Relaxed));
-            self.add_request(request_id, prompt, params)?;
+            self.add_request(request_id, prompt, params, true)?;
             Ok(request_id)
         }
 
@@ -412,6 +421,7 @@ mod inner {
             prompt: String,
             prompt_token_ids: Vec<TokenId>,
             params: SamplingParams,
+            emit_intermediate: bool,
         ) -> Result<()> {
             let num_seqs = params.best_of.max(1);
             let mut seqs = Vec::with_capacity(num_seqs);
@@ -434,6 +444,7 @@ mod inner {
                     prompt,
                     prompt_token_ids,
                     sampling_params: params,
+                    emit_intermediate,
                     seq_states,
                 },
             );
@@ -534,7 +545,12 @@ mod inner {
                     std::mem::take(&mut *lock)
                 };
                 for req in requests {
-                    let _ = self.add_request(req.request_id, req.prompt, req.params);
+                    let _ = self.add_request(
+                        req.request_id,
+                        req.prompt,
+                        req.params,
+                        req.emit_intermediate,
+                    );
                 }
             }
         }
@@ -807,13 +823,16 @@ mod inner {
                     }
                 }
 
-                let output = OutputProcessor::build_request_output(
-                    request_id,
-                    &req.prompt,
-                    &req.prompt_token_ids,
-                    &req.seq_states,
-                );
-                results.push(output);
+                let all_finished = req.seq_states.iter().all(|s| s.is_finished());
+                if req.emit_intermediate || all_finished {
+                    let output = OutputProcessor::build_request_output(
+                        request_id,
+                        &req.prompt,
+                        &req.prompt_token_ids,
+                        &req.seq_states,
+                    );
+                    results.push(output);
+                }
             }
 
             // Clean up finished requests.

@@ -422,6 +422,7 @@ mod inner {
                         request_id,
                         prompt,
                         params: sampling_params,
+                        emit_intermediate: false,
                     });
                     // Ack immediately -- the request is queued and will be
                     // picked up by the GPU thread at the next step().
@@ -471,6 +472,7 @@ mod inner {
                 request_id: rid,
                 prompt: req.prompt,
                 params: req.sampling_params,
+                emit_intermediate: req.emit_intermediate,
             });
 
             let _ = req.id_tx.send(Ok(rid));
