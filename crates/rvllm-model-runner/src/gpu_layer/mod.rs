@@ -14,7 +14,7 @@ mod batched;
 mod inner {
     use std::sync::Arc;
 
-    use cudarc::driver::{CudaSlice, CudaStream, CudaView, CudaViewMut, DevicePtr, DevicePtrMut, DeviceSlice, LaunchConfig};
+    use cudarc::driver::{CudaSlice, CudaStream, CudaView, CudaViewMut, DevicePtr, DevicePtrMut, DeviceSlice, LaunchConfig, PushKernelArg};
     use half::f16;
     use tracing::info;
 

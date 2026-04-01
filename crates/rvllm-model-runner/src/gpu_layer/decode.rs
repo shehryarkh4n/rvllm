@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use cudarc::driver::{CudaSlice, CudaStream, CudaViewMut, DevicePtr, DevicePtrMut, DeviceSlice, LaunchConfig};
+use cudarc::driver::{CudaSlice, CudaStream, CudaViewMut, DevicePtr, DevicePtrMut, DeviceSlice, LaunchConfig, PushKernelArg};
 use half::f16;
 use tracing::info;
 
@@ -278,8 +278,10 @@ impl GpuTransformerLayer {
             weights.fused_qkv_fp8_scale,
             self.loader.get_func("gemv_fp8", "fused_add_norm_fp8_gemv_kernel"),
         ) {
+            // Reinterpret u8 slice as f16 for the launch builder (kernel handles FP8 internally)
+            let fp8_as_f16 = unsafe { std::mem::transmute::<&CudaSlice<u8>, &CudaSlice<f16>>(fp8_w) };
             return self.launch_fused_gemv_2out(fk, hidden_states, prev_mlp, norm_w,
-                fp8_w, Some(fp8_s), None, eps, hidden, qkv_dim, false);
+                fp8_as_f16, Some(fp8_s), None, eps, hidden, qkv_dim, false);
         }
 
         // f16 bias-fused variant
@@ -374,7 +376,7 @@ impl GpuTransformerLayer {
         hidden_states: &CudaSlice<f16>,
         prev_mlp: &CudaSlice<f16>,
         norm_w: &CudaSlice<f16>,
-        weight: &(impl DevicePtr<f16> + cudarc::driver::DeviceSlice<f16>),
+        weight: &CudaSlice<f16>,
         fp8_scale: Option<&CudaSlice<f16>>,
         qkv_bias: Option<&CudaSlice<f16>>,
         eps: f32,
