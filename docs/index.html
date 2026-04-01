@@ -28,21 +28,10 @@ header .links a:hover{color:#fff}
 .hero{padding:1.5rem 0 2rem;border-bottom:1px solid #111}
 .hero .big{font-size:3.6rem;font-weight:700;color:#fff;letter-spacing:-0.04em;line-height:1.1}
 .hero .sub{font-size:0.95rem;color:#888;margin-top:0.4rem;font-weight:300}
-.hero-graphic{position:relative;margin-top:1.6rem;padding:1rem 1rem 0.8rem;background:radial-gradient(circle at top left,rgba(70,115,255,0.14),transparent 32%),radial-gradient(circle at top right,rgba(0,212,170,0.10),transparent 28%),linear-gradient(180deg,#060606,#020202);border:1px solid #111;overflow:hidden}
-.hero-graphic:before{content:"";position:absolute;inset:0;background:linear-gradient(90deg,transparent 0,rgba(255,255,255,0.03) 50%,transparent 100%);transform:translateX(-100%);animation:sweep 9s linear infinite}
-.hero-graphic-head{display:flex;justify-content:space-between;align-items:flex-end;gap:1rem;margin-bottom:0.9rem;position:relative;z-index:1}
-.hero-graphic-title{font-size:0.68rem;text-transform:uppercase;letter-spacing:0.12em;color:#9a9a9a}
-.hero-graphic-sub{font-size:0.8rem;color:#666;max-width:420px}
-.hero-legend{display:flex;flex-wrap:wrap;gap:0.8rem 1rem;justify-content:flex-end;font-size:0.68rem;color:#777}
-.hero-legend span{display:inline-flex;align-items:center;gap:0.4rem}
-.hero-legend i{display:inline-block;width:10px;height:10px;border-radius:999px}
-.hero-graphic svg{display:block;width:100%;height:auto;position:relative;z-index:1}
-.hero-chip{font-size:0.62rem;letter-spacing:0.08em;text-transform:uppercase;fill:#a8a8a8}
-.hero-chip-val{font-size:0.82rem;font-weight:600;fill:#fff}
-
-@keyframes sweep{
-  to{transform:translateX(100%)}
-}
+.hero-graphic{margin-top:1.6rem;padding:1rem;background:linear-gradient(180deg,#07090d,#030405);border:1px solid #111;border-radius:18px}
+.hero-graphic-title{font-size:0.68rem;text-transform:uppercase;letter-spacing:0.12em;color:#9a9a9a;margin-bottom:0.35rem}
+.hero-graphic-sub{font-size:0.82rem;color:#666;margin-bottom:0.9rem}
+.hero-graphic img{display:block;width:100%;height:auto;border-radius:14px;border:1px solid #171b22;background:#05070b}
 
 section{padding:2rem 0;border-bottom:1px solid #111}
 section:last-of-type{border-bottom:none}
@@ -117,145 +106,9 @@ footer a:hover{color:#999}
   <div class="big">3,170 tok/s</div>
   <div class="sub">Qwen2.5-7B on H100, direct engine, N=32. 0.99x stock vLLM in the latest apples-to-apples run. HTTP throughput: 2,723 tok/s at 200 requests / concurrency 32.</div>
   <div class="hero-graphic">
-    <div class="hero-graphic-head">
-      <div>
-        <div class="hero-graphic-title">Inference Signal Path</div>
-        <div class="hero-graphic-sub">Colored by subsystem so the page stays dark and dense, but the data path reads instantly.</div>
-      </div>
-      <div class="hero-legend">
-        <span><i style="background:#6ba8ff"></i>Ingress</span>
-        <span><i style="background:#ff8a4c"></i>Scheduler</span>
-        <span><i style="background:#00d4aa"></i>KV / Attention</span>
-        <span><i style="background:#ff4d6d"></i>Fused Compute</span>
-        <span><i style="background:#d7ff64"></i>Sample / Output</span>
-      </div>
-    </div>
-    <svg viewBox="0 0 1080 500" aria-label="rvLLM data path">
-      <defs>
-        <linearGradient id="gridFade" x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0%" stop-color="#1a1a1a"/>
-          <stop offset="100%" stop-color="#070707"/>
-        </linearGradient>
-        <linearGradient id="flowIngress" x1="0" y1="0" x2="1" y2="0">
-          <stop offset="0%" stop-color="#295fff"/>
-          <stop offset="100%" stop-color="#6ba8ff"/>
-        </linearGradient>
-        <linearGradient id="flowSched" x1="0" y1="0" x2="1" y2="0">
-          <stop offset="0%" stop-color="#ff6b2c"/>
-          <stop offset="100%" stop-color="#ffb35c"/>
-        </linearGradient>
-        <linearGradient id="flowKv" x1="0" y1="0" x2="1" y2="0">
-          <stop offset="0%" stop-color="#00b79a"/>
-          <stop offset="100%" stop-color="#79ffd6"/>
-        </linearGradient>
-        <linearGradient id="flowFuse" x1="0" y1="0" x2="1" y2="0">
-          <stop offset="0%" stop-color="#ff3d63"/>
-          <stop offset="100%" stop-color="#ff7f97"/>
-        </linearGradient>
-        <linearGradient id="flowOut" x1="0" y1="0" x2="1" y2="0">
-          <stop offset="0%" stop-color="#9fd21f"/>
-          <stop offset="100%" stop-color="#e7ff7e"/>
-        </linearGradient>
-        <filter id="softGlow" x="-50%" y="-50%" width="200%" height="200%">
-          <feGaussianBlur stdDeviation="8" result="blur"/>
-          <feMerge>
-            <feMergeNode in="blur"/>
-            <feMergeNode in="SourceGraphic"/>
-          </feMerge>
-        </filter>
-      </defs>
-
-      <rect x="0" y="0" width="1080" height="500" fill="url(#gridFade)"/>
-      <g opacity="0.5">
-        <path d="M0 70H1080M0 160H1080M0 250H1080M0 340H1080M0 430H1080" stroke="#111" stroke-width="1"/>
-        <path d="M90 0V500M270 0V500M450 0V500M630 0V500M810 0V500M990 0V500" stroke="#111" stroke-width="1"/>
-      </g>
-
-      <g>
-        <rect x="28" y="40" width="160" height="90" rx="18" fill="#090909" stroke="#17305f"/>
-        <text x="52" y="72" class="hero-chip">API / HTTP</text>
-        <text x="52" y="104" class="hero-chip-val">Requests</text>
-        <text x="52" y="121" fill="#6ba8ff" font-size="13">OpenAI-compatible ingress</text>
-
-        <rect x="236" y="40" width="175" height="90" rx="18" fill="#090909" stroke="#5b2f17"/>
-        <text x="260" y="72" class="hero-chip">Scheduler</text>
-        <text x="260" y="104" class="hero-chip-val">Continuous Batch</text>
-        <text x="260" y="121" fill="#ff9e62" font-size="13">Step packing + queue merge</text>
-
-        <rect x="458" y="40" width="175" height="90" rx="18" fill="#090909" stroke="#0f5e4e"/>
-        <text x="482" y="72" class="hero-chip">Memory</text>
-        <text x="482" y="104" class="hero-chip-val">Paged KV Cache</text>
-        <text x="482" y="121" fill="#51eac6" font-size="13">Block allocation + reuse</text>
-
-        <rect x="680" y="40" width="175" height="90" rx="18" fill="#090909" stroke="#5b1730"/>
-        <text x="704" y="72" class="hero-chip">Compute</text>
-        <text x="704" y="104" class="hero-chip-val">Fused Kernels</text>
-        <text x="704" y="121" fill="#ff7f97" font-size="13">RMSNorm + GEMV + FA3 v3</text>
-
-        <rect x="902" y="40" width="150" height="90" rx="18" fill="#090909" stroke="#576c15"/>
-        <text x="926" y="72" class="hero-chip">Output</text>
-        <text x="926" y="104" class="hero-chip-val">Token Emit</text>
-        <text x="926" y="121" fill="#d7ff64" font-size="13">Sample + stream</text>
-      </g>
-
-      <g fill="none" stroke-linecap="round">
-        <path d="M188 85C215 85 215 85 236 85" stroke="url(#flowIngress)" stroke-width="12" filter="url(#softGlow)"/>
-        <path d="M411 85C432 85 436 85 458 85" stroke="url(#flowSched)" stroke-width="12" filter="url(#softGlow)"/>
-        <path d="M633 85C654 85 658 85 680 85" stroke="url(#flowKv)" stroke-width="12" filter="url(#softGlow)"/>
-        <path d="M855 85C877 85 882 85 902 85" stroke="url(#flowFuse)" stroke-width="12" filter="url(#softGlow)"/>
-
-        <path d="M315 155C365 230 505 240 549 184" stroke="url(#flowSched)" stroke-width="6" opacity="0.9"/>
-        <path d="M549 184C600 120 725 123 770 185" stroke="url(#flowKv)" stroke-width="6" opacity="0.9"/>
-        <path d="M770 185C815 247 925 242 967 181" stroke="url(#flowFuse)" stroke-width="6" opacity="0.9"/>
-      </g>
-
-      <g>
-        <rect x="64" y="178" width="952" height="260" rx="22" fill="#050505" stroke="#111"/>
-        <text x="94" y="214" class="hero-chip">Decode Step Timeline</text>
-
-        <rect x="94" y="244" width="124" height="42" rx="12" fill="#0b1320" stroke="#17305f"/>
-        <text x="115" y="270" fill="#7bb2ff" font-size="15">parse + enqueue</text>
-
-        <rect x="246" y="244" width="158" height="42" rx="12" fill="#1a1009" stroke="#5b2f17"/>
-        <text x="269" y="270" fill="#ffaf74" font-size="15">block plan + admission</text>
-
-        <rect x="432" y="244" width="148" height="42" rx="12" fill="#081514" stroke="#0f5e4e"/>
-        <text x="460" y="270" fill="#67f1d2" font-size="15">rope + kv write</text>
-
-        <rect x="608" y="244" width="182" height="42" rx="12" fill="#190810" stroke="#5b1730"/>
-        <text x="632" y="270" fill="#ff86a1" font-size="15">jit fused gemv / fa3</text>
-
-        <rect x="818" y="244" width="164" height="42" rx="12" fill="#15190a" stroke="#576c15"/>
-        <text x="848" y="270" fill="#e7ff7e" font-size="15">argmax + sample</text>
-
-        <path d="M94 324C190 284 260 381 356 345S522 280 618 335S786 402 982 332" fill="none" stroke="#111827" stroke-width="42" stroke-linecap="round"/>
-        <path d="M94 324C190 284 260 381 356 345S522 280 618 335S786 402 982 332" fill="none" stroke="url(#flowIngress)" stroke-width="7" stroke-linecap="round" opacity="0.8"/>
-        <path d="M94 332C190 292 260 389 356 353S522 288 618 343S786 410 982 340" fill="none" stroke="url(#flowSched)" stroke-width="6" stroke-linecap="round" opacity="0.8"/>
-        <path d="M94 340C190 300 260 397 356 361S522 296 618 351S786 418 982 348" fill="none" stroke="url(#flowKv)" stroke-width="5" stroke-linecap="round" opacity="0.9"/>
-        <path d="M94 348C190 308 260 405 356 369S522 304 618 359S786 426 982 356" fill="none" stroke="url(#flowFuse)" stroke-width="5" stroke-linecap="round" opacity="0.92"/>
-
-        <g transform="translate(100 378)">
-          <rect x="0" y="0" width="140" height="34" rx="12" fill="#0a0a0a" stroke="#191919"/>
-          <text x="18" y="14" class="hero-chip">batch width</text>
-          <text x="18" y="24" class="hero-chip-val">N = 1 ... 128</text>
-        </g>
-        <g transform="translate(276 378)">
-          <rect x="0" y="0" width="190" height="34" rx="12" fill="#0a0a0a" stroke="#191919"/>
-          <text x="18" y="14" class="hero-chip">kernel strategy</text>
-          <text x="18" y="24" class="hero-chip-val">JIT > CUDA > cuBLAS</text>
-        </g>
-        <g transform="translate(502 378)">
-          <rect x="0" y="0" width="180" height="34" rx="12" fill="#0a0a0a" stroke="#191919"/>
-          <text x="18" y="14" class="hero-chip">memory mode</text>
-          <text x="18" y="24" class="hero-chip-val">Safe-max card fill</text>
-        </g>
-        <g transform="translate(718 378)">
-          <rect x="0" y="0" width="268" height="34" rx="12" fill="#0a0a0a" stroke="#191919"/>
-          <text x="18" y="14" class="hero-chip">goal</text>
-          <text x="18" y="24" class="hero-chip-val">Fastest tok/s without fallback paths</text>
-        </g>
-      </g>
-    </svg>
+    <div class="hero-graphic-title">Verified H100 Comparison</div>
+    <div class="hero-graphic-sub">Three-way benchmark: stock vLLM vs rvllm-lite vs rvLLM, with both direct-engine and HTTP serving results.</div>
+    <img src="assets/h100-comparison.svg" alt="rvLLM H100 comparison chart">
   </div>
 </div>
 
