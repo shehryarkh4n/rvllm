@@ -1,8 +1,7 @@
 //! HTTP server setup, AppState, router construction, and graceful shutdown.
 //!
-//! When compiled with the `cuda` feature and a CUDA-capable GPU is detected,
-//! the server uses the GPU-accelerated AsyncGpuLLMEngine. Otherwise it falls
-//! back to the mock executor via AsyncLLMEngine.
+//! The server requires a CUDA-capable GPU and uses AsyncGpuLLMEngine for real
+//! inference. It fails fast instead of falling back to a mock executor.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -17,8 +16,6 @@ use tracing::info;
 
 use rvllm_config::EngineConfig;
 use rvllm_core::prelude::RequestId;
-use rvllm_engine::AsyncLLMEngine;
-use rvllm_engine::{ExecutorAdapter, ExecutorConfig};
 use rvllm_tokenizer::Tokenizer;
 
 use crate::routes;
@@ -42,19 +39,6 @@ pub trait InferenceEngine: Send + Sync {
 }
 
 #[async_trait::async_trait]
-impl InferenceEngine for AsyncLLMEngine {
-    async fn generate(
-        &self,
-        prompt: String,
-        params: rvllm_core::prelude::SamplingParams,
-    ) -> rvllm_core::prelude::Result<(
-        RequestId,
-        tokio_stream::wrappers::ReceiverStream<rvllm_core::prelude::RequestOutput>,
-    )> {
-        self.generate(prompt, params).await
-    }
-}
-
 #[cfg(feature = "cuda")]
 #[async_trait::async_trait]
 impl InferenceEngine for rvllm_engine::AsyncGpuLLMEngine {
@@ -187,13 +171,14 @@ pub async fn serve(config: EngineConfig) -> rvllm_core::prelude::Result<()> {
 
     let tokenizer = Tokenizer::from_pretrained(&tokenizer_path)?;
 
-    let engine: Arc<dyn InferenceEngine> = if cuda_gpu_available() {
-        info!("GPU detected, creating AsyncGpuLLMEngine for real inference");
-        create_gpu_engine(config).await?
-    } else {
-        info!("no GPU detected, creating mock engine");
-        Arc::new(create_engine(config, &tokenizer_path)?)
-    };
+    if !cuda_gpu_available() {
+        return Err(rvllm_core::prelude::LLMError::GpuError(
+            "no CUDA GPU detected; refusing to start mock/non-GPU server backend".into(),
+        ));
+    }
+
+    info!("GPU detected, creating AsyncGpuLLMEngine for real inference");
+    let engine: Arc<dyn InferenceEngine> = create_gpu_engine(config).await?;
 
     let state = Arc::new(AppState::new(engine, model_name, tokenizer));
     let app = build_router(state);
@@ -235,73 +220,6 @@ async fn create_gpu_engine(
     Err(rvllm_core::prelude::LLMError::GpuError(
         "CUDA not available".into(),
     ))
-}
-
-fn create_engine(
-    config: EngineConfig,
-    tokenizer_path: &str,
-) -> rvllm_core::prelude::Result<AsyncLLMEngine> {
-    let tokenizer = Tokenizer::from_pretrained(tokenizer_path)?;
-
-    let executor_config = ExecutorConfig {
-        num_gpus: config.parallel.tensor_parallel_size,
-        model_name: config.model.model_path.clone(),
-        block_size: config.cache.block_size,
-        gpu_memory_utilization: config.cache.gpu_memory_utilization,
-        tensor_parallel_size: config.parallel.tensor_parallel_size,
-        pipeline_parallel_size: config.parallel.pipeline_parallel_size,
-    };
-    let rt = tokio::runtime::Handle::current();
-    let executor = ExecutorAdapter::from_config(executor_config, rt).map_err(|e| {
-        rvllm_core::prelude::LLMError::ConfigError(format!("failed to create executor: {}", e))
-    })?;
-
-    let scheduler = Box::new(PlaceholderScheduler::new());
-
-    let engine = AsyncLLMEngine::new(config, Box::new(executor), scheduler, tokenizer)?;
-    Ok(engine)
-}
-
-struct PlaceholderScheduler {
-    groups: Vec<rvllm_sequence::SequenceGroup>,
-}
-
-impl PlaceholderScheduler {
-    fn new() -> Self {
-        Self { groups: Vec::new() }
-    }
-}
-
-impl rvllm_engine::Scheduler for PlaceholderScheduler {
-    fn add_seq_group(&mut self, seq_group: rvllm_sequence::SequenceGroup) {
-        self.groups.push(seq_group);
-    }
-
-    fn abort_seq_group(&mut self, request_id: &RequestId) {
-        self.groups.retain(|g| g.request_id != *request_id);
-    }
-
-    fn schedule(&mut self) -> rvllm_engine::SchedulerOutputs {
-        let groups = self.groups.clone();
-        self.groups.retain(|g| !g.is_finished());
-        let num_tokens = groups
-            .iter()
-            .flat_map(|g| g.get_seqs())
-            .map(|s| s.num_new_tokens().max(1))
-            .sum();
-        rvllm_engine::SchedulerOutputs {
-            scheduled_seq_groups: groups,
-            num_batched_tokens: num_tokens,
-            preempted: false,
-        }
-    }
-
-    fn has_unfinished_seqs(&self) -> bool {
-        !self.groups.is_empty()
-    }
-    fn get_num_unfinished_seq_groups(&self) -> usize {
-        self.groups.len()
-    }
 }
 
 async fn shutdown_signal() {

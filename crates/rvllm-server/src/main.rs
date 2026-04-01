@@ -91,7 +91,7 @@ fn init_tracing(log_level: &str) {
 fn detect_gpu_and_log() {
     let devices = rvllm_gpu::prelude::list_devices();
     if devices.is_empty() {
-        info!("no GPU devices detected, using mock backend");
+        info!("no GPU devices detected");
     } else {
         for dev in &devices {
             info!(
@@ -106,19 +106,18 @@ fn detect_gpu_and_log() {
 }
 
 /// Detect the appropriate device string based on compiled features and hardware.
-fn detect_device_string() -> &'static str {
+fn detect_device_string() -> anyhow::Result<&'static str> {
     #[cfg(feature = "cuda")]
     {
         let devices = rvllm_gpu::prelude::list_devices();
         if !devices.is_empty() {
-            return "cuda";
+            return Ok("cuda");
         }
-        info!("cuda feature enabled but no CUDA devices found, falling back to cpu");
-        "cpu"
+        anyhow::bail!("cuda feature enabled but no CUDA devices found; refusing to start non-GPU backend")
     }
     #[cfg(not(feature = "cuda"))]
     {
-        "cpu"
+        anyhow::bail!("rvllm was built without CUDA support; refusing to start non-GPU backend")
     }
 }
 
@@ -183,7 +182,7 @@ async fn main() -> anyhow::Result<()> {
                     )
                     .device(
                         DeviceConfig::builder()
-                            .device(detect_device_string())
+                            .device(detect_device_string()?)
                             .build(),
                     )
                     .telemetry(
@@ -277,7 +276,7 @@ async fn main() -> anyhow::Result<()> {
                     .parallel(ParallelConfigImpl::builder().build())
                     .device(
                         DeviceConfig::builder()
-                            .device(detect_device_string())
+                            .device(detect_device_string()?)
                             .build(),
                     )
                     .telemetry(TelemetryConfig::builder().enabled(false).build())
