@@ -1629,7 +1629,7 @@ mod cuda_impl {
             embedding: &CudaSlice<f16>,
             gpu_cache: &[(CudaSlice<f16>, CudaSlice<f16>)],
             packed_buf: CudaView<'_, i32>,
-            offsets: &PackedMetaOffsets,
+            offsets: PackedMetaOffsets,
             num_tokens: usize,
             _num_seqs: usize,
             max_context_len: u32,
@@ -1641,7 +1641,7 @@ mod cuda_impl {
 
             let cfg = &self.config;
             let hidden = cfg.hidden_size;
-            let num_heads = cfg.num_attention_heads;
+            let num_heads = cfg.num_heads;
             let num_kv_heads = cfg.num_kv_heads;
             let head_dim = cfg.head_dim;
             let intermediate = cfg.intermediate_size;
