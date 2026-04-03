@@ -41,8 +41,6 @@ pub use stop_checker::StopChecker;
 pub use async_gpu_engine::AsyncGpuLLMEngine;
 #[cfg(feature = "cuda")]
 pub use gpu_engine::GpuLLMEngine;
-#[cfg(feature = "cuda")]
-pub use gpu_engine::GpuTargetModel;
 
 // Re-export real executor types for downstream convenience
 pub use rvllm_executor::ExecutorConfig;

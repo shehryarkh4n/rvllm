@@ -1,13 +1,13 @@
 use std::path::Path;
 
 use rvllm_core::error::{LLMError, Result};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::dtype::DType;
 use crate::weights::{GpuAllocator, ModelWeights, WeightTensor};
 
 /// Magic bytes for GGUF format.
-const GGUF_MAGIC: u32 = 0x46475547; // "GGUF" in little-endian
+const GGUF_MAGIC: u32 = 0x46554747; // "GGUF" as read from little-endian bytes
 
 /// Loads model weights from GGUF files using memory-mapped I/O.
 pub struct GGUFLoader;
@@ -17,9 +17,12 @@ impl GGUFLoader {
     pub fn load(path: &Path, gpu: &dyn GpuAllocator) -> Result<ModelWeights> {
         info!("loading GGUF from {}", path.display());
 
-        let data = std::fs::read(path)?;
+        let data = std::fs::read(path).map_err(|e| {
+            LLMError::ModelError(format!("failed to read {}: {}", path.display(), e))
+        })?;
+        let data: &[u8] = &data;
 
-        let header = parse_gguf_header(&data)?;
+        let header = parse_gguf_header(data)?;
 
         info!(
             "GGUF v{}: {} tensors, {} metadata entries",
@@ -32,7 +35,7 @@ impl GGUFLoader {
         // Parse tensor info entries
         let mut tensor_infos = Vec::with_capacity(header.tensor_count as usize);
         for _ in 0..header.tensor_count {
-            let (info, new_offset) = parse_tensor_info(&data, offset)?;
+            let (info, new_offset) = parse_tensor_info(data, offset)?;
             tensor_infos.push(info);
             offset = new_offset;
         }
@@ -43,13 +46,12 @@ impl GGUFLoader {
         let data_offset = align_up(offset, alignment);
 
         for info in &tensor_infos {
-            let dtype = DType::from_gguf_type(info.dtype_code).unwrap_or_else(|| {
-                warn!(
-                    "unknown GGUF type {} for tensor {}, defaulting to U8",
+            let dtype = DType::from_gguf_type(info.dtype_code).ok_or_else(|| {
+                LLMError::ModelError(format!(
+                    "unsupported GGUF tensor type {} for tensor {}",
                     info.dtype_code, info.name
-                );
-                DType::U8
-            });
+                ))
+            })?;
 
             let tensor_start = data_offset + info.offset as usize;
             let tensor_end = tensor_start + info.size_bytes;
@@ -99,6 +101,26 @@ struct GGUFHeader {
     metadata_kv_count: u64,
     tensor_info_offset: usize,
     alignment: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct GGUFModelInfo {
+    pub architecture: String,
+    pub name: Option<String>,
+    pub file_type: Option<u32>,
+    pub block_count: Option<usize>,
+    pub context_length: Option<usize>,
+    pub embedding_length: Option<usize>,
+    pub feed_forward_length: Option<usize>,
+    pub attention_head_count: Option<usize>,
+    pub attention_head_count_kv: Option<usize>,
+    pub attention_key_length: Option<usize>,
+    pub attention_value_length: Option<usize>,
+    pub rope_freq_base: Option<f32>,
+    pub rms_norm_eps: Option<f32>,
+    pub vocab_size: Option<usize>,
+    pub expert_count: Option<usize>,
+    pub expert_used_count: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -156,9 +178,9 @@ const GGUF_TYPE_INT8: u32 = 1;
 const GGUF_TYPE_UINT16: u32 = 2;
 const GGUF_TYPE_INT16: u32 = 3;
 const GGUF_TYPE_INT32: u32 = 5;
-const GGUF_TYPE_INT64: u32 = 9;
-const GGUF_TYPE_FLOAT64: u32 = 11;
-const GGUF_TYPE_ARRAY: u32 = 12;
+const GGUF_TYPE_ARRAY: u32 = 9;
+const GGUF_TYPE_INT64: u32 = 11;
+const GGUF_TYPE_FLOAT64: u32 = 12;
 
 /// Skip over a metadata value, returning the new offset.
 fn skip_metadata_value(data: &[u8], offset: usize, vtype: u32) -> Result<usize> {
@@ -194,6 +216,85 @@ fn read_metadata_u64_value(data: &[u8], offset: usize, vtype: u32) -> Option<u64
         GGUF_TYPE_UINT64 => read_u64(data, offset).ok(),
         _ => None,
     }
+}
+
+fn read_metadata_f32_value(data: &[u8], offset: usize, vtype: u32) -> Option<f32> {
+    match vtype {
+        GGUF_TYPE_FLOAT32 => {
+            if offset + 4 <= data.len() {
+                Some(f32::from_le_bytes(data[offset..offset + 4].try_into().ok()?))
+            } else {
+                None
+            }
+        }
+        GGUF_TYPE_FLOAT64 => {
+            if offset + 8 <= data.len() {
+                Some(f64::from_le_bytes(data[offset..offset + 8].try_into().ok()?) as f32)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+pub fn inspect_gguf_model_info(path: &Path) -> Result<GGUFModelInfo> {
+    let data = std::fs::read(path).map_err(|e| {
+        LLMError::ModelError(format!("failed to read {}: {}", path.display(), e))
+    })?;
+    let data: &[u8] = &data;
+    let header = parse_gguf_header(data)?;
+    let mut offset = 24usize;
+    let mut architecture = None;
+    let mut name = None;
+    let mut file_type = None;
+    let mut numeric: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    let mut floats: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
+    let mut arrays: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+
+    for _ in 0..header.metadata_kv_count {
+        let (key, new_offset) = read_string(data, offset)?;
+        let vtype = read_u32(data, new_offset)?;
+        let value_offset = new_offset + 4;
+
+        if key == "general.architecture" && vtype == GGUF_TYPE_STRING {
+            architecture = Some(read_string(data, value_offset)?.0);
+        } else if key == "general.name" && vtype == GGUF_TYPE_STRING {
+            name = Some(read_string(data, value_offset)?.0);
+        } else if key == "general.file_type" {
+            file_type = read_metadata_u64_value(data, value_offset, vtype).map(|v| v as u32);
+        } else if vtype == GGUF_TYPE_ARRAY {
+            let count = read_u64(data, value_offset + 4)? as usize;
+            arrays.insert(key.clone(), count);
+        } else if let Some(v) = read_metadata_u64_value(data, value_offset, vtype) {
+            numeric.insert(key.clone(), v);
+        } else if let Some(v) = read_metadata_f32_value(data, value_offset, vtype) {
+            floats.insert(key.clone(), v);
+        }
+
+        offset = skip_metadata_value(data, value_offset, vtype)?;
+    }
+
+    let arch = architecture.ok_or_else(|| LLMError::ModelError("GGUF missing general.architecture".into()))?;
+    let p = |suffix: &str| format!("{arch}.{suffix}");
+    Ok(GGUFModelInfo {
+        architecture: arch.clone(),
+        name,
+        file_type,
+        block_count: numeric.get(&p("block_count")).copied().map(|v| v as usize),
+        context_length: numeric.get(&p("context_length")).copied().map(|v| v as usize),
+        embedding_length: numeric.get(&p("embedding_length")).copied().map(|v| v as usize),
+        feed_forward_length: numeric.get(&p("feed_forward_length")).copied().map(|v| v as usize),
+        attention_head_count: numeric.get(&p("attention.head_count")).copied().map(|v| v as usize),
+        attention_head_count_kv: numeric.get(&p("attention.head_count_kv")).copied().map(|v| v as usize),
+        attention_key_length: numeric.get(&p("attention.key_length")).copied().map(|v| v as usize),
+        attention_value_length: numeric.get(&p("attention.value_length")).copied().map(|v| v as usize),
+        rope_freq_base: floats.get(&p("rope.freq_base")).copied(),
+        rms_norm_eps: floats.get(&p("attention.layer_norm_rms_epsilon")).copied().or_else(|| floats.get(&p("attention.layer_norm_epsilon")).copied()),
+        vocab_size: numeric.get(&p("vocab_size")).copied().map(|v| v as usize).or_else(|| arrays.get("tokenizer.ggml.tokens").copied()),
+        expert_count: numeric.get(&p("expert_count")).copied().map(|v| v as usize),
+        expert_used_count: numeric.get(&p("expert_used_count")).copied().map(|v| v as usize),
+    })
 }
 
 fn parse_gguf_header(data: &[u8]) -> Result<GGUFHeader> {
@@ -271,8 +372,15 @@ fn parse_tensor_info(data: &[u8], offset: usize) -> Result<(TensorInfo, usize)> 
     } else {
         shape.iter().product()
     };
-    let dtype = DType::from_gguf_type(dtype_code).unwrap_or(DType::U8);
-    let size_bytes = numel * dtype.size_of();
+    let dtype = DType::from_gguf_type(dtype_code).ok_or_else(|| {
+        LLMError::ModelError(format!("unsupported GGUF tensor type {} for tensor {}", dtype_code, name))
+    })?;
+    let size_bytes = dtype.gguf_tensor_bytes(numel).ok_or_else(|| {
+        LLMError::ModelError(format!(
+            "tensor {} with dtype {} has incompatible element count {} for GGUF block sizing",
+            name, dtype, numel
+        ))
+    })?;
 
     Ok((
         TensorInfo {

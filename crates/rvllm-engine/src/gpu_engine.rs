@@ -18,6 +18,8 @@ mod inner {
 
     use rvllm_block_manager::{BlockManager, MemoryPool};
     use rvllm_config::{resolve_runtime_max_model_len, EngineConfig};
+    use rvllm_model_loader::{detect_format, ModelFormat};
+    use rvllm_model_loader::gguf::inspect_gguf_model_info;
     use rvllm_core::prelude::{
         BlockId, FinishReason, LLMError, LogProb, RequestId, RequestOutput, Result, SamplingParams,
         SequenceId, TokenId,
@@ -66,6 +68,47 @@ mod inner {
     }
 
     fn read_model_config(model_dir: &Path) -> Result<HfModelConfig> {
+        if matches!(detect_format(model_dir)?, ModelFormat::GGUF) {
+            let gguf_path = if model_dir.is_dir() {
+                std::fs::read_dir(model_dir)?
+                    .filter_map(|e| e.ok())
+                    .find(|e| e.path().extension().map(|ext| ext == "gguf").unwrap_or(false))
+                    .map(|e| e.path())
+                    .ok_or_else(|| LLMError::ModelError("no .gguf file found in directory".into()))?
+            } else {
+                model_dir.to_path_buf()
+            };
+            let info = inspect_gguf_model_info(&gguf_path)?;
+            let hidden_size = info.embedding_length
+                .ok_or_else(|| LLMError::ModelError("GGUF missing embedding_length".into()))?;
+            let num_attention_heads = info.attention_head_count
+                .ok_or_else(|| LLMError::ModelError("GGUF missing attention.head_count".into()))?;
+            let num_key_value_heads = info.attention_head_count_kv.unwrap_or(num_attention_heads);
+            let head_dim = info.attention_key_length
+                .or(info.attention_value_length)
+                .unwrap_or_else(|| hidden_size / num_attention_heads.max(1));
+            return Ok(HfModelConfig {
+                hidden_size,
+                intermediate_size: info.feed_forward_length.unwrap_or(hidden_size * 4),
+                num_attention_heads,
+                num_key_value_heads,
+                num_hidden_layers: info.block_count
+                    .ok_or_else(|| LLMError::ModelError("GGUF missing block_count".into()))?,
+                vocab_size: info.vocab_size
+                    .ok_or_else(|| LLMError::ModelError("GGUF missing vocab_size".into()))?,
+                declared_max_model_len: None,
+                rms_norm_eps: info.rms_norm_eps.unwrap_or(1e-5),
+                tie_word_embeddings: false,
+                architecture: info.architecture,
+                rope_theta: info.rope_freq_base.unwrap_or(10000.0),
+                partial_rotary_factor: 1.0,
+                head_dim,
+                attn_logit_softcapping: 0.0,
+                num_local_experts: info.expert_count.unwrap_or(0),
+                num_experts_per_tok: info.expert_used_count.unwrap_or(0),
+            });
+        }
+
         let config_path = model_dir.join("config.json");
         let content = std::fs::read_to_string(&config_path).map_err(|e| {
             LLMError::ModelError(format!("failed to read {}: {e}", config_path.display()))

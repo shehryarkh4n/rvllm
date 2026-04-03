@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 
-use crate::ir::FusedKernel;
 #[cfg(feature = "llvm")]
 use crate::llvm_backend::LlvmPtxCompiler;
 

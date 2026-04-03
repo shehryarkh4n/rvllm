@@ -7,6 +7,7 @@ pub mod gemma;
 pub mod gpt_neox;
 pub mod llama;
 pub mod mistral;
+pub mod nemotron_h_moe;
 pub mod mixtral;
 pub mod phi;
 pub mod qwen2;
@@ -49,6 +50,9 @@ pub fn create_model(
             deepseek::DeepSeekV2ForCausalLM::new(weights, config)?,
         )),
         "MixtralForCausalLM" => Ok(Box::new(mixtral::MixtralForCausalLM::new(weights, config)?)),
+        "nemotron_h_moe" | "NemotronHMoEForCausalLM" | "NemotronHMoE" => {
+            Ok(Box::new(nemotron_h_moe::NemotronHMoEForCausalLM::new(weights, config)?))
+        }
         "PhiForCausalLM" | "Phi3ForCausalLM" | "Phi3SmallForCausalLM" => {
             Ok(Box::new(phi::PhiForCausalLM::new(weights, config)?))
         }

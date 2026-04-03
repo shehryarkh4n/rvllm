@@ -482,7 +482,7 @@ pub fn verify_all(
         ("add_norm_gateup_gemv", hidden_size, gate_up_dim, 0, eps),
     ];
 
-    for (name, hidden, out_dim, intermediate, epsilon) in patterns {
+    for (name, _hidden, out_dim, _intermediate, _epsilon) in patterns {
         // Placeholder result -- actual verification runs on GPU
         results.insert(
             name.to_string(),

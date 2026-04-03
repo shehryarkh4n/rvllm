@@ -335,6 +335,8 @@ pub struct GpuWorker {
     /// Raw f16 weight map preserved for deferred GpuModelRunner construction.
     #[cfg(feature = "cuda")]
     raw_weight_map: Option<HashMap<String, CudaSlice<half::f16>>>,
+    #[cfg(feature = "cuda")]
+    raw_weight_shapes: Option<HashMap<String, Vec<usize>>>,
     /// GPU-resident model runner (full forward pass on GPU, no CPU attention fallback).
     /// Constructed in init_cache() once cache geometry is known.
     #[cfg(feature = "cuda")]
@@ -466,6 +468,8 @@ impl GpuWorker {
             #[cfg(feature = "cuda")]
             raw_weight_map: None,
             #[cfg(feature = "cuda")]
+            raw_weight_shapes: None,
+            #[cfg(feature = "cuda")]
             gpu_model_runner: None,
             graph_runner,
             #[cfg(feature = "cuda")]
@@ -490,8 +494,8 @@ impl GpuWorker {
     pub fn load_weights(&mut self, model_path: &Path) -> Result<()> {
         info!(device_id = self.device_id, path = %model_path.display(), "loading weights to GPU");
 
-        let all_weights_f16 =
-            rvllm_model_loader::gpu_loader::load_weights_to_gpu(model_path, &self.stream)
+        let (all_weights_f16, all_weight_shapes) =
+            rvllm_model_loader::gpu_loader::load_weights_to_gpu_with_shapes(model_path, &self.stream)
                 .map_err(|e| LLMError::GpuError(format!("weight loading failed: {e}")))?;
 
         info!("loaded {} weight tensors to GPU (f16)", all_weights_f16.len());
@@ -499,6 +503,7 @@ impl GpuWorker {
         #[cfg(feature = "cuda")]
         {
             self.raw_weight_map = Some(all_weights_f16.clone());
+            self.raw_weight_shapes = Some(all_weight_shapes.clone());
         }
 
         // Weights are stored only in raw_weight_map for GpuModelRunner.
@@ -561,10 +566,14 @@ impl GpuWorker {
         {
             use rvllm_model_loader::gpu_weights::GpuModelWeights as LoaderWeights;
 
-            let raw_map = self.raw_weight_map.take().ok_or_else(|| {
+            let mut raw_map = self.raw_weight_map.take().ok_or_else(|| {
                 LLMError::GpuError("raw weight map not available -- call load_weights first".into())
             })?;
-            let loader_weights = LoaderWeights::new(raw_map, HashMap::new());
+            if self.config.architecture == "Qwen3_5ForConditionalGeneration" {
+                self.install_qwen35_compat_weights_f16(&mut raw_map)?;
+            }
+            let raw_shapes = self.raw_weight_shapes.take().unwrap_or_default();
+            let loader_weights = LoaderWeights::new(raw_map, raw_shapes);
 
             let block_size = self.config.block_size;
             let cache = rvllm_kv_cache::engine_cuda::CudaCacheEngine::new(
@@ -630,7 +639,10 @@ impl GpuWorker {
             )?;
 
             if let Err(e) = runner.fuse_weights() {
-                warn!("weight fusion failed: {e} -- f16 unfused path");
+                warn!("weight fusion failed: {e} -- trying unfused fp16 runtime");
+                if let Err(e2) = runner.prepare_fp16_runtime() {
+                    warn!("fp16 runtime preparation failed: {e2} -- keeping unfused default path");
+                }
             }
 
             // Pre-allocate cuBLAS workspace for CUDA graph capture.
@@ -920,6 +932,72 @@ impl GpuWorker {
         std::env::var("HOME")
             .map(|h| std::path::PathBuf::from(h).join(".cache").join("rvllm"))
             .unwrap_or_else(|_| std::path::PathBuf::from("/tmp/rvllm"))
+    }
+
+    #[cfg(feature = "cuda")]
+    fn alias_weight<T: Clone>(weights: &mut HashMap<String, T>, dst: &str, src: &str) {
+        if !weights.contains_key(dst) {
+            if let Some(v) = weights.get(src).cloned() {
+                weights.insert(dst.to_string(), v);
+            }
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    fn copy_range_f16(
+        &self,
+        src: &CudaSlice<half::f16>,
+        offset: usize,
+        len: usize,
+    ) -> Result<CudaSlice<half::f16>> {
+        let host = self.stream
+            .clone_dtoh(src)
+            .map_err(|e| LLMError::GpuError(format!("compat dtoh f16: {e}")))?;
+        let slice = host[offset..offset + len].to_vec();
+        self.stream
+            .clone_htod(&slice)
+            .map_err(|e| LLMError::GpuError(format!("compat htod f16: {e}")))
+    }
+
+    #[cfg(feature = "cuda")]
+    fn install_qwen35_compat_weights_f16(
+        &self,
+        weights: &mut HashMap<String, CudaSlice<half::f16>>,
+    ) -> Result<()> {
+        let hidden = self.config.hidden_size;
+        let q_dim = self.config.num_attention_heads * self.config.head_dim;
+        let kv_dim = self.config.num_kv_heads * self.config.head_dim;
+        Self::alias_weight(weights, "model.embed_tokens.weight", "model.language_model.embed_tokens.weight");
+        Self::alias_weight(weights, "model.norm.weight", "model.language_model.norm.weight");
+        for i in 0..self.config.num_layers {
+            let old = format!("model.layers.{i}");
+            let base = format!("model.language_model.layers.{i}");
+            Self::alias_weight(weights, &format!("{old}.input_layernorm.weight"), &format!("{base}.input_layernorm.weight"));
+            Self::alias_weight(weights, &format!("{old}.post_attention_layernorm.weight"), &format!("{base}.post_attention_layernorm.weight"));
+            Self::alias_weight(weights, &format!("{old}.mlp.gate_proj.weight"), &format!("{base}.mlp.gate_proj.weight"));
+            Self::alias_weight(weights, &format!("{old}.mlp.up_proj.weight"), &format!("{base}.mlp.up_proj.weight"));
+            Self::alias_weight(weights, &format!("{old}.mlp.down_proj.weight"), &format!("{base}.mlp.down_proj.weight"));
+            let full_q = format!("{base}.self_attn.q_proj.weight");
+            let full_k = format!("{base}.self_attn.k_proj.weight");
+            let full_v = format!("{base}.self_attn.v_proj.weight");
+            let full_o = format!("{base}.self_attn.o_proj.weight");
+            let lin_qkv = format!("{base}.linear_attn.in_proj_qkv.weight");
+            let lin_o = format!("{base}.linear_attn.out_proj.weight");
+            if let Some(src_q) = weights.get(&full_q).cloned() {
+                weights.insert(format!("{old}.self_attn.q_proj.weight"), self.copy_range_f16(&src_q, 0, q_dim * hidden)?);
+                Self::alias_weight(weights, &format!("{old}.self_attn.k_proj.weight"), &full_k);
+                Self::alias_weight(weights, &format!("{old}.self_attn.v_proj.weight"), &full_v);
+                Self::alias_weight(weights, &format!("{old}.self_attn.o_proj.weight"), &full_o);
+            } else if let Some(src_qkv) = weights.get(&lin_qkv).cloned() {
+                weights.insert(format!("{old}.self_attn.q_proj.weight"), self.copy_range_f16(&src_qkv, 0, q_dim * hidden)?);
+                weights.insert(format!("{old}.self_attn.k_proj.weight"), self.copy_range_f16(&src_qkv, q_dim * hidden, kv_dim * hidden)?);
+                weights.insert(format!("{old}.self_attn.v_proj.weight"), self.copy_range_f16(&src_qkv, (q_dim + kv_dim) * hidden, kv_dim * hidden)?);
+                Self::alias_weight(weights, &format!("{old}.self_attn.o_proj.weight"), &lin_o);
+            } else {
+                return Err(LLMError::ModelError(format!("Qwen3.5 compat f16: missing attention weights for layer {i}")));
+            }
+        }
+        Ok(())
     }
 
     /// Search for compiled PTX directory from build output.

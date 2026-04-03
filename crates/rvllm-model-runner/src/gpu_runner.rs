@@ -204,19 +204,24 @@ mod cuda_impl {
                 "GpuModelRunner::new"
             );
 
-            let embed_tokens = weights
-                .get("model.embed_tokens.weight")
+            let get_weight = |name: &str| {
+                weights.get(name).or_else(|| {
+                    name.strip_prefix("model.")
+                        .and_then(|rest| weights.get(&format!("model.language_model.{rest}")))
+                })
+            };
+
+            let embed_tokens = get_weight("model.embed_tokens.weight")
                 .ok_or_else(|| LLMError::GpuError("missing model.embed_tokens.weight".into()))?
                 .clone();
 
-            let final_norm_weight = weights
-                .get("model.norm.weight")
+            let final_norm_weight = get_weight("model.norm.weight")
                 .ok_or_else(|| LLMError::GpuError("missing model.norm.weight".into()))?
                 .clone();
 
             let lm_head_weight = weights
                 .get("lm_head.weight")
-                .or_else(|| weights.get("model.embed_tokens.weight"))
+                .or_else(|| get_weight("model.embed_tokens.weight"))
                 .ok_or_else(|| {
                     LLMError::GpuError(
                         "missing lm_head.weight and model.embed_tokens.weight".into(),
@@ -595,6 +600,15 @@ mod cuda_impl {
 
             info!(current_tokens, required_tokens, "growing f16 layer scratch for batched forward");
             self.alloc_scratch(required_tokens)
+        }
+
+        /// Prepare the minimal unfused fp16 runtime state.
+        pub fn prepare_fp16_runtime(&mut self) -> Result<()> {
+            if self.f16_scratch.borrow().is_none() {
+                info!(num_layers = self.layers.len(), "prepared zero-copy unfused fp16 runtime state");
+                self.alloc_scratch()?;
+            }
+            Ok(())
         }
 
         pub fn forward(

@@ -34,6 +34,7 @@ rvllm-worker = { workspace = true, optional = true }
 rvllm-block-manager = { workspace = true, optional = true }
 rvllm-scheduler = { workspace = true, optional = true }
 rvllm-speculative = { workspace = true, optional = true }
+rvllm-model-loader.workspace = true
 
 [features]
 default = []

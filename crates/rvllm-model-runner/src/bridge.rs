@@ -234,6 +234,44 @@ pub struct ModelWeights {
 
 impl ModelWeights {
     pub fn get(&self, name: &str) -> Result<&WeightTensor> {
+        if let Some(t) = self.tensors.get(name) {
+            return Ok(t);
+        }
+
+        if let Some(rest) = name.strip_prefix("model.") {
+            let alt = format!("model.language_model.{rest}");
+            if let Some(t) = self.tensors.get(&alt) {
+                return Ok(t);
+            }
+        }
+
+        if let Some(rest) = name.strip_prefix("lm_head.") {
+            let alt = format!("model.language_model.lm_head.{rest}");
+            if let Some(t) = self.tensors.get(&alt) {
+                return Ok(t);
+            }
+        }
+
+        // GGUF-style top-level aliases.
+        match name {
+            "model.embed_tokens.weight" => {
+                if let Some(t) = self.tensors.get("token_embd.weight") {
+                    return Ok(t);
+                }
+            }
+            "model.norm.weight" => {
+                if let Some(t) = self.tensors.get("output_norm.weight") {
+                    return Ok(t);
+                }
+            }
+            "lm_head.weight" => {
+                if let Some(t) = self.tensors.get("output.weight") {
+                    return Ok(t);
+                }
+            }
+            _ => {}
+        }
+
         self.tensors
             .get(name)
             .ok_or_else(|| LLMError::ModelError(format!("weight not found: {}", name)))

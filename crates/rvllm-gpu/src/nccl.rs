@@ -50,7 +50,7 @@ pub struct NcclUniqueId {
 impl NcclUniqueId {
     /// Generate a new unique ID for bootstrapping a communicator group.
     pub fn new() -> Self {
-        #[cfg(feature = "cuda")]
+        #[cfg(all(feature = "cuda", not(target_os = "windows")))]
         {
             // Real NCCL: call ncclGetUniqueId
             let mut id_bytes = vec![0u8; 128];
@@ -68,7 +68,7 @@ impl NcclUniqueId {
             }
             Self { bytes: id_bytes }
         }
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(any(not(feature = "cuda"), target_os = "windows"))]
         {
             Self {
                 bytes: vec![0xCC; 128],
@@ -90,7 +90,7 @@ impl Default for NcclUniqueId {
 pub struct NcclComm {
     rank: usize,
     world_size: usize,
-    #[cfg(feature = "cuda")]
+    #[cfg(all(feature = "cuda", not(target_os = "windows")))]
     handle: *mut std::ffi::c_void,
 }
 
@@ -111,7 +111,7 @@ impl NcclComm {
             )));
         }
 
-        #[cfg(feature = "cuda")]
+        #[cfg(all(feature = "cuda", not(target_os = "windows")))]
         {
             let mut handle: *mut std::ffi::c_void = std::ptr::null_mut();
             let ret = unsafe {
@@ -136,7 +136,7 @@ impl NcclComm {
             })
         }
 
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(any(not(feature = "cuda"), target_os = "windows"))]
         {
             let _ = unique_id;
             tracing::info!(rank, world_size, "NCCL communicator initialized (mock)");
@@ -177,7 +177,7 @@ impl NcclComm {
             )));
         }
 
-        #[cfg(feature = "cuda")]
+        #[cfg(all(feature = "cuda", not(target_os = "windows")))]
         {
             let nccl_dtype = to_nccl_dtype(dtype);
             let nccl_op = to_nccl_op(op);
@@ -200,7 +200,7 @@ impl NcclComm {
             }
         }
 
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(any(not(feature = "cuda"), target_os = "windows"))]
         {
             let _ = (count, dtype, op);
             // Mock: single rank, just copy send to recv
@@ -228,7 +228,7 @@ impl NcclComm {
             )));
         }
 
-        #[cfg(feature = "cuda")]
+        #[cfg(all(feature = "cuda", not(target_os = "windows")))]
         {
             let nccl_dtype = to_nccl_dtype(dtype);
             let nccl_op = to_nccl_op(op);
@@ -252,7 +252,7 @@ impl NcclComm {
             }
         }
 
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(any(not(feature = "cuda"), target_os = "windows"))]
         {
             let _ = (count, dtype, op);
             // Mock: single rank, buffer is already the result
@@ -288,7 +288,7 @@ impl NcclComm {
             )));
         }
 
-        #[cfg(feature = "cuda")]
+        #[cfg(all(feature = "cuda", not(target_os = "windows")))]
         {
             let nccl_dtype = to_nccl_dtype(dtype);
             let ret = unsafe {
@@ -309,7 +309,7 @@ impl NcclComm {
             }
         }
 
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(any(not(feature = "cuda"), target_os = "windows"))]
         {
             let _ = (sendcount, dtype);
             // Mock: single rank, just copy
@@ -348,7 +348,7 @@ impl NcclComm {
             )));
         }
 
-        #[cfg(feature = "cuda")]
+        #[cfg(all(feature = "cuda", not(target_os = "windows")))]
         {
             let nccl_dtype = to_nccl_dtype(dtype);
             let nccl_op = to_nccl_op(op);
@@ -371,7 +371,7 @@ impl NcclComm {
             }
         }
 
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(any(not(feature = "cuda"), target_os = "windows"))]
         {
             let _ = (recvcount, dtype, op);
             // Mock: single rank, copy the rank-0 chunk
@@ -400,7 +400,7 @@ impl NcclComm {
             )));
         }
 
-        #[cfg(feature = "cuda")]
+        #[cfg(all(feature = "cuda", not(target_os = "windows")))]
         {
             let nccl_dtype = to_nccl_dtype(dtype);
             let ptr = buf.as_mut_ptr() as *mut std::ffi::c_void;
@@ -423,7 +423,7 @@ impl NcclComm {
             }
         }
 
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(any(not(feature = "cuda"), target_os = "windows"))]
         {
             let _ = (count, dtype, root);
             // Mock: single rank, buffer already has the data
@@ -436,7 +436,7 @@ impl NcclComm {
 
 impl Drop for NcclComm {
     fn drop(&mut self) {
-        #[cfg(feature = "cuda")]
+        #[cfg(all(feature = "cuda", not(target_os = "windows")))]
         {
             if !self.handle.is_null() {
                 unsafe {
@@ -488,7 +488,7 @@ impl NcclGroup {
 // CUDA FFI declarations (only compiled with `cuda` feature)
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(target_os = "windows")))]
 mod ffi {
     extern "C" {
         pub fn ncclGetUniqueId(id: *mut u8) -> i32;
@@ -544,7 +544,7 @@ mod ffi {
 }
 
 /// Convert our dtype enum to NCCL's integer type codes.
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(target_os = "windows")))]
 fn to_nccl_dtype(dtype: NcclDataType) -> i32 {
     match dtype {
         NcclDataType::Float32 => 7,  // ncclFloat32
@@ -554,7 +554,7 @@ fn to_nccl_dtype(dtype: NcclDataType) -> i32 {
 }
 
 /// Convert our reduce-op enum to NCCL's integer op codes.
-#[cfg(feature = "cuda")]
+#[cfg(all(feature = "cuda", not(target_os = "windows")))]
 fn to_nccl_op(op: NcclReduceOp) -> i32 {
     match op {
         NcclReduceOp::Sum => 0,  // ncclSum

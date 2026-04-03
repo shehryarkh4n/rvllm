@@ -10,12 +10,21 @@ pub enum DType {
     U8,
     Q4_0,
     #[allow(non_camel_case_types)]
+    Q8_0,
+    #[allow(non_camel_case_types)]
     Q4_K_M,
+    #[allow(non_camel_case_types)]
+    Q5_K,
+    #[allow(non_camel_case_types)]
+    IQ4_NL,
+    #[allow(non_camel_case_types)]
+    IQ4_XS,
 }
 
 impl DType {
     /// Size in bytes of a single element for this dtype.
-    /// Quantized types report the average bytes per element.
+    /// Quantized types report 1 byte here; use `gguf_tensor_bytes()` for exact
+    /// GGUF tensor sizing.
     pub fn size_of(&self) -> usize {
         match self {
             DType::F32 => 4,
@@ -23,11 +32,31 @@ impl DType {
             DType::BF16 => 2,
             DType::I32 => 4,
             DType::U8 => 1,
-            // Q4_0: 32 values packed in 18 bytes (16 nibbles + 2 byte scale) = 0.5625 bytes/elem
-            // We report the block size; callers use total_bytes() on WeightTensor for exact sizing.
-            DType::Q4_0 => 1,
-            // Q4_K_M: similar quantization granularity
-            DType::Q4_K_M => 1,
+            DType::Q4_0 | DType::Q8_0 | DType::Q4_K_M | DType::Q5_K | DType::IQ4_NL | DType::IQ4_XS => 1,
+        }
+    }
+
+    /// Exact number of bytes occupied by a GGUF tensor with `numel` elements.
+    pub fn gguf_tensor_bytes(&self, numel: usize) -> Option<usize> {
+        fn exact_blocks(numel: usize, block: usize, bytes: usize) -> Option<usize> {
+            if numel % block == 0 {
+                Some((numel / block) * bytes)
+            } else {
+                None
+            }
+        }
+
+        match self {
+            DType::F32 => Some(numel * 4),
+            DType::F16 | DType::BF16 => Some(numel * 2),
+            DType::I32 => Some(numel * 4),
+            DType::U8 => Some(numel),
+            DType::Q4_0 => exact_blocks(numel, 32, 18),
+            DType::Q8_0 => exact_blocks(numel, 32, 34),
+            DType::Q4_K_M => exact_blocks(numel, 256, 144),
+            DType::Q5_K => exact_blocks(numel, 256, 176),
+            DType::IQ4_NL => exact_blocks(numel, 32, 18),
+            DType::IQ4_XS => exact_blocks(numel, 256, 136),
         }
     }
 
@@ -49,10 +78,12 @@ impl DType {
             0 => Some(DType::F32),
             1 => Some(DType::F16),
             2 => Some(DType::Q4_0),
-            // GGUF type 14 = Q4_K_M (approximate; real mapping depends on ggml version)
-            14 => Some(DType::Q4_K_M),
-            7 => Some(DType::I32),
-            8 => Some(DType::U8),
+            8 => Some(DType::Q8_0),
+            13 => Some(DType::Q5_K),
+            20 => Some(DType::IQ4_NL),
+            23 => Some(DType::IQ4_XS),
+            26 => Some(DType::I32),
+            30 => Some(DType::BF16),
             _ => None,
         }
     }
@@ -67,7 +98,11 @@ impl fmt::Display for DType {
             DType::I32 => write!(f, "I32"),
             DType::U8 => write!(f, "U8"),
             DType::Q4_0 => write!(f, "Q4_0"),
+            DType::Q8_0 => write!(f, "Q8_0"),
             DType::Q4_K_M => write!(f, "Q4_K_M"),
+            DType::Q5_K => write!(f, "Q5_K"),
+            DType::IQ4_NL => write!(f, "IQ4_NL"),
+            DType::IQ4_XS => write!(f, "IQ4_XS"),
         }
     }
 }
