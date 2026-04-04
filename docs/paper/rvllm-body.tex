@@ -7,7 +7,7 @@
   \vspace{0.3em}
   {\normalsize\texttt{https://github.com/m0at/rvllm}\par}
   \vspace{0.3em}
-  {\normalsize San Francisco, April 1, 2026\par}
+  {\normalsize San Francisco, April 3, 2026\par}
 \end{center}
 \vspace{1em}
 
@@ -15,10 +15,12 @@
 \begin{abstract}
 I present rvLLM, a from-scratch Rust implementation of the vLLM inference engine
 for OpenAI-compatible API serving with CUDA GPU acceleration. The current codebase
-is a 26-package Rust workspace with 54 CUDA kernels, FA3 v3 cp.async + split-KV
-attention, no-fallback kernel validation, and a Rust-native PTX compiler that
-generates fused decode kernels 2--7.5$\times$ faster than the hand-written CUDA
-baselines in the measured microbenchmarks. In the latest verified apples-to-apples
+is a 31-crate Rust workspace ($\sim$76K lines) with 54 CUDA kernels, 13 model
+architectures (Llama, Qwen2, Mistral, DeepSeek-V2, Mixtral, NemotronH~MoE, Gemma,
+and others), FA3 v3 cp.async + split-KV attention, no-fallback kernel validation,
+and a Rust-native PTX compiler that generates fused decode kernels
+2--7.5$\times$ faster than the hand-written CUDA baselines in the measured
+microbenchmarks. In the latest verified apples-to-apples
 comparison on a single H100~SXM~80\,GB serving Qwen2.5-7B f16, rvLLM reaches
 3{,}170~tok/s at $N\!=\!32$ direct engine (\textbf{0.99$\times$ stock vLLM~0.6.3.post1}).
 In a matched fixed-length 10k lifecycle race on clean H100 boxes, rvLLM finishes
@@ -76,19 +78,25 @@ $\sim$150{,}000$\times$ reduction.
 
 The primary contributions are:
 \begin{enumerate}
-  \item A modular 26-package Rust architecture for LLM inference, with GPU-resident
+  \item A modular 31-crate Rust architecture for LLM inference, with GPU-resident
         execution that eliminates per-step device-to-host logit transfers for greedy
-        decoding.
+        decoding. 13 model architectures, 6 runtime-selectable decode paths, and an
+        OpenAI-compatible API with 14 endpoints (completions, chat, Responses API with
+        stored multi-turn conversations, embeddings, batch inference).
   \item 54~CUDA kernels including FlashAttention-3 v3 with cp.async bulk copies and split-KV,
-        paged KV cache support, GPU argmax, fused residual-RMSNorm, and reserve-based
-        safe-max VRAM sizing for server startup. No-fallback startup validation ensures
-        every required kernel loads or the server fails fast.
+        paged KV cache support (f16 + FP8), GPU argmax, fused residual-RMSNorm, a
+        megakernel that packs all 28 transformer layers into a single kernel launch,
+        and reserve-based safe-max VRAM sizing for server startup. No-fallback startup
+        validation ensures every required kernel loads or the server fails fast.
   \item Verified three-way H100 benchmark results against stock vLLM and an
         intermediate Python serving layer, plus a matched 10k launch-to-finished
         lifecycle race that separates raw direct-engine parity from serving-stack
         overhead.
   \item A Rust-native PTX emission path for fused decode kernels, with measured
         2--7.5$\times$ speedups over the corresponding hand-written CUDA kernels.
+  \item Weight loading for SafeTensors (single and sharded) and GGUF (Q4\_0, Q4\_K\_M,
+        Q5\_0, Q5\_K\_M, Q8\_0), guided decoding (JSON, JSON Schema, regex constraints),
+        tool/function calling, Zig SIMD sampling backend, and tensor parallelism via NCCL.
   \item A development cost analysis: approximately \$1{,}780 in compute and AI
         assistance to build the system from scratch.
 \end{enumerate}

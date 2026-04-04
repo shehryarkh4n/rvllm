@@ -128,7 +128,7 @@ footer a:hover{color:#999}
 
 <header>
   <h1>rvLLM</h1>
-  <p class="sub">High-performance LLM inference in Rust. 26-package workspace. 54 CUDA kernels. FA3 v3 cp.async + split-KV. JIT PTX compiler.</p>
+  <p class="sub">High-performance LLM inference in Rust. 31-crate workspace. 54 CUDA kernels. 13 model architectures. FA3 v3 cp.async + split-KV. JIT PTX compiler.</p>
   <p class="links">
     <a href="https://github.com/m0at/rvllm">GitHub</a>
     <a href="paper/rvllm.pdf">Paper (color)</a>
@@ -289,14 +289,15 @@ footer a:hover{color:#999}
 
 <section>
 <h2>Abstract</h2>
-<p class="section-sub">Andy Norris (m0at) -- San Francisco, April 1 2026</p>
+<p class="section-sub">Andy Norris (m0at) -- San Francisco, April 3 2026</p>
 <p>
   rvLLM is a from-scratch Rust implementation of the vLLM inference engine for
-  OpenAI-compatible API serving with CUDA GPU acceleration. The current tree is a
-  26-package Rust workspace with 54 CUDA kernels, a Rust-native PTX compiler that
-  generates fused kernels 2-7.5x faster than the hand-written CUDA versions in the
-  measured decode microbenchmarks, FA3 v3 cp.async + split-KV attention, and no-fallback
-  kernel validation.
+  OpenAI-compatible API serving with CUDA GPU acceleration. 310 commits, 31 crates,
+  ~76K lines of Rust, 253 source files. The current tree has 54 CUDA kernels, a
+  Rust-native PTX compiler that generates fused kernels 2-7.5x faster than the
+  hand-written CUDA versions in the measured decode microbenchmarks, FA3 v3 cp.async +
+  split-KV attention, no-fallback kernel validation, and 13 model architectures
+  including Llama, Qwen2, Mistral, DeepSeek-V2, Mixtral, NemotronH MoE, and Gemma.
 </p>
 <p>
   In the latest verified apples-to-apples H100 SXM 80GB comparison on Qwen2.5-7B f16,
@@ -307,6 +308,15 @@ footer a:hover{color:#999}
   for rvLLM. The intermediate <code>rvllm-lite</code> stack keeps near-stock direct-engine speed but
   collapses to 131.8 tok/s over HTTP, which isolates the Python serving layer as a major source
   of practical overhead.
+</p>
+<p>
+  The API layer implements 14 OpenAI-compatible endpoints including completions, chat
+  completions with tool/function calling, the Responses API (stored multi-turn conversations,
+  background execution, streaming argument deltas), embeddings, batch inference, and a
+  Prometheus metrics endpoint. Weight loading supports SafeTensors (single and sharded) and
+  GGUF (Q4_0, Q4_K_M, Q5_0, Q5_K_M, Q8_0). Guided decoding enforces JSON, JSON Schema,
+  and regex constraints at the token level. Sampling uses a Zig SIMD backend for hot paths
+  (softmax, argmax, weight conversion) with 1.4-6.3x speedups over scalar Rust.
 </p>
 </section>
 
@@ -419,6 +429,8 @@ footer a:hover{color:#999}
 <li><strong>FA3 v3 cp.async + split-KV attention</strong> -- cp.async bulk copies, split-KV across thread blocks, parallel softmax, bank-conflict-free smem, V reuse across head groups</li>
 <li><strong>No GIL, no GC</strong> -- deterministic Rust, parallel scheduling via Rayon</li>
 <li><strong>FP8 weight support</strong> -- cublasLt FP8 GEMM halves weight bandwidth</li>
+<li><strong>Zig SIMD sampling</strong> -- NEON/AVX-512 softmax, argmax, weight conversion (1.4-6.3x)</li>
+<li><strong>Chunked prefill scheduler</strong> -- bounds prefill tokens per step, prevents decode starvation</li>
 </ol>
 </section>
 
@@ -456,6 +468,9 @@ footer a:hover{color:#999}
 <tr><td>5d</td><td>FA3 v2 warp-parallel attention</td><td class="r">8,652</td><td>Mar 31</td></tr>
 <tr class="peak"><td>6</td><td>FA3 v3 cp.async + split-KV + no-fallback</td><td class="r">12,312</td><td>Mar 31</td></tr>
 <tr><td>7</td><td>Architecture hardening + INT4 kernel</td><td class="r">12,312</td><td>Apr 1</td></tr>
+<tr><td>8</td><td>Chunked prefill scheduler + lifecycle race</td><td class="r">3,419 (N=32)</td><td>Apr 2</td></tr>
+<tr><td>9</td><td>Responses API + Harmony templates + vision types</td><td class="r">--</td><td>Apr 3</td></tr>
+<tr><td>10</td><td>Qwen/Nemotron integrations + GGUF loader + mock smoke path</td><td class="r">--</td><td>Apr 3</td></tr>
 </tbody>
 </table>
 </div>
@@ -463,26 +478,41 @@ footer a:hover{color:#999}
 
 <section>
 <h2>Architecture</h2>
-<p class="section-sub">26 workspace packages, 54 CUDA kernels, selected components</p>
-<pre>rvllm (12 MB local release build)
-  +-- rvllm-engine         async engine, continuous batching
-  |     +-- rvllm-worker   GPU worker, CUDA graph management
+<p class="section-sub">31 crates, 54 CUDA kernels, 13 model architectures, 6 decode paths</p>
+<pre>rvllm-server          CLI binary (serve, benchmark, info)
+  +-- rvllm-api         axum HTTP server, 14 OpenAI-compatible routes, SSE streaming
+  +-- rvllm-engine      async engine, continuous batching, dedicated GPU thread
+  |     +-- rvllm-scheduler    chunked prefill, FCFS/priority/SJF, preemption
+  |     +-- rvllm-worker       GPU worker, CUDA graph capture/replay (35 sizes)
   |     +-- rvllm-speculative  self-draft speculative decoding
-  +-- rvllm-model-runner   forward pass, autotuning, weight loading
-  |     +-- rvllm-attention    FA3 v3 cp.async, GQA, split-KV
+  +-- rvllm-model-runner   forward pass, 13 architectures, 6 decode paths, megakernel
+  |     +-- rvllm-attention    FA3 v3 cp.async, GQA, split-KV, sliding window
   |     +-- rvllm-kv-cache     paged KV (f16 + FP8)
-  |     +-- rvllm-model-loader SafeTensors, HF hub
-  +-- rvllm-fusion         JIT compiler, PTX emitter, LLVM backend
-  +-- rvllm-gpu            CUDA, cuBLAS, kernel loader, vendored cublaslt
+  |     +-- rvllm-model-loader SafeTensors + GGUF, HF hub, TP sharding
+  +-- rvllm-fusion         JIT PTX compiler, 2-7.5x faster than hand-written CUDA
+  +-- rtriton              Triton-style GPU kernel compiler (research crate)
+  +-- rvllm-gpu            CUDA, cuBLAS/cublasLt, kernel loader (~60 modules)
+  +-- rvllm-sampling       temp/top-k/p/min-p, guided decoding (JSON schema, regex)
   +-- rvllm-tp             tensor parallelism (NCCL, Megatron sharding)
-  +-- rvllm-tokenizer      HuggingFace tokenizers
+  +-- rvllm-tokenizer      HF tokenizers, ChatML/Harmony templates, tool parsing
+  +-- rvllm-vision         image preprocessing, vision encoder trait
+  +-- rvllm-zig            Zig SIMD backend (softmax, argmax, weight conversion)
+  +-- rvllm-telemetry      Prometheus metrics, structured logging, OTLP traces
+  +-- rvllm-python         PyO3 bindings (import rvllm)
+
+Model architectures:
+  LlamaForCausalLM, MistralForCausalLM, Qwen2ForCausalLM, CohereForCausalLM,
+  GPTNeoXForCausalLM, StableLMForCausalLM, GemmaForCausalLM, Gemma2ForCausalLM,
+  DeepseekV2ForCausalLM, MixtralForCausalLM, NemotronHMoE, Phi3SmallForCausalLM,
+  SentenceTransformer (embedding models)
 
 Decode paths (N=1):
   FusedDecode .......... 121 tok/s  (JIT fused norm+GEMV)
   CublasGemvDecode ..... 118 tok/s  (separate norm + cuBLAS HGEMM, 84% BW)
-  Megakernel ............ 50 tok/s  (single-launch hidden_size param)
-  Persistent ............ 51 tok/s  (resident thread blocks)
-  Fp8Decode ............. --        (FP8 E4M3 weights)
+  Megakernel ............ 50 tok/s  (28-layer single-launch, instruction tape)
+  Persistent ............ 51 tok/s  (SM-DAG cooperative kernel)
+  Fp8Decode ............. --        (FP8 E4M3 cublasLt)
+  Batched ............... auto      (cuBLAS/CUTLASS for T>=2)
   Theoretical f16 ceiling: 222 tok/s</pre>
 </section>
 
