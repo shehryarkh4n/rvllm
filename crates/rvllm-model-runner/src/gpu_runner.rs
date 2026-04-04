@@ -524,6 +524,10 @@ mod cuda_impl {
             // memory is settled. Scratch buffers (~10MB each) are dropped after.
             #[cfg(feature = "cublaslt")]
             if let Some(ref lt) = self.blas_lt {
+                let gpu_name = rvllm_gpu::prelude::list_devices()
+                    .first()
+                    .map(|d| d.name.clone())
+                    .unwrap_or_else(|| "unknown".into());
                 match rvllm_gpu::CublasAutotuner::autotune_model(
                     lt,
                     rvllm_gpu::GemmDtype::F16,
@@ -532,6 +536,7 @@ mod cuda_impl {
                     qkv_dim,
                     intermediate,
                     gate_up_dim,
+                    &gpu_name,
                 ) {
                     Ok(tuner) => {
                         info!(

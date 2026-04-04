@@ -282,36 +282,59 @@ impl GpuTransformerLayer {
         let mut bias_fused = false;
 
         if let Some(fused_qkv) = weights.fused_qkv {
-            if num_tokens == 1 {
-                #[cfg(feature = "cublaslt")]
-                if let (Some(lt_ops), Some(bias)) = (lt, weights.qkv_bias) {
+            // Try cublasLt bias epilogue (eliminates separate add_bias kernel launches)
+            #[cfg(feature = "cublaslt")]
+            if let (Some(lt_ops), Some(bias)) = (lt, weights.qkv_bias) {
+                if num_tokens == 1 {
+                    // N=1: write directly to qkv with bias
                     Self::hgemm_dispatch_fp8_bias_into(
                         &self.stream, lt_ops, &*scratch.normed, fused_qkv,
                         bias, num_tokens, qkv_dim, hidden, scratch.qkv)?;
                     bias_fused = true;
+                } else {
+                    // N>1: write to gate_up (temp) with bias, then deinterleave
+                    Self::hgemm_dispatch_fp8_bias_into(
+                        &self.stream, lt_ops, &*scratch.normed, fused_qkv,
+                        bias, num_tokens, qkv_dim, hidden, scratch.gate_up)?;
+                    bias_fused = true;
+                    let interleaved_len = num_tokens * qkv_dim;
+                    let dk = self.loader.get_func("deinterleave_qkv", "deinterleave_qkv_f16_kernel")
+                        .map_err(|e| LLMError::GpuError(format!("Required deinterleave_qkv kernel missing: {e}")))?;
+                    let total = interleaved_len as u32;
+                    let tmp_view = scratch.gate_up.slice(..interleaved_len);
+                    let mut qkv_view = scratch.qkv.slice_mut(..interleaved_len);
+                    unsafe {
+                        self.stream.launch_builder(&dk)
+                            .arg(&mut qkv_view).arg(&tmp_view)
+                            .arg(&(num_tokens as i32)).arg(&(q_dim as i32)).arg(&(kv_dim as i32))
+                            .launch(LaunchConfig { grid_dim: ((total + 255) / 256, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 })
+                            .map_err(|e| LLMError::GpuError(format!("deinterleave qkv: {e}")))?;
+                    }
                 }
-                if !bias_fused {
+            }
+            // Fallback: GEMM without bias epilogue
+            if !bias_fused {
+                if num_tokens == 1 {
                     Self::hgemm_dispatch_fp8_into(&self.stream, blas, lt, &*scratch.normed, fused_qkv,
                         num_tokens, qkv_dim, hidden, &self.loader,
                         weights.fused_qkv_fp8, scratch.qkv)?;
-                }
-            } else {
-                // Fused GEMM into gate_up (temp) + deinterleave into qkv
-                Self::hgemm_dispatch_fp8_into(&self.stream, blas, lt, &*scratch.normed, fused_qkv,
-                    num_tokens, qkv_dim, hidden, &self.loader,
-                    weights.fused_qkv_fp8, scratch.gate_up)?;
-                let interleaved_len = num_tokens * qkv_dim;
-                let dk = self.loader.get_func("deinterleave_qkv", "deinterleave_qkv_f16_kernel")
-                    .map_err(|e| LLMError::GpuError(format!("Required deinterleave_qkv kernel missing: {e}")))?;
-                let total = interleaved_len as u32;
-                let tmp_view = scratch.gate_up.slice(..interleaved_len);
-                let mut qkv_view = scratch.qkv.slice_mut(..interleaved_len);
-                unsafe {
-                    self.stream.launch_builder(&dk)
-                        .arg(&mut qkv_view).arg(&tmp_view)
-                        .arg(&(num_tokens as i32)).arg(&(q_dim as i32)).arg(&(kv_dim as i32))
-                        .launch(LaunchConfig { grid_dim: ((total + 255) / 256, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 })
-                        .map_err(|e| LLMError::GpuError(format!("deinterleave qkv: {e}")))?;
+                } else {
+                    Self::hgemm_dispatch_fp8_into(&self.stream, blas, lt, &*scratch.normed, fused_qkv,
+                        num_tokens, qkv_dim, hidden, &self.loader,
+                        weights.fused_qkv_fp8, scratch.gate_up)?;
+                    let interleaved_len = num_tokens * qkv_dim;
+                    let dk = self.loader.get_func("deinterleave_qkv", "deinterleave_qkv_f16_kernel")
+                        .map_err(|e| LLMError::GpuError(format!("Required deinterleave_qkv kernel missing: {e}")))?;
+                    let total = interleaved_len as u32;
+                    let tmp_view = scratch.gate_up.slice(..interleaved_len);
+                    let mut qkv_view = scratch.qkv.slice_mut(..interleaved_len);
+                    unsafe {
+                        self.stream.launch_builder(&dk)
+                            .arg(&mut qkv_view).arg(&tmp_view)
+                            .arg(&(num_tokens as i32)).arg(&(q_dim as i32)).arg(&(kv_dim as i32))
+                            .launch(LaunchConfig { grid_dim: ((total + 255) / 256, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 })
+                            .map_err(|e| LLMError::GpuError(format!("deinterleave qkv: {e}")))?;
+                    }
                 }
             }
         } else {
