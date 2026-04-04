@@ -13,11 +13,61 @@ pub use block_table::BlockTable;
 pub use manager::{BlockManager, SharedBlockManager};
 pub use prefix_cache::PrefixCache;
 
-use rvllm_core::prelude::BlockId;
+use std::collections::VecDeque;
+
+use rvllm_core::prelude::{BlockId, SequenceId};
 
 // Re-export real types from dependency crates.
 pub use rvllm_memory::DeviceType as Device;
 pub use rvllm_sequence::SequenceStatus;
+
+// ---------------------------------------------------------------------------
+// CachePolicy: pluggable eviction policy for automatic KV cache offloading.
+// ---------------------------------------------------------------------------
+
+pub trait CachePolicy: Send + Sync {
+    fn select_victim(&self, candidates: &[SequenceId]) -> Option<SequenceId>;
+    fn on_access(&mut self, seq_id: SequenceId);
+    fn on_evict(&mut self, seq_id: SequenceId);
+}
+
+pub struct LruCachePolicy {
+    order: VecDeque<SequenceId>,
+}
+
+impl LruCachePolicy {
+    pub fn new() -> Self {
+        Self {
+            order: VecDeque::new(),
+        }
+    }
+}
+
+impl Default for LruCachePolicy {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CachePolicy for LruCachePolicy {
+    fn select_victim(&self, candidates: &[SequenceId]) -> Option<SequenceId> {
+        for seq_id in &self.order {
+            if candidates.contains(seq_id) {
+                return Some(*seq_id);
+            }
+        }
+        None
+    }
+
+    fn on_access(&mut self, seq_id: SequenceId) {
+        self.order.retain(|id| *id != seq_id);
+        self.order.push_back(seq_id);
+    }
+
+    fn on_evict(&mut self, seq_id: SequenceId) {
+        self.order.retain(|id| *id != seq_id);
+    }
+}
 
 // ---------------------------------------------------------------------------
 // PhysicalBlock: kept local because rvllm_memory::PhysicalBlock uses atomic

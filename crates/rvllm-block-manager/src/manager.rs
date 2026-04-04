@@ -6,7 +6,7 @@ use rvllm_core::prelude::{BlockId, LLMError, Result, SequenceId};
 
 use crate::block_table::BlockTable;
 use crate::prefix_cache::PrefixCache;
-use crate::{Device, MemoryPool, PhysicalBlock, Sequence};
+use crate::{CachePolicy, Device, MemoryPool, PhysicalBlock, Sequence};
 
 /// Flat-array reference counter indexed by `BlockId`.
 ///
@@ -124,6 +124,8 @@ pub struct BlockManager {
     prefix_cache: Option<PrefixCache>,
     /// Per-slot prefix block IDs (indexed by slot).
     prefix_blocks: Vec<Option<Vec<BlockId>>>,
+    /// Pluggable cache eviction policy for automatic KV offloading.
+    cache_policy: Option<Box<dyn CachePolicy>>,
 }
 
 impl BlockManager {
@@ -131,6 +133,40 @@ impl BlockManager {
         gpu_pool: Arc<dyn MemoryPool>,
         cpu_pool: Arc<dyn MemoryPool>,
         block_size: usize,
+    ) -> Self {
+        let gpu_cap = gpu_pool.total_blocks();
+        let cpu_cap = cpu_pool.total_blocks();
+
+        let cache_policy: Option<Box<dyn CachePolicy>> =
+            if std::env::var("RVLLM_KV_OFFLOAD").as_deref() == Ok("1") {
+                tracing::info!("automatic KV cache offloading enabled (LRU policy)");
+                Some(Box::new(crate::LruCachePolicy::new()))
+            } else {
+                None
+            };
+
+        Self {
+            gpu_pool,
+            cpu_pool,
+            block_size,
+            seq_slots: SeqSlots::new(),
+            gpu_tables: Vec::new(),
+            cpu_tables: Vec::new(),
+            gpu_ref_counts: RefCounter::new(gpu_cap),
+            cpu_ref_counts: RefCounter::new(cpu_cap),
+            cow_pending: Vec::new(),
+            watermark: 0.04,
+            prefix_cache: None,
+            prefix_blocks: Vec::new(),
+            cache_policy,
+        }
+    }
+
+    pub fn new_with_policy(
+        gpu_pool: Arc<dyn MemoryPool>,
+        cpu_pool: Arc<dyn MemoryPool>,
+        block_size: usize,
+        policy: Option<Box<dyn CachePolicy>>,
     ) -> Self {
         let gpu_cap = gpu_pool.total_blocks();
         let cpu_cap = cpu_pool.total_blocks();
@@ -147,6 +183,7 @@ impl BlockManager {
             watermark: 0.04,
             prefix_cache: None,
             prefix_blocks: Vec::new(),
+            cache_policy: policy,
         }
     }
 
@@ -203,6 +240,9 @@ impl BlockManager {
 
     /// Allocate GPU blocks for new tokens in a sequence.
     pub fn allocate(&mut self, seq: &Sequence) -> Result<()> {
+        if let Some(ref mut policy) = self.cache_policy {
+            policy.on_access(seq.seq_id);
+        }
         let needed = self.blocks_needed(seq.get_len());
         let slot = self.seq_slots.get_or_create(seq.seq_id);
 
@@ -302,6 +342,9 @@ impl BlockManager {
 
     /// Free all GPU and CPU blocks for a sequence.
     pub fn free(&mut self, seq: &Sequence) {
+        if let Some(ref mut policy) = self.cache_policy {
+            policy.on_evict(seq.seq_id);
+        }
         let slot = match self.seq_slots.remove(seq.seq_id) {
             Some(s) => s,
             None => return,
@@ -531,6 +574,93 @@ impl BlockManager {
         ensure_slot(&mut self.gpu_tables, slot);
         self.gpu_tables[slot as usize] = Some(gpu_table);
         Ok(mapping)
+    }
+
+    /// Automatically offload KV blocks to CPU using the configured eviction policy.
+    /// Returns the list of evicted (sequence_id, gpu->cpu block mappings) pairs.
+    pub fn auto_offload(
+        &mut self,
+        needed_blocks: usize,
+    ) -> Result<Vec<(SequenceId, Vec<(BlockId, BlockId)>)>> {
+        if self.cache_policy.is_none() {
+            return Ok(Vec::new());
+        }
+
+        let mut evicted = Vec::new();
+        while self.usable_gpu_blocks() < needed_blocks {
+            let candidates: Vec<SequenceId> = self
+                .seq_slots
+                .id_to_slot
+                .iter()
+                .filter(|(_, &slot)| {
+                    self.gpu_tables
+                        .get(slot as usize)
+                        .and_then(|o| o.as_ref())
+                        .map(|t| !t.is_empty())
+                        .unwrap_or(false)
+                })
+                .map(|(sid, _)| *sid)
+                .collect();
+
+            if candidates.is_empty() {
+                break;
+            }
+
+            let victim = match self.cache_policy.as_ref().unwrap().select_victim(&candidates) {
+                Some(v) => v,
+                None => break,
+            };
+
+            // Build a temporary Sequence just to call swap_out
+            let slot = match self.seq_slots.get(victim) {
+                Some(s) => s,
+                None => break,
+            };
+
+            let gpu_table = match self
+                .gpu_tables
+                .get_mut(slot as usize)
+                .and_then(|o| o.take())
+            {
+                Some(t) => t,
+                None => break,
+            };
+
+            let mut mapping = Vec::with_capacity(gpu_table.len());
+            let mut cpu_table = BlockTable::with_capacity(gpu_table.len());
+
+            for block in gpu_table.iter() {
+                let cpu_block_id = self
+                    .cpu_pool
+                    .allocate()
+                    .ok_or_else(|| LLMError::MemoryError("out of CPU blocks for auto offload".into()))?;
+                mapping.push((block.block_id, cpu_block_id));
+                cpu_table.push(PhysicalBlock::new(
+                    cpu_block_id,
+                    self.block_size,
+                    Device::Cpu,
+                ));
+                self.cpu_ref_counts.increment(cpu_block_id);
+
+                let remaining = self.gpu_ref_counts.decrement(block.block_id);
+                if remaining == 0 {
+                    self.gpu_pool.free(block.block_id);
+                    self.gpu_ref_counts.remove(block.block_id);
+                }
+            }
+
+            ensure_slot(&mut self.cpu_tables, slot);
+            self.cpu_tables[slot as usize] = Some(cpu_table);
+
+            if let Some(ref mut policy) = self.cache_policy {
+                policy.on_evict(victim);
+            }
+
+            tracing::debug!(seq_id = %victim, blocks = mapping.len(), "auto-offloaded sequence to CPU");
+            evicted.push((victim, mapping));
+        }
+
+        Ok(evicted)
     }
 
     /// Drain pending copy-on-write block pairs.
@@ -938,5 +1068,181 @@ mod tests {
         let seq = make_seq(100, 16);
         mgr.allocate(&seq).unwrap();
         assert_eq!(mgr.get_block_table(SequenceId(100)).unwrap().len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // LRU cache policy tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn lru_policy_select_victim_returns_least_recent() {
+        use crate::{CachePolicy, LruCachePolicy};
+
+        let mut policy = LruCachePolicy::new();
+        policy.on_access(SequenceId(1));
+        policy.on_access(SequenceId(2));
+        policy.on_access(SequenceId(3));
+
+        let candidates = vec![SequenceId(1), SequenceId(2), SequenceId(3)];
+        assert_eq!(policy.select_victim(&candidates), Some(SequenceId(1)));
+    }
+
+    #[test]
+    fn lru_policy_access_promotes_to_back() {
+        use crate::{CachePolicy, LruCachePolicy};
+
+        let mut policy = LruCachePolicy::new();
+        policy.on_access(SequenceId(1));
+        policy.on_access(SequenceId(2));
+        policy.on_access(SequenceId(3));
+
+        // Re-access seq 1 -- it should move to back (most recent)
+        policy.on_access(SequenceId(1));
+
+        let candidates = vec![SequenceId(1), SequenceId(2), SequenceId(3)];
+        assert_eq!(policy.select_victim(&candidates), Some(SequenceId(2)));
+    }
+
+    #[test]
+    fn lru_policy_evict_removes_from_tracking() {
+        use crate::{CachePolicy, LruCachePolicy};
+
+        let mut policy = LruCachePolicy::new();
+        policy.on_access(SequenceId(1));
+        policy.on_access(SequenceId(2));
+        policy.on_access(SequenceId(3));
+
+        policy.on_evict(SequenceId(1));
+
+        let candidates = vec![SequenceId(1), SequenceId(2), SequenceId(3)];
+        assert_eq!(policy.select_victim(&candidates), Some(SequenceId(2)));
+    }
+
+    #[test]
+    fn lru_policy_select_victim_filters_by_candidates() {
+        use crate::{CachePolicy, LruCachePolicy};
+
+        let mut policy = LruCachePolicy::new();
+        policy.on_access(SequenceId(1));
+        policy.on_access(SequenceId(2));
+        policy.on_access(SequenceId(3));
+
+        // Only seq 3 is a candidate
+        let candidates = vec![SequenceId(3)];
+        assert_eq!(policy.select_victim(&candidates), Some(SequenceId(3)));
+    }
+
+    #[test]
+    fn lru_policy_empty_candidates() {
+        use crate::{CachePolicy, LruCachePolicy};
+
+        let mut policy = LruCachePolicy::new();
+        policy.on_access(SequenceId(1));
+
+        assert_eq!(policy.select_victim(&[]), None);
+    }
+
+    #[test]
+    fn lru_policy_no_tracked_sequences() {
+        use crate::{CachePolicy, LruCachePolicy};
+
+        let policy = LruCachePolicy::new();
+        let candidates = vec![SequenceId(1), SequenceId(2)];
+        assert_eq!(policy.select_victim(&candidates), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Auto-offload integration tests
+    // -----------------------------------------------------------------------
+
+    fn make_offload_manager(gpu_blocks: usize, cpu_blocks: usize) -> BlockManager {
+        let gpu = Arc::new(TestPool::new(gpu_blocks));
+        let cpu = Arc::new(TestPool::new(cpu_blocks));
+        let mut mgr = BlockManager::new_with_policy(
+            gpu,
+            cpu,
+            16,
+            Some(Box::new(crate::LruCachePolicy::new())),
+        );
+        mgr.set_watermark(0.0);
+        mgr
+    }
+
+    #[test]
+    fn auto_offload_frees_gpu_blocks() {
+        let mut mgr = make_offload_manager(4, 10);
+
+        let seq1 = make_seq(1, 32); // needs 2 blocks
+        let seq2 = make_seq(2, 32); // needs 2 blocks
+        mgr.allocate(&seq1).unwrap();
+        mgr.allocate(&seq2).unwrap();
+        assert_eq!(mgr.gpu_pool.free_blocks(), 0);
+
+        // Need 2 more blocks -- should evict seq1 (LRU)
+        let evicted = mgr.auto_offload(2).unwrap();
+        assert_eq!(evicted.len(), 1);
+        assert_eq!(evicted[0].0, SequenceId(1));
+        assert_eq!(evicted[0].1.len(), 2);
+        assert!(mgr.gpu_pool.free_blocks() >= 2);
+    }
+
+    #[test]
+    fn auto_offload_noop_when_enough_free() {
+        let mut mgr = make_offload_manager(10, 10);
+
+        let seq = make_seq(1, 16);
+        mgr.allocate(&seq).unwrap();
+
+        let evicted = mgr.auto_offload(2).unwrap();
+        assert!(evicted.is_empty());
+    }
+
+    #[test]
+    fn auto_offload_noop_without_policy() {
+        let mut mgr = make_manager(4, 10);
+        let seq1 = make_seq(1, 32);
+        let seq2 = make_seq(2, 32);
+        mgr.allocate(&seq1).unwrap();
+        mgr.allocate(&seq2).unwrap();
+
+        let evicted = mgr.auto_offload(2).unwrap();
+        assert!(evicted.is_empty());
+    }
+
+    #[test]
+    fn auto_offload_evicts_multiple_sequences() {
+        let mut mgr = make_offload_manager(6, 10);
+
+        let seq1 = make_seq(1, 32); // 2 blocks
+        let seq2 = make_seq(2, 32); // 2 blocks
+        let seq3 = make_seq(3, 32); // 2 blocks
+        mgr.allocate(&seq1).unwrap();
+        mgr.allocate(&seq2).unwrap();
+        mgr.allocate(&seq3).unwrap();
+        assert_eq!(mgr.gpu_pool.free_blocks(), 0);
+
+        // Need 4 blocks -- should evict seq1 and seq2 (oldest accessed)
+        let evicted = mgr.auto_offload(4).unwrap();
+        assert_eq!(evicted.len(), 2);
+        assert!(mgr.gpu_pool.free_blocks() >= 4);
+    }
+
+    #[test]
+    fn auto_offload_respects_access_order() {
+        let mut mgr = make_offload_manager(4, 10);
+
+        let seq1 = make_seq(1, 32); // 2 blocks
+        let seq2 = make_seq(2, 32); // 2 blocks
+        mgr.allocate(&seq1).unwrap();
+        mgr.allocate(&seq2).unwrap();
+
+        // Re-access seq1 so seq2 becomes LRU
+        if let Some(ref mut policy) = mgr.cache_policy {
+            policy.on_access(SequenceId(1));
+        }
+
+        let evicted = mgr.auto_offload(2).unwrap();
+        assert_eq!(evicted.len(), 1);
+        assert_eq!(evicted[0].0, SequenceId(2));
     }
 }
