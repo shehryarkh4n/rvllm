@@ -651,8 +651,8 @@ impl PersistentV2Kernels {
         };
         let sms =
             crate::cooperative::sm_count(&self.context).map_err(|e| format!("v3 sm_count: {e}"))?;
-        // After the phase6 rewrite, direct timing sweeps favor a slightly higher grid.
-        Ok((bpsm * sms).min(512))
+        // After the fused FFN rewrite, direct timing sweeps favor a higher grid.
+        Ok((bpsm * sms).min(640))
     }
 
     /// Launch persistent_layer_v3_f16 (non-cooperative, regular cuLaunchKernel).
