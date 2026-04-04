@@ -108,6 +108,18 @@ fn is_blackwell_arch(arch: &str) -> bool {
 fn compile_kernels(nvcc: &Path, kernel_dir: &Path, out_dir: &Path) {
     let archs = resolve_archs();
 
+    // CUTLASS include paths for fused epilogue kernels
+    let cutlass_includes: Vec<String> = [
+        "./cutlass/include",
+        "/usr/local/include",
+        "/tmp/cutlass/include",
+        "/tmp/cutlass/tools/util/include",
+    ]
+    .iter()
+    .filter(|p| std::path::Path::new(p).exists())
+    .map(|p| format!("-I{p}"))
+    .collect();
+
     // For any Blackwell arch detected, ensure both sm_100 and sm_120 are
     // included so we ship PTX for both data-center and consumer Blackwell.
     let mut archs = archs;
@@ -213,6 +225,9 @@ fn compile_kernels(nvcc: &Path, kernel_dir: &Path, out_dir: &Path) {
             } else {
                 let mut nvcc_cmd = Command::new(nvcc);
                 nvcc_cmd.args(["-ptx", &arch_flag, "-O3"]);
+                for inc in &cutlass_includes {
+                    nvcc_cmd.arg(inc);
+                }
                 if blackwell {
                     nvcc_cmd.arg("-DBLACKWELL=1");
                 }
