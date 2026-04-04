@@ -332,6 +332,68 @@ The sampling layer includes a constrained decoding engine (`rvllm-sampling/src/g
 
 Request-level control via the `response_format` field in SamplingParams.
 
+## Profile-Guided Autotuning
+
+rvLLM includes a two-stage tuning system: **nsys profiling** identifies which kernels to optimize, then **cublasLt autotuning** finds the fastest algorithm for each GEMM shape.
+
+### Stage 1: Profile with nsys
+
+```bash
+NSYS=/opt/nvidia/nsight-compute/2025.1.0/host/target-linux-x64/nsys
+
+$NSYS profile --stats=true -o profile_output \
+  ./target/release/rvllm benchmark \
+  --model /root/models/Qwen2.5-7B --dtype half --n 32 --output-len 32
+```
+
+This prints a kernel ranking table showing exactly where GPU time goes:
+
+```
+ Time(%)  Total(ms)  Calls   Avg(us)   Name
+    5.3     27.9      980    28.5      fa3_v3_decode_gqa_kernel
+    4.4     23.2     4089     5.7      fused_residual_rmsnorm_f16_kernel
+    2.8     14.8     2044     7.2      silu_mul_interleaved_f16_kernel
+    2.6     14.0     6132     2.3      add_bias_f16_kernel        <-- 6132 launches!
+    ...
+```
+
+The kernel with the most total time and the most launches is your optimization target. In the example above, `add_bias_f16_kernel` has 6,132 separate launches that should be fused into the GEMM epilogue.
+
+See [docs/profiling.md](docs/profiling.md) for the full profiling guide.
+
+### Stage 2: cublasLt Algorithm Autotuning
+
+When built with `--features cuda,cublaslt`, rvLLM benchmarks 32 cublasLt algorithm candidates for each GEMM shape at startup. Results are cached to `~/.cache/rvllm/autotune.json` so subsequent runs skip the benchmarking phase.
+
+```bash
+# First run: autotuning takes 1-2 minutes (benchmarks ~24 shapes x 32 algorithms)
+cargo build --release --features cuda,cublaslt
+./target/release/rvllm serve --model Qwen/Qwen2.5-7B --dtype half
+
+# Second run: instant (reads from cache)
+./target/release/rvllm serve --model Qwen/Qwen2.5-7B --dtype half
+```
+
+The cache is keyed by `(gpu_name, m, n, k, dtype)` so different GPUs and models get separate tuning results. Override the cache path with `RVLLM_AUTOTUNE_CACHE=/path/to/cache.json`.
+
+The cublasLt path also enables **bias epilogue fusion**: bias-add is folded into the GEMM output instead of launching a separate kernel. This eliminates thousands of kernel launches per benchmark (6,132 `add_bias_f16_kernel` calls become zero).
+
+### Stage 3: CUPTI-Based Full-Pipeline Tuning (rvllm-autotune)
+
+The `rvllm-autotune` crate (`crates/rvllm-autotune/`) goes beyond GEMM algorithm selection to profile and tune every kernel in the inference pipeline:
+
+1. **Profile** (`CuptiProfiler`): captures per-kernel GPU timing via CUPTI activity API with nanosecond precision
+2. **Rank** (`KernelRanker`): sorts kernels by total GPU time, classifies as Gemm/Attention/Norm/Activation/Memory, marks which are tunable (ours) vs library internals (cuBLAS)
+3. **Sweep** (`ConfigSweeper`): generates alternative launch configs (block sizes, shared memory, tile parameters) and benchmarks each
+4. **Cache** (`TuneCache`): persists winning configs to `~/.cache/rvllm/tune.json`
+
+The workflow:
+```
+nsys profile  -->  identify top kernels  -->  autotune those kernels  -->  cache results
+     |                    |                          |                         |
+  CUPTI API        KernelRanker              ConfigSweeper               TuneCache
+```
+
 ## Telemetry
 
 Prometheus-compatible metrics exposed at `/metrics`, plus structured logging via `tracing`:
