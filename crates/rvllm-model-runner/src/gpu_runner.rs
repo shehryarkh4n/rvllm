@@ -114,6 +114,22 @@ mod cuda_impl {
         pub down_b: CudaSlice<f16>,     // [max_tokens * hidden]
     }
 
+    struct PersistentV3Scratch {
+        max_splits: usize,
+        qkv: CudaSlice<f16>,
+        attn: CudaSlice<f16>,
+        oproj: CudaSlice<f16>,
+        gateup: CudaSlice<f16>,
+        split_max: CudaSlice<u8>,
+        split_sum: CudaSlice<u8>,
+        split_acc: CudaSlice<u8>,
+        sync_flags: CudaSlice<i32>,
+        residual_a: CudaSlice<f16>,
+        residual_b: CudaSlice<f16>,
+        mlp_a: CudaSlice<f16>,
+        mlp_b: CudaSlice<f16>,
+    }
+
     const DEFAULT_F16_SCRATCH_TOKENS: usize = 512;
 
     /// Element offsets into the packed metadata GPU buffer.
@@ -188,6 +204,8 @@ mod cuda_impl {
         fp8_input_scratch: Option<CudaSlice<u8>>,
         /// Pre-allocated scratch buffers for the forward pass (RefCell for interior mutability).
         f16_scratch: RefCell<Option<F16LayerScratch>>,
+        /// Pre-allocated batch-1 scratch for persistent v3 decode.
+        persistent_v3_scratch: RefCell<Option<PersistentV3Scratch>>,
     }
 
     impl GpuModelRunner {
@@ -393,6 +411,7 @@ mod cuda_impl {
                 fp8_down_proj_scale: Vec::new(),
                 fp8_input_scratch: None,
                 f16_scratch: RefCell::new(None),
+                persistent_v3_scratch: RefCell::new(None),
             })
         }
 
@@ -706,6 +725,70 @@ mod cuda_impl {
                 required_tokens, "growing f16 layer scratch for batched forward"
             );
             self.alloc_scratch(required_tokens)
+        }
+
+        fn alloc_persistent_v3_scratch(&self, max_splits: usize) -> Result<()> {
+            use rvllm_gpu::persistent_v2_ffi::PersistentV2Kernels;
+
+            let hidden = self.config.hidden_size;
+            let q_dim = self.config.num_heads * self.config.head_dim;
+            let kv_dim = self.config.num_kv_heads * self.config.head_dim;
+            let qkv_dim = q_dim + kv_dim + kv_dim;
+            let gate_up_dim = self.config.intermediate_size * 2;
+            let heads_per_group = self.config.num_heads / self.config.num_kv_heads;
+            let head_dim = self.config.head_dim;
+            let num_kv_heads = self.config.num_kv_heads;
+
+            let alloc_f16 = |n: usize| -> Result<CudaSlice<f16>> {
+                unsafe { self.stream.alloc::<f16>(n) }
+                    .map_err(|e| LLMError::GpuError(format!("pv3 scratch alloc ({n} elems): {e}")))
+            };
+            let alloc_u8 = |n: usize| -> Result<CudaSlice<u8>> {
+                unsafe { self.stream.alloc::<u8>(n) }
+                    .map_err(|e| LLMError::GpuError(format!("pv3 scratch alloc ({n} bytes): {e}")))
+            };
+
+            let (max_sz, sum_sz, acc_sz) = PersistentV2Kernels::split_kv_scratch_size(
+                num_kv_heads,
+                max_splits,
+                heads_per_group,
+                head_dim,
+            );
+
+            let scratch = PersistentV3Scratch {
+                max_splits,
+                qkv: alloc_f16(qkv_dim)?,
+                attn: alloc_f16(q_dim)?,
+                oproj: alloc_f16(hidden)?,
+                gateup: alloc_f16(gate_up_dim)?,
+                split_max: alloc_u8(max_sz)?,
+                split_sum: alloc_u8(sum_sz)?,
+                split_acc: alloc_u8(acc_sz)?,
+                sync_flags: self
+                    .stream
+                    .alloc_zeros::<i32>(6)
+                    .map_err(|e| LLMError::GpuError(format!("pv3 sync alloc: {e}")))?,
+                residual_a: alloc_f16(hidden)?,
+                residual_b: alloc_f16(hidden)?,
+                mlp_a: alloc_f16(hidden)?,
+                mlp_b: alloc_f16(hidden)?,
+            };
+
+            info!(max_splits, "persistent v3 scratch allocated");
+            *self.persistent_v3_scratch.borrow_mut() = Some(scratch);
+            Ok(())
+        }
+
+        fn ensure_persistent_v3_scratch(&self, max_splits: usize) -> Result<()> {
+            let current = self
+                .persistent_v3_scratch
+                .borrow()
+                .as_ref()
+                .map_or(0, |scratch| scratch.max_splits);
+            if current >= max_splits {
+                return Ok(());
+            }
+            self.alloc_persistent_v3_scratch(max_splits)
         }
 
         /// Prepare the minimal unfused fp16 runtime state.
@@ -1485,6 +1568,20 @@ mod cuda_impl {
             let meta_packed = self.meta_packed.borrow();
             let packed_buf = meta_packed.slice();
             let offsets = self.meta_packed_offsets.get();
+            let path = self.resolve_forward_path(num_tokens, is_prefill);
+            if path == ForwardPath::PersistentV3Decode {
+                return self.forward_persistent_v3(
+                    &hidden_f16,
+                    gpu_cache,
+                    packed_buf,
+                    offsets,
+                    num_tokens,
+                    num_seqs,
+                    max_context_len,
+                    block_size,
+                    greedy_only,
+                );
+            }
             // Double-buffered scratch for T>1 decode: zero per-layer allocations.
             let use_scratch = num_tokens > 1 || is_prefill;
             if use_scratch {
@@ -1492,7 +1589,6 @@ mod cuda_impl {
             }
             let mut scratch_borrow = self.f16_scratch.borrow_mut();
             let mut prev_mlp_out: Option<CudaSlice<f16>> = None;
-            let path = self.resolve_forward_path(num_tokens, is_prefill);
             for (layer_idx, layer) in self.layers.iter().enumerate() {
                 let (key_cache, value_cache) = &gpu_cache[layer_idx];
                 let even = layer_idx % 2 == 0;
@@ -1686,6 +1782,7 @@ mod cuda_impl {
                 ForwardPath::Fp8Decode
                     | ForwardPath::FusedDecode
                     | ForwardPath::PersistentDecode
+                    | ForwardPath::PersistentV3Decode
                     | ForwardPath::CublasGemvDecode
                     | ForwardPath::Batched
             )
@@ -1705,11 +1802,6 @@ mod cuda_impl {
 
         fn resolve_forward_path(&self, num_tokens: usize, is_prefill: bool) -> ForwardPath {
             if num_tokens == 1 && !is_prefill {
-                // cuBLAS decode: separate norm + cuBLAS GEMM (higher BW)
-                // Enable with RVLLM_CUBLAS_DECODE=1
-                if std::env::var("RVLLM_CUBLAS_DECODE").map_or(false, |v| v == "1") {
-                    return ForwardPath::CublasGemvDecode;
-                }
                 // v3 persistent per-layer: non-cooperative, 1024 blocks, vectorized GEMV
                 if std::env::var("RVLLM_PERSISTENT_V3").map_or(false, |v| v == "1") {
                     if self
@@ -1747,6 +1839,12 @@ mod cuda_impl {
                 // v1 DAG persistent decode: single kernel per layer (scalar GEMV)
                 if std::env::var("RVLLM_PERSISTENT").map_or(false, |v| v == "1") {
                     return ForwardPath::PersistentDecode;
+                }
+                // cuBLAS decode: separate norm + cuBLAS GEMM (higher BW).
+                // Default on for normal single-token decode; set
+                // RVLLM_CUBLAS_DECODE=0 to force the legacy fused path.
+                if std::env::var("RVLLM_CUBLAS_DECODE").map_or(true, |v| v != "0") {
+                    return ForwardPath::CublasGemvDecode;
                 }
                 #[cfg(feature = "cublaslt")]
                 if self.blas_lt.is_some()
@@ -1829,6 +1927,19 @@ mod cuda_impl {
             let meta_packed = self.meta_packed.borrow();
             let packed_buf = meta_packed.slice();
             let offsets = self.meta_packed_offsets.get();
+            let path = self.resolve_forward_path(num_tokens, is_prefill);
+            if path == ForwardPath::PersistentV3Decode {
+                return self.forward_persistent_v3_graph(
+                    &hidden_f16,
+                    gpu_cache,
+                    packed_buf,
+                    offsets,
+                    num_tokens,
+                    num_seqs,
+                    max_context_len,
+                    block_size,
+                );
+            }
             // Double-buffered scratch for T>1 decode: zero per-layer allocations.
             let use_scratch = num_tokens > 1 || is_prefill;
             if use_scratch {
@@ -1836,7 +1947,6 @@ mod cuda_impl {
             }
             let mut scratch_borrow = self.f16_scratch.borrow_mut();
             let mut prev_mlp_out: Option<CudaSlice<f16>> = None;
-            let path = self.resolve_forward_path(num_tokens, is_prefill);
             for (layer_idx, layer) in self.layers.iter().enumerate() {
                 let (key_cache, value_cache) = &gpu_cache[layer_idx];
                 let even = layer_idx % 2 == 0;
@@ -1999,6 +2109,16 @@ mod cuda_impl {
             // Copy argmax result into the persistent output buffer.
             // On first call this allocates; on subsequent calls with the same
             // num_tokens it reuses the same GPU pointer (crucial for graph replay).
+            self.write_graph_output(&token_ids_gpu, num_tokens)?;
+
+            Ok(())
+        }
+
+        fn write_graph_output(
+            &self,
+            token_ids_gpu: &CudaSlice<i32>,
+            num_tokens: usize,
+        ) -> Result<()> {
             let mut out = self.graph_output.borrow_mut();
             let need = num_tokens;
             let have = out.as_ref().map_or(0, |b| b.len());
@@ -2011,9 +2131,8 @@ mod cuda_impl {
             }
             let dst = out.as_mut().unwrap();
             self.stream
-                .memcpy_dtod(&token_ids_gpu, dst)
+                .memcpy_dtod(token_ids_gpu, dst)
                 .map_err(|e| LLMError::GpuError(format!("graph_output dtod: {e}")))?;
-
             Ok(())
         }
 
@@ -2623,7 +2742,7 @@ mod cuda_impl {
                 final_mlp,
                 &self.final_norm_weight,
                 self.rms_norm_eps,
-                1,
+                num_tokens,
                 hidden,
             )?;
 
@@ -2673,6 +2792,84 @@ mod cuda_impl {
             block_size: usize,
             greedy_only: bool,
         ) -> Result<ForwardOutput> {
+            let normed_f16 = self.forward_persistent_v3_hidden(
+                embedding,
+                gpu_cache,
+                packed_buf,
+                offsets,
+                num_tokens,
+                max_context_len,
+                block_size,
+            )?;
+            let vocab_size = self.config.vocab_size;
+            let hidden = self.config.hidden_size;
+            if greedy_only {
+                let token_ids_gpu = self.gpu_fused_lm_head_argmax_f16_hidden(
+                    &normed_f16,
+                    &self.lm_head_weight,
+                    vocab_size,
+                    hidden,
+                )?;
+                let token_ids_cpu = self
+                    .stream
+                    .clone_dtoh(&token_ids_gpu)
+                    .map_err(|e| LLMError::GpuError(format!("pv3 argmax dtoh: {e}")))?;
+                return Ok(ForwardOutput::TokenIds(token_ids_cpu));
+            }
+            let logits_gpu = CudaLinearLayer::forward_f16_in(
+                &normed_f16,
+                &self.lm_head_weight,
+                num_tokens,
+                vocab_size,
+                hidden,
+                &self.blas,
+            )?;
+            let logits_cpu = self
+                .stream
+                .clone_dtoh(&logits_gpu)
+                .map_err(|e| LLMError::GpuError(format!("pv3 logits dtoh: {e}")))?;
+            Ok(ForwardOutput::Logits(logits_cpu))
+        }
+
+        fn forward_persistent_v3_graph(
+            &self,
+            embedding: &CudaSlice<f16>,
+            gpu_cache: &[(CudaSlice<f16>, CudaSlice<f16>)],
+            packed_buf: &CudaSlice<i32>,
+            offsets: PackedMetaOffsets,
+            num_tokens: usize,
+            _num_seqs: usize,
+            max_context_len: u32,
+            block_size: usize,
+        ) -> Result<()> {
+            let normed_f16 = self.forward_persistent_v3_hidden(
+                embedding,
+                gpu_cache,
+                packed_buf,
+                offsets,
+                num_tokens,
+                max_context_len,
+                block_size,
+            )?;
+            let token_ids_gpu = self.gpu_fused_lm_head_argmax_f16_hidden(
+                &normed_f16,
+                &self.lm_head_weight,
+                self.config.vocab_size,
+                self.config.hidden_size,
+            )?;
+            self.write_graph_output(&token_ids_gpu, num_tokens)
+        }
+
+        fn forward_persistent_v3_hidden(
+            &self,
+            embedding: &CudaSlice<f16>,
+            gpu_cache: &[(CudaSlice<f16>, CudaSlice<f16>)],
+            packed_buf: &CudaSlice<i32>,
+            offsets: PackedMetaOffsets,
+            num_tokens: usize,
+            max_context_len: u32,
+            block_size: usize,
+        ) -> Result<CudaSlice<f16>> {
             use rvllm_gpu::persistent_v2_ffi::PersistentV2Kernels;
 
             let pv2 = self
@@ -2694,12 +2891,8 @@ mod cuda_impl {
             let heads_per_group = num_heads / num_kv_heads;
             let attn_scale = 1.0f32 / (head_dim as f32).sqrt();
 
-            let smem = PersistentV2Kernels::v3_shared_mem(
-                hidden,
-                head_dim,
-                heads_per_group,
-                intermediate,
-            );
+            let smem =
+                PersistentV2Kernels::v3_shared_mem(hidden, head_dim, heads_per_group, intermediate);
 
             // V3: non-cooperative, up to 1024 blocks
             let grid_blocks = pv2.v3_max_grid(smem).map_err(|e| LLMError::GpuError(e))?;
@@ -2707,49 +2900,15 @@ mod cuda_impl {
             // Split-KV config
             let max_splits = (grid_blocks as usize / num_kv_heads).min(8).max(1) as i32;
 
-            // Allocate per-layer scratch (reused across layers)
-            let mut qkv_scratch = unsafe { self.stream.alloc::<f16>(qkv_dim) }
-                .map_err(|e| LLMError::GpuError(format!("pv3 alloc: {e}")))?;
-            let mut attn_scratch = unsafe { self.stream.alloc::<f16>(q_dim) }
-                .map_err(|e| LLMError::GpuError(format!("pv3 alloc: {e}")))?;
-            let mut oproj_scratch = unsafe { self.stream.alloc::<f16>(hidden) }
-                .map_err(|e| LLMError::GpuError(format!("pv3 alloc: {e}")))?;
-            let mut gateup_scratch = unsafe { self.stream.alloc::<f16>(gate_up_dim) }
-                .map_err(|e| LLMError::GpuError(format!("pv3 alloc: {e}")))?;
-
-            // Split-KV scratch
-            let (max_sz, sum_sz, acc_sz) = PersistentV2Kernels::split_kv_scratch_size(
-                num_kv_heads,
-                max_splits as usize,
-                heads_per_group,
-                head_dim,
-            );
-            let split_max_buf = unsafe { self.stream.alloc::<u8>(max_sz) }
-                .map_err(|e| LLMError::GpuError(format!("pv3 split_max: {e}")))?;
-            let split_sum_buf = unsafe { self.stream.alloc::<u8>(sum_sz) }
-                .map_err(|e| LLMError::GpuError(format!("pv3 split_sum: {e}")))?;
-            let split_acc_buf = unsafe { self.stream.alloc::<u8>(acc_sz) }
-                .map_err(|e| LLMError::GpuError(format!("pv3 split_acc: {e}")))?;
-
-            // Sync flags (zeroed before each layer launch)
-            let sync_flags = self
-                .stream
-                .clone_htod(&[0i32; 6])
-                .map_err(|e| LLMError::GpuError(format!("pv3 sync: {e}")))?;
-
-            // Double-buffer residuals
-            let mut residual_a = unsafe { self.stream.alloc::<f16>(hidden) }
-                .map_err(|e| LLMError::GpuError(format!("pv3 alloc: {e}")))?;
-            let mut residual_b = unsafe { self.stream.alloc::<f16>(hidden) }
-                .map_err(|e| LLMError::GpuError(format!("pv3 alloc: {e}")))?;
-            let mut mlp_a = unsafe { self.stream.alloc::<f16>(hidden) }
-                .map_err(|e| LLMError::GpuError(format!("pv3 alloc: {e}")))?;
-            let mut mlp_b = unsafe { self.stream.alloc::<f16>(hidden) }
-                .map_err(|e| LLMError::GpuError(format!("pv3 alloc: {e}")))?;
+            self.ensure_persistent_v3_scratch(max_splits as usize)?;
+            let mut scratch_borrow = self.persistent_v3_scratch.borrow_mut();
+            let scratch = scratch_borrow
+                .as_mut()
+                .ok_or_else(|| LLMError::GpuError("persistent_v3 scratch missing".into()))?;
 
             // Copy embedding into residual_a
             self.stream
-                .memcpy_dtod(embedding, &mut residual_a.slice_mut(..hidden))
+                .memcpy_dtod(embedding, &mut scratch.residual_a.slice_mut(..hidden))
                 .map_err(|e| LLMError::GpuError(format!("pv3 embed copy: {e}")))?;
 
             let max_blocks = (self.graph_max_blocks) as i32;
@@ -2764,14 +2923,14 @@ mod cuda_impl {
             let p_rope_cos = DevicePtr::device_ptr(&self.rope_cos, &self.stream).0;
             let p_rope_sin = DevicePtr::device_ptr(&self.rope_sin, &self.stream).0;
 
-            let p_qkv_scratch = DevicePtr::device_ptr(&qkv_scratch, &self.stream).0;
-            let p_attn_scratch = DevicePtr::device_ptr(&attn_scratch, &self.stream).0;
-            let p_oproj_scratch = DevicePtr::device_ptr(&oproj_scratch, &self.stream).0;
-            let p_gateup_scratch = DevicePtr::device_ptr(&gateup_scratch, &self.stream).0;
-            let p_split_max = DevicePtr::device_ptr(&split_max_buf, &self.stream).0;
-            let p_split_sum = DevicePtr::device_ptr(&split_sum_buf, &self.stream).0;
-            let p_split_acc = DevicePtr::device_ptr(&split_acc_buf, &self.stream).0;
-            let p_sync = DevicePtr::device_ptr(&sync_flags, &self.stream).0;
+            let p_qkv_scratch = DevicePtr::device_ptr(&scratch.qkv, &self.stream).0;
+            let p_attn_scratch = DevicePtr::device_ptr(&scratch.attn, &self.stream).0;
+            let p_oproj_scratch = DevicePtr::device_ptr(&scratch.oproj, &self.stream).0;
+            let p_gateup_scratch = DevicePtr::device_ptr(&scratch.gateup, &self.stream).0;
+            let p_split_max = DevicePtr::device_ptr(&scratch.split_max, &self.stream).0;
+            let p_split_sum = DevicePtr::device_ptr(&scratch.split_sum, &self.stream).0;
+            let p_split_acc = DevicePtr::device_ptr(&scratch.split_acc, &self.stream).0;
+            let p_sync = DevicePtr::device_ptr(&scratch.sync_flags, &self.stream).0;
 
             debug!(grid_blocks, smem, max_splits, "persistent_v3 launching");
 
@@ -2787,14 +2946,14 @@ mod cuda_impl {
 
                 let even = layer_idx % 2 == 0;
                 let (read_res, write_res) = if even {
-                    (&residual_a, &residual_b)
+                    (&scratch.residual_a, &scratch.residual_b)
                 } else {
-                    (&residual_b, &residual_a)
+                    (&scratch.residual_b, &scratch.residual_a)
                 };
                 let (read_mlp, write_mlp) = if even {
-                    (&mlp_a, &mlp_b)
+                    (&scratch.mlp_a, &scratch.mlp_b)
                 } else {
-                    (&mlp_b, &mlp_a)
+                    (&scratch.mlp_b, &scratch.mlp_a)
                 };
 
                 let p_prev_residual = DevicePtr::device_ptr(read_res, &self.stream).0;
@@ -2866,8 +3025,16 @@ mod cuda_impl {
 
             // After all layers: final residual is in write buffer of last layer
             let even_last = (num_layers - 1) % 2 == 0;
-            let final_residual = if even_last { &residual_b } else { &residual_a };
-            let final_mlp = if even_last { &mlp_b } else { &mlp_a };
+            let final_residual = if even_last {
+                &scratch.residual_b
+            } else {
+                &scratch.residual_a
+            };
+            let final_mlp = if even_last {
+                &scratch.mlp_b
+            } else {
+                &scratch.mlp_a
+            };
 
             // Final: fuse last residual add + RMSNorm
             let (normed_f16, _) = GpuTransformerLayer::fused_residual_rmsnorm_f16(
@@ -2881,34 +3048,7 @@ mod cuda_impl {
                 hidden,
             )?;
 
-            // LM head + argmax
-            let vocab_size = self.config.vocab_size;
-            if greedy_only {
-                let token_ids_gpu = self.gpu_fused_lm_head_argmax_f16_hidden(
-                    &normed_f16,
-                    &self.lm_head_weight,
-                    vocab_size,
-                    hidden,
-                )?;
-                let token_ids_cpu = self
-                    .stream
-                    .clone_dtoh(&token_ids_gpu)
-                    .map_err(|e| LLMError::GpuError(format!("pv3 argmax dtoh: {e}")))?;
-                return Ok(ForwardOutput::TokenIds(token_ids_cpu));
-            }
-            let logits_gpu = CudaLinearLayer::forward_f16_in(
-                &normed_f16,
-                &self.lm_head_weight,
-                1,
-                vocab_size,
-                hidden,
-                &self.blas,
-            )?;
-            let logits_cpu = self
-                .stream
-                .clone_dtoh(&logits_gpu)
-                .map_err(|e| LLMError::GpuError(format!("pv3 logits dtoh: {e}")))?;
-            Ok(ForwardOutput::Logits(logits_cpu))
+            Ok(normed_f16)
         }
 
         // ===================================================================
