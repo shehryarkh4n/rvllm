@@ -902,7 +902,8 @@ mod cuda_impl {
             let meta_packed = self.meta_packed.borrow();
             let packed_buf = meta_packed.slice();
             let offsets = self.meta_packed_offsets.get();
-            let use_scratch = num_tokens > 1 || is_prefill;
+            let path = self.resolve_forward_path(num_tokens, is_prefill);
+            let use_scratch = num_tokens > 1 || is_prefill || path == ForwardPath::Batched;
             if use_scratch {
                 self.ensure_scratch_capacity(num_tokens)?;
             }
@@ -921,8 +922,6 @@ mod cuda_impl {
                         .map_err(|e| LLMError::GpuError(format!("embed->scratch: {e}")))?;
                 }
             }
-
-            let path = self.resolve_forward_path(num_tokens, is_prefill);
 
             // === MEGAKERNEL V2: all layers in one cooperative launch (TC GEMV + split-KV) ===
             if path == ForwardPath::MegakernelV2Decode {
@@ -1270,7 +1269,7 @@ mod cuda_impl {
             let layers_to_run = max_layers.min(self.layers.len());
             let mut prev_mlp_out: Option<CudaSlice<f16>> = None;
             let path = self.resolve_forward_path(num_tokens, is_prefill);
-            let use_scratch = num_tokens > 1 || is_prefill;
+            let use_scratch = num_tokens > 1 || is_prefill || path == ForwardPath::Batched;
             if use_scratch {
                 self.ensure_scratch_capacity(num_tokens)?;
             }
@@ -1611,8 +1610,9 @@ mod cuda_impl {
                     greedy_only,
                 );
             }
-            // Double-buffered scratch for T>1 decode: zero per-layer allocations.
-            let use_scratch = num_tokens > 1 || is_prefill;
+            // Double-buffered scratch for batched decode/prefill and optional
+            // batch-1 decode experiments: zero per-layer allocations.
+            let use_scratch = num_tokens > 1 || is_prefill || path == ForwardPath::Batched;
             if use_scratch {
                 self.ensure_scratch_capacity(num_tokens)?;
             }
@@ -1869,6 +1869,13 @@ mod cuda_impl {
                 if std::env::var("RVLLM_PERSISTENT").map_or(false, |v| v == "1") {
                     return ForwardPath::PersistentDecode;
                 }
+                // Default batch-1 decode now uses the reusable batched scratch
+                // path to avoid per-layer output allocations. Set
+                // RVLLM_BATCHED_DECODE_1=0 to fall back to the legacy
+                // CublasGemvDecode / FusedDecode path family.
+                if std::env::var("RVLLM_BATCHED_DECODE_1").map_or(true, |v| v != "0") {
+                    return ForwardPath::Batched;
+                }
                 // cuBLAS decode: separate norm + cuBLAS GEMM (higher BW).
                 // Default on for normal single-token decode; set
                 // RVLLM_CUBLAS_DECODE=0 to force the legacy fused path.
@@ -1969,8 +1976,9 @@ mod cuda_impl {
                     block_size,
                 );
             }
-            // Double-buffered scratch for T>1 decode: zero per-layer allocations.
-            let use_scratch = num_tokens > 1 || is_prefill;
+            // Double-buffered scratch for batched decode/prefill and optional
+            // batch-1 decode experiments: zero per-layer allocations.
+            let use_scratch = num_tokens > 1 || is_prefill || path == ForwardPath::Batched;
             if use_scratch {
                 self.ensure_scratch_capacity(num_tokens)?;
             }

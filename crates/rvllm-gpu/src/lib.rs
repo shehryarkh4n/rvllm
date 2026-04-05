@@ -34,6 +34,8 @@ pub mod kernel_loader;
 #[cfg(all(feature = "mock-gpu", not(feature = "cuda")))]
 pub mod mock;
 pub mod nccl;
+#[cfg(feature = "cuda")]
+pub mod persistent_v2_ffi;
 pub mod pinned_memory;
 pub mod stream;
 

@@ -1708,6 +1708,7 @@ impl GpuWorker {
         padded_batch: usize,
         _greedy_only: bool,
     ) -> Result<ForwardOutput> {
+        self.ensure_pinned_output_capacity(actual_batch)?;
         let runner = self
             .gpu_model_runner
             .as_ref()
@@ -1741,13 +1742,15 @@ impl GpuWorker {
         // see the updated buffers.
         graph.replay(&self.runner_stream)?;
 
-        // Read results -- skip trim when no padding
-        let ids = runner.read_graph_output(padded_batch)?;
-        if actual_batch == padded_batch {
-            Ok(ForwardOutput::TokenIds(ids))
-        } else {
-            Ok(ForwardOutput::TokenIds(ids[..actual_batch].to_vec()))
-        }
+        let pinned = self
+            .pinned_output
+            .as_mut()
+            .ok_or_else(|| LLMError::GpuError("pinned output buffer not allocated".into()))?;
+        let dst = pinned
+            .as_mut_slice()
+            .map_err(|e| LLMError::GpuError(format!("pinned buf write: {e}")))?;
+        runner.read_graph_output_async(actual_batch, dst)?;
+        Ok(ForwardOutput::TokenIdsPending { actual_batch })
     }
 
     /// Try to capture a graph for a padded batch size.
@@ -1760,6 +1763,7 @@ impl GpuWorker {
         _greedy_only: bool,
     ) -> Result<ForwardOutput> {
         let max_context_len = model_input.attention_metadata.max_context_len;
+        self.ensure_pinned_output_capacity(actual_batch)?;
 
         let runner = self
             .gpu_model_runner
@@ -1820,9 +1824,14 @@ impl GpuWorker {
                 self.graph_runner.pool_mut().insert(graph);
                 self.graph_runner.mark_captured(padded_batch);
                 info!(padded_batch, "CUDA graph captured for padded batch");
-
-                let ids = runner.read_graph_output(padded_batch)?;
-                Ok(ForwardOutput::TokenIds(ids[..actual_batch].to_vec()))
+                let pinned = self.pinned_output.as_mut().ok_or_else(|| {
+                    LLMError::GpuError("pinned output buffer not allocated".into())
+                })?;
+                let dst = pinned
+                    .as_mut_slice()
+                    .map_err(|e| LLMError::GpuError(format!("pinned buf write: {e}")))?;
+                runner.read_graph_output_async(actual_batch, dst)?;
+                Ok(ForwardOutput::TokenIdsPending { actual_batch })
             }
             Err(e) => {
                 warn!(padded_batch, "graph capture forward failed: {e}");
@@ -1834,6 +1843,19 @@ impl GpuWorker {
                 Err(e)
             }
         }
+    }
+
+    #[cfg(feature = "cuda")]
+    fn ensure_pinned_output_capacity(&mut self, need: usize) -> Result<()> {
+        let have = self.pinned_output.as_ref().map_or(0, |b| b.len());
+        if have >= need {
+            return Ok(());
+        }
+        let alloc_len = need.max(1);
+        let buf = unsafe { self.context.alloc_pinned::<i32>(alloc_len) }
+            .map_err(|e| LLMError::GpuError(format!("pinned output alloc: {e}")))?;
+        self.pinned_output = Some(buf);
+        Ok(())
     }
 
     /// Legacy CPU forward pass removed -- f16 only, use GpuModelRunner.
