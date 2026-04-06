@@ -6,7 +6,6 @@
 
 use clap::{Parser, Subcommand};
 use rvllm_core::types::Dtype;
-use tokio_stream::StreamExt;
 use tracing::info;
 
 #[derive(Parser)]
@@ -305,6 +304,33 @@ async fn main() -> anyhow::Result<()> {
 
             #[cfg(feature = "cuda")]
             {
+                const BENCH_PROMPTS: &[&str] = &[
+                    "Explain the theory of relativity in simple terms.",
+                    "Write a Python function to sort a list of integers.",
+                    "What are the main differences between TCP and UDP?",
+                    "Describe the process of photosynthesis step by step.",
+                    "Write a short story about a robot learning to paint.",
+                    "Explain how a transformer neural network works.",
+                    "What are the advantages of Rust over C++?",
+                    "Describe the water cycle in detail.",
+                    "Write a haiku about machine learning.",
+                    "Explain the concept of recursion with an example.",
+                    "What is the difference between a stack and a queue?",
+                    "Describe how HTTPS encryption works.",
+                    "Write a SQL query to find duplicate records in a table.",
+                    "Explain the CAP theorem in distributed systems.",
+                    "What are the main principles of object-oriented programming?",
+                    "Describe the architecture of a modern CPU.",
+                    "Write a regular expression to validate email addresses.",
+                    "Explain how garbage collection works in Java.",
+                    "What is the difference between concurrency and parallelism?",
+                    "Describe the MapReduce programming model.",
+                    "Explain how a B-tree index works in databases.",
+                    "What are the trade-offs between microservices and monoliths?",
+                    "Describe the process of DNS resolution.",
+                    "Write pseudocode for the A* pathfinding algorithm.",
+                ];
+
                 // Each batch size runs as a separate process to avoid CUDA context
                 // poisoning between different graph captures.
                 if batch_sizes.len() > 1 {
@@ -352,11 +378,12 @@ async fn main() -> anyhow::Result<()> {
                             let p = rvllm_core::types::SamplingParams {
                                 temperature: 0.0,
                                 max_tokens: 5,
+                                ignore_eos: true,
                                 ..Default::default()
                             };
+                            let prompt = BENCH_PROMPTS[i % BENCH_PROMPTS.len()].to_string();
                             warmup_handles.push(tokio::spawn(async move {
-                                if let Ok((_id, mut s)) = eng.generate(format!("warm {i}"), p).await
-                                {
+                                if let Ok((_id, mut s)) = eng.generate(prompt, p).await {
                                     while s.next().await.is_some() {}
                                 }
                             }));
@@ -369,6 +396,7 @@ async fn main() -> anyhow::Result<()> {
                     let params = rvllm_core::types::SamplingParams {
                         temperature: 0.0,
                         max_tokens: output_len,
+                        ignore_eos: true,
                         ..Default::default()
                     };
 
@@ -377,7 +405,7 @@ async fn main() -> anyhow::Result<()> {
                     for i in 0..batch {
                         let eng = engine.clone();
                         let p = params.clone();
-                        let prompt = format!("Write about topic number {i}");
+                        let prompt = BENCH_PROMPTS[i % BENCH_PROMPTS.len()].to_string();
                         handles.push(tokio::spawn(async move {
                             match eng.generate(prompt, p).await {
                                 Ok((_id, mut stream)) => {
