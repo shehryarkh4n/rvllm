@@ -6,7 +6,6 @@
 
 use clap::{Parser, Subcommand};
 use rvllm_core::types::Dtype;
-use tokio_stream::StreamExt;
 use tracing::info;
 
 #[derive(Parser)]
@@ -366,16 +365,15 @@ async fn main() -> anyhow::Result<()> {
                     return Ok(()); // We handled everything via subprocesses
                 }
 
-                // Single batch size -- run directly in this process.
-                let engine = rvllm_engine::AsyncGpuLLMEngine::new(config.clone()).await?;
                 let mut results = Vec::new();
 
                 for &batch in &batch_sizes {
-                    // Warmup: fire `batch` requests to trigger graph capture at this N
+                    // Single batch size -- run directly in this process on the sync GPU engine.
+                    let mut engine = rvllm_engine::GpuLLMEngine::new(config.clone())?;
+
+                    // Warmup: run `batch` short requests to trigger graph capture at this N.
                     {
-                        let mut warmup_handles = Vec::new();
                         for i in 0..batch {
-                            let eng = engine.clone();
                             let p = rvllm_core::types::SamplingParams {
                                 temperature: 0.0,
                                 max_tokens: 5,
@@ -383,19 +381,11 @@ async fn main() -> anyhow::Result<()> {
                                 ..Default::default()
                             };
                             let prompt = BENCH_PROMPTS[i % BENCH_PROMPTS.len()].to_string();
-                            warmup_handles.push(tokio::spawn(async move {
-                                if let Ok((_id, mut s)) =
-                                    eng.generate_with_mode(prompt, p, false).await
-                                {
-                                    while s.next().await.is_some() {}
-                                }
-                            }));
+                            engine.add_request_auto_id(prompt, p)?;
                         }
-                        for h in warmup_handles {
-                            let _ = h.await;
-                        }
+                        let _ = engine.run()?;
                     }
-                    // Fire N requests concurrently
+
                     let params = rvllm_core::types::SamplingParams {
                         temperature: 0.0,
                         max_tokens: output_len,
@@ -404,41 +394,19 @@ async fn main() -> anyhow::Result<()> {
                     };
 
                     let t0 = std::time::Instant::now();
-                    let mut handles = Vec::with_capacity(batch);
                     for i in 0..batch {
-                        let eng = engine.clone();
-                        let p = params.clone();
                         let prompt = BENCH_PROMPTS[i % BENCH_PROMPTS.len()].to_string();
-                        handles.push(tokio::spawn(async move {
-                            match eng.generate_with_mode(prompt, p, false).await {
-                                Ok((_id, mut stream)) => {
-                                    let mut toks = 0usize;
-                                    while let Some(out) = stream.next().await {
-                                        if out.finished {
-                                            for c in &out.outputs {
-                                                toks += c.token_ids.len();
-                                            }
-                                        }
-                                    }
-                                    toks
-                                }
-                                Err(e) => {
-                                    eprintln!("  generate error: {e}");
-                                    0
-                                }
-                            }
-                        }));
+                        engine.add_request_auto_id(prompt, params.clone())?;
                     }
 
-                    let mut total_toks = 0usize;
-                    let mut failed = 0usize;
-                    for h in handles {
-                        match h.await {
-                            Ok(t) if t > 0 => total_toks += t,
-                            _ => failed += 1,
-                        }
-                    }
+                    let outputs = engine.run()?;
                     let elapsed = t0.elapsed();
+                    let total_toks: usize = outputs
+                        .iter()
+                        .flat_map(|out| out.outputs.iter())
+                        .map(|c| c.token_ids.len())
+                        .sum();
+                    let failed = batch.saturating_sub(outputs.len());
                     let tps = total_toks as f64 / elapsed.as_secs_f64();
 
                     if json {
