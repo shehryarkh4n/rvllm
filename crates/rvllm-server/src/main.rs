@@ -6,6 +6,7 @@
 
 use clap::{Parser, Subcommand};
 use rvllm_core::types::Dtype;
+use tokio_stream::StreamExt;
 use tracing::info;
 
 #[derive(Parser)]
@@ -383,7 +384,9 @@ async fn main() -> anyhow::Result<()> {
                             };
                             let prompt = BENCH_PROMPTS[i % BENCH_PROMPTS.len()].to_string();
                             warmup_handles.push(tokio::spawn(async move {
-                                if let Ok((_id, mut s)) = eng.generate(prompt, p).await {
+                                if let Ok((_id, mut s)) =
+                                    eng.generate_with_mode(prompt, p, false).await
+                                {
                                     while s.next().await.is_some() {}
                                 }
                             }));
@@ -407,7 +410,7 @@ async fn main() -> anyhow::Result<()> {
                         let p = params.clone();
                         let prompt = BENCH_PROMPTS[i % BENCH_PROMPTS.len()].to_string();
                         handles.push(tokio::spawn(async move {
-                            match eng.generate(prompt, p).await {
+                            match eng.generate_with_mode(prompt, p, false).await {
                                 Ok((_id, mut stream)) => {
                                     let mut toks = 0usize;
                                     while let Some(out) = stream.next().await {
