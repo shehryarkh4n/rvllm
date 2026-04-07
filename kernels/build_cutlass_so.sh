@@ -20,6 +20,8 @@ fi
 DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$DIR"
 mkdir -p "$ARCH"
+OBJ_DIR="$ARCH/obj"
+mkdir -p "$OBJ_DIR"
 
 NVCC=${NVCC:-nvcc}
 NVCC_FLAGS="-std=c++17 -arch=${ARCH}a --expt-relaxed-constexpr -O3 --use_fast_math \
@@ -52,14 +54,20 @@ fi
 OK=0
 FAIL=0
 OBJS=""
+GATE_ONLY=${RVLLM_CUTLASS_GATE_ONLY:-0}
 
 for f in cutlass_qkv_bias.cu cutlass_oproj_residual.cu cutlass_gateup_silu.cu cutlass_gemm.cu; do
     [ -f "$f" ] || continue
     stem=${f%.cu}
-    obj="/tmp/rvllm_${stem}.o"
+    obj="$OBJ_DIR/${stem}.o"
     EXTRA_FLAGS=""
     if [ "$f" = "cutlass_gateup_silu.cu" ]; then
         EXTRA_FLAGS="$GATE_DEFINES"
+    fi
+    if [ "$GATE_ONLY" = "1" ] && [ "$f" != "cutlass_gateup_silu.cu" ] && [ -f "$obj" ]; then
+        echo "  $f -> ${stem}.o ... cached"
+        OBJS="$OBJS $obj"
+        continue
     fi
     echo -n "  $f -> ${stem}.o ... "
     if $NVCC -c $NVCC_FLAGS $EXTRA_FLAGS -o "$obj" "$f" 2>/tmp/nvcc_so_${stem}.log; then
