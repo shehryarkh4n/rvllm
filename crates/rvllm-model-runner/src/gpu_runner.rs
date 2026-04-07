@@ -2144,8 +2144,12 @@ mod cuda_impl {
             for seq_idx in 0..actual {
                 let src_off = seq_idx * max_blocks;
                 let dst_off = src_off;
-                host.block_tables[dst_off..dst_off + max_blocks]
-                    .copy_from_slice(&block_tables_flat[src_off..src_off + max_blocks]);
+                for (dst, &src) in host.block_tables[dst_off..dst_off + max_blocks]
+                    .iter_mut()
+                    .zip(block_tables_flat[src_off..src_off + max_blocks].iter())
+                {
+                    *dst = src as i32;
+                }
             }
             if actual > 0 {
                 let dummy_row = &host.block_tables[..max_blocks];
