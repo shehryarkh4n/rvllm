@@ -415,12 +415,11 @@ impl Default for DecodeInputScratch {
     }
 }
 
-/// Like `prepare_decode` but reuses caller-owned scratch buffers to avoid heap allocations.
-pub fn prepare_decode_reuse(
+fn fill_decode_scratch(
     scratch: &mut DecodeInputScratch,
     metadata: &[SequenceGroupMetadata],
     block_size: usize,
-) -> Result<ModelInput> {
+) -> u32 {
     scratch.clear();
 
     // Count sequences for block_tables reuse
@@ -468,7 +467,16 @@ pub fn prepare_decode_reuse(
     let num_seqs = scratch.context_lens.len();
     scratch.query_lens.resize(num_seqs, 1);
 
-    let max_context_len = scratch.context_lens.iter().copied().max().unwrap_or(0);
+    scratch.context_lens.iter().copied().max().unwrap_or(0)
+}
+
+/// Like `prepare_decode` but reuses caller-owned scratch buffers to avoid heap allocations.
+pub fn prepare_decode_reuse(
+    scratch: &mut DecodeInputScratch,
+    metadata: &[SequenceGroupMetadata],
+    block_size: usize,
+) -> Result<ModelInput> {
+    let max_context_len = fill_decode_scratch(scratch, metadata, block_size);
 
     Ok(ModelInput {
         token_ids: scratch.token_ids.clone(),
@@ -495,7 +503,7 @@ pub fn prepare_decode_persistent_reuse(
     block_size: usize,
     max_blocks: usize,
 ) -> Result<()> {
-    let _ = prepare_decode_reuse(scratch, metadata, block_size)?;
+    fill_decode_scratch(scratch, metadata, block_size);
     scratch.rebuild_block_tables_flat(max_blocks);
     Ok(())
 }

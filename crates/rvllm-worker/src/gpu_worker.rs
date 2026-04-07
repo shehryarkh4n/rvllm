@@ -19,7 +19,8 @@ use rvllm_gpu::prelude::{CublasHandle, CudaGpuAllocator, GpuStream};
 
 use rvllm_kv_cache::CacheEngine;
 use rvllm_model_runner::gpu_runner::{
-    DecodeExecutionPlan, DecodeGraphAction, DecodeGraphRuntimeState, ForwardOutput,
+    DecodeExecutionPlan, DecodeGraphAction, DecodeGraphDispatch, DecodeGraphRuntimeState,
+    ForwardOutput,
 };
 use rvllm_model_runner::input::ModelInput;
 use rvllm_model_runner::ModelRunnerConfig;
@@ -499,6 +500,33 @@ impl GpuWorker {
     }
 
     #[cfg(feature = "cuda")]
+    fn decode_graph_dispatch(
+        &self,
+        batch: usize,
+        is_prefill: bool,
+        is_decode: bool,
+    ) -> Result<DecodeGraphDispatch> {
+        let runner = self
+            .gpu_model_runner
+            .as_ref()
+            .ok_or_else(|| LLMError::GpuError("GPU model runner not initialized".into()))?;
+        let execution = runner.decode_execution_plan(batch, is_prefill, is_decode);
+        Ok(runner.decode_graph_dispatch(
+            batch,
+            is_prefill,
+            is_decode,
+            DecodeGraphRuntimeState {
+                graphs_enabled: self.graph_runner.is_enabled(),
+                exact_graph_available: self.graph_runner.has_graph_for_exact(execution.graph_tokens),
+                warmup_complete: self.forward_count > Self::GRAPH_WARMUP_CALLS,
+                capture_attempted: self
+                    .graph_runner
+                    .was_capture_attempted(execution.graph_tokens),
+            },
+        ))
+    }
+
+    #[cfg(feature = "cuda")]
     fn try_gpu_forward_persistent_decode(
         &mut self,
         metadata: &[SequenceGroupMetadata],
@@ -513,29 +541,16 @@ impl GpuWorker {
             return Ok(None);
         }
 
-        let runner = self
-            .gpu_model_runner
-            .as_ref()
-            .ok_or_else(|| LLMError::GpuError("GPU model runner not initialized".into()))?;
-        let execution = runner.decode_execution_plan(batch, false, true);
-        let dispatch = runner.decode_graph_dispatch(
-            batch,
-            false,
-            true,
-            DecodeGraphRuntimeState {
-                graphs_enabled: self.graph_runner.is_enabled(),
-                exact_graph_available: self.graph_runner.has_graph_for_exact(execution.graph_tokens),
-                warmup_complete: self.forward_count > Self::GRAPH_WARMUP_CALLS,
-                capture_attempted: self
-                    .graph_runner
-                    .was_capture_attempted(execution.graph_tokens),
-            },
-        );
+        let dispatch = self.decode_graph_dispatch(batch, false, true)?;
         if !dispatch.execution.use_batched_v2 || matches!(dispatch.action, DecodeGraphAction::Raw)
         {
             return Ok(None);
         }
 
+        let runner = self
+            .gpu_model_runner
+            .as_ref()
+            .ok_or_else(|| LLMError::GpuError("GPU model runner not initialized".into()))?;
         input::prepare_decode_persistent_reuse(
             &mut self.decode_input_scratch,
             metadata,
@@ -1786,27 +1801,8 @@ impl GpuWorker {
         } else {
             #[cfg(feature = "cuda")]
             {
-                let runner = self
-                    .gpu_model_runner
-                    .as_ref()
-                    .ok_or_else(|| LLMError::GpuError("GPU model runner not initialized".into()))?;
-                let execution =
-                    runner.decode_execution_plan(batch, model_input.is_prefill, is_decode);
-                let dispatch = runner.decode_graph_dispatch(
-                    batch,
-                    model_input.is_prefill,
-                    is_decode,
-                    DecodeGraphRuntimeState {
-                        graphs_enabled: self.graph_runner.is_enabled(),
-                        exact_graph_available: self.graph_runner.has_graph_for_exact(
-                            execution.graph_tokens,
-                        ),
-                        warmup_complete: self.forward_count > Self::GRAPH_WARMUP_CALLS,
-                        capture_attempted: self
-                            .graph_runner
-                            .was_capture_attempted(execution.graph_tokens),
-                    },
-                );
+                let dispatch =
+                    self.decode_graph_dispatch(batch, model_input.is_prefill, is_decode)?;
 
                 match dispatch.action {
                     DecodeGraphAction::Raw => self.raw_gpu_forward_ex(model_input, greedy_only),
