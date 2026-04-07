@@ -365,6 +365,7 @@ pub struct DecodeInputScratch {
     pub slot_mapping: Vec<u32>,
     pub context_lens: Vec<u32>,
     pub block_tables: Vec<Vec<u32>>,
+    pub block_tables_flat: Vec<u32>,
     pub query_lens: Vec<u32>,
 }
 
@@ -376,6 +377,7 @@ impl DecodeInputScratch {
             slot_mapping: Vec::with_capacity(64),
             context_lens: Vec::with_capacity(64),
             block_tables: Vec::with_capacity(64),
+            block_tables_flat: Vec::with_capacity(64 * 64),
             query_lens: Vec::with_capacity(64),
         }
     }
@@ -389,7 +391,21 @@ impl DecodeInputScratch {
         for bt in &mut self.block_tables {
             bt.clear();
         }
+        self.block_tables_flat.clear();
         self.query_lens.clear();
+    }
+
+    pub fn rebuild_block_tables_flat(&mut self, max_blocks: usize) -> &[u32] {
+        let num_seqs = self.block_tables.len();
+        self.block_tables_flat.clear();
+        self.block_tables_flat.resize(num_seqs * max_blocks, 0);
+        for (seq_idx, row) in self.block_tables.iter().enumerate() {
+            let row_base = seq_idx * max_blocks;
+            for (blk_idx, &blk) in row.iter().take(max_blocks).enumerate() {
+                self.block_tables_flat[row_base + blk_idx] = blk;
+            }
+        }
+        &self.block_tables_flat
     }
 }
 
@@ -466,6 +482,22 @@ pub fn prepare_decode_reuse(
         },
         is_prefill: false,
     })
+}
+
+/// Rebuild decode scratch in-place for the persistent V2 decode path.
+///
+/// Unlike `prepare_decode_reuse`, this does not clone into a `ModelInput`.
+/// Callers consume the scratch vectors directly and rebuild the flat block-table
+/// view with a fixed row stride suitable for persistent GPU metadata buffers.
+pub fn prepare_decode_persistent_reuse(
+    scratch: &mut DecodeInputScratch,
+    metadata: &[SequenceGroupMetadata],
+    block_size: usize,
+    max_blocks: usize,
+) -> Result<()> {
+    let _ = prepare_decode_reuse(scratch, metadata, block_size)?;
+    scratch.rebuild_block_tables_flat(max_blocks);
+    Ok(())
 }
 
 fn decode_seq_len(sd: &SequenceData) -> usize {

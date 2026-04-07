@@ -1739,10 +1739,15 @@ impl GpuWorker {
 
         // Upload metadata (skip clone when no padding needed)
         if plan.use_batched_v2 {
-            runner.upload_decode_metadata_v2(
-                &model_input.token_ids,
-                &model_input.position_ids,
-                &model_input.attention_metadata,
+            self.decode_input_scratch
+                .rebuild_block_tables_flat(runner.graph_max_blocks());
+            let scratch = &self.decode_input_scratch;
+            runner.upload_decode_metadata_flat_v2(
+                &scratch.token_ids,
+                &scratch.position_ids,
+                &scratch.context_lens,
+                &scratch.block_tables_flat,
+                &scratch.slot_mapping,
                 padded_batch,
             )?;
         } else if actual_batch == padded_batch {
@@ -1814,10 +1819,15 @@ impl GpuWorker {
 
         // Warmup forward (outside capture)
         if plan.use_batched_v2 {
-            runner.upload_decode_metadata_v2(
-                &model_input.token_ids,
-                &model_input.position_ids,
-                &model_input.attention_metadata,
+            self.decode_input_scratch
+                .rebuild_block_tables_flat(runner.graph_max_blocks());
+            let scratch = &self.decode_input_scratch;
+            runner.upload_decode_metadata_flat_v2(
+                &scratch.token_ids,
+                &scratch.position_ids,
+                &scratch.context_lens,
+                &scratch.block_tables_flat,
+                &scratch.slot_mapping,
                 padded_batch,
             )?;
         } else {
@@ -1838,10 +1848,13 @@ impl GpuWorker {
 
         // Re-upload padded metadata
         if plan.use_batched_v2 {
-            runner.upload_decode_metadata_v2(
-                &model_input.token_ids,
-                &model_input.position_ids,
-                &model_input.attention_metadata,
+            let scratch = &self.decode_input_scratch;
+            runner.upload_decode_metadata_flat_v2(
+                &scratch.token_ids,
+                &scratch.position_ids,
+                &scratch.context_lens,
+                &scratch.block_tables_flat,
+                &scratch.slot_mapping,
                 padded_batch,
             )?;
         } else {

@@ -2090,6 +2090,273 @@ mod cuda_impl {
             Ok(())
         }
 
+        pub fn upload_decode_metadata_v2_flat(
+            &self,
+            token_ids: &[u32],
+            positions: &[u32],
+            query_lens: &[u32],
+            context_lens: &[u32],
+            slot_mapping: &[u32],
+            block_tables_flat: &[u32],
+            padded_batch: usize,
+        ) -> Result<()> {
+            let actual = token_ids.len();
+            let padded = padded_batch.max(actual);
+            let max_blocks = self.graph_max_blocks;
+            let expected_bt_len = actual * max_blocks;
+            if block_tables_flat.len() < expected_bt_len {
+                return Err(LLMError::GpuError(format!(
+                    "decode v2 flat block tables too short: have {}, need {}",
+                    block_tables_flat.len(),
+                    expected_bt_len
+                )));
+            }
+
+            let bt_len = padded * max_blocks;
+            let token_ids_off = 0usize;
+            let positions_off = token_ids_off + padded;
+            let context_lens_off = positions_off + padded;
+            let block_tables_off = context_lens_off + padded;
+            let slot_mapping_off = block_tables_off + bt_len;
+            let seq_start_pos_off = slot_mapping_off + padded;
+            let total_len = seq_start_pos_off + padded + 1;
+
+            let dummy_ctx = context_lens.first().copied().unwrap_or(1) as i32;
+            let mut host = self.decode_meta_v2_state.borrow_mut();
+            host.resize(padded, max_blocks);
+
+            host.token_ids.fill(0);
+            for (dst, &src) in host.token_ids.iter_mut().zip(token_ids.iter()) {
+                *dst = src as i32;
+            }
+
+            host.positions.fill(0);
+            for (dst, &src) in host.positions.iter_mut().zip(positions.iter()) {
+                *dst = src as i32;
+            }
+
+            host.context_lens.fill(dummy_ctx);
+            for (dst, &src) in host.context_lens.iter_mut().zip(context_lens.iter()) {
+                *dst = src as i32;
+            }
+
+            host.block_tables.fill(0);
+            for seq_idx in 0..actual {
+                let src_off = seq_idx * max_blocks;
+                let dst_off = src_off;
+                host.block_tables[dst_off..dst_off + max_blocks]
+                    .copy_from_slice(&block_tables_flat[src_off..src_off + max_blocks]);
+            }
+            if actual > 0 {
+                let dummy_row = &host.block_tables[..max_blocks];
+                for seq_idx in actual..padded {
+                    let dst_off = seq_idx * max_blocks;
+                    host.block_tables[dst_off..dst_off + max_blocks].copy_from_slice(dummy_row);
+                }
+            }
+
+            host.slot_mapping.fill(0);
+            for (dst, &src) in host.slot_mapping.iter_mut().zip(slot_mapping.iter()) {
+                *dst = src as i32;
+            }
+
+            let mut seq_pos = 0i32;
+            for idx in 0..padded {
+                host.seq_start_pos[idx] = seq_pos;
+                seq_pos += query_lens.get(idx).copied().unwrap_or(1) as i32;
+            }
+            host.seq_start_pos[padded] = seq_pos;
+
+            self.persistent_decode_meta
+                .ensure_len(padded, max_blocks, &self.stream)
+                .map_err(|e| LLMError::GpuError(format!("decode v2 persistent meta alloc: {e}")))?;
+
+            self.persistent_decode_meta
+                .token_ids
+                .borrow_mut()
+                .upload(&host.token_ids, &self.stream)
+                .map_err(|e| LLMError::GpuError(format!("decode v2 token_ids HtoD: {e}")))?;
+            self.persistent_decode_meta
+                .positions
+                .borrow_mut()
+                .upload(&host.positions, &self.stream)
+                .map_err(|e| LLMError::GpuError(format!("decode v2 positions HtoD: {e}")))?;
+            self.persistent_decode_meta
+                .context_lens
+                .borrow_mut()
+                .upload(&host.context_lens, &self.stream)
+                .map_err(|e| LLMError::GpuError(format!("decode v2 context_lens HtoD: {e}")))?;
+            self.persistent_decode_meta
+                .block_tables
+                .borrow_mut()
+                .upload(&host.block_tables, &self.stream)
+                .map_err(|e| LLMError::GpuError(format!("decode v2 block_tables HtoD: {e}")))?;
+            self.persistent_decode_meta
+                .slot_mapping
+                .borrow_mut()
+                .upload(&host.slot_mapping, &self.stream)
+                .map_err(|e| LLMError::GpuError(format!("decode v2 slot_mapping HtoD: {e}")))?;
+            self.persistent_decode_meta
+                .seq_start_pos
+                .borrow_mut()
+                .upload(&host.seq_start_pos, &self.stream)
+                .map_err(|e| LLMError::GpuError(format!("decode v2 seq_start_pos HtoD: {e}")))?;
+
+            let mut meta = self.meta_packed.borrow_mut();
+            meta.ensure_len(total_len, &self.stream)
+                .map_err(|e| LLMError::GpuError(format!("decode v2 meta alloc: {e}")))?;
+            let packed = meta.buf.as_mut().expect("meta_packed allocated");
+
+            {
+                let src = self.persistent_decode_meta.token_ids.borrow();
+                self.stream
+                    .memcpy_dtod(
+                        src.slice(),
+                        &mut packed.slice_mut(token_ids_off..token_ids_off + padded),
+                    )
+                    .map_err(|e| LLMError::GpuError(format!("decode v2 token_ids DtoD: {e}")))?;
+            }
+            {
+                let src = self.persistent_decode_meta.positions.borrow();
+                self.stream
+                    .memcpy_dtod(
+                        src.slice(),
+                        &mut packed.slice_mut(positions_off..positions_off + padded),
+                    )
+                    .map_err(|e| LLMError::GpuError(format!("decode v2 positions DtoD: {e}")))?;
+            }
+            {
+                let src = self.persistent_decode_meta.context_lens.borrow();
+                self.stream
+                    .memcpy_dtod(
+                        src.slice(),
+                        &mut packed.slice_mut(context_lens_off..context_lens_off + padded),
+                    )
+                    .map_err(|e| LLMError::GpuError(format!("decode v2 context_lens DtoD: {e}")))?;
+            }
+            {
+                let src = self.persistent_decode_meta.block_tables.borrow();
+                self.stream
+                    .memcpy_dtod(
+                        src.slice(),
+                        &mut packed.slice_mut(block_tables_off..block_tables_off + bt_len),
+                    )
+                    .map_err(|e| LLMError::GpuError(format!("decode v2 block_tables DtoD: {e}")))?;
+            }
+            {
+                let src = self.persistent_decode_meta.slot_mapping.borrow();
+                self.stream
+                    .memcpy_dtod(
+                        src.slice(),
+                        &mut packed.slice_mut(slot_mapping_off..slot_mapping_off + padded),
+                    )
+                    .map_err(|e| LLMError::GpuError(format!("decode v2 slot_mapping DtoD: {e}")))?;
+            }
+            {
+                let src = self.persistent_decode_meta.seq_start_pos.borrow();
+                self.stream
+                    .memcpy_dtod(
+                        src.slice(),
+                        &mut packed.slice_mut(seq_start_pos_off..seq_start_pos_off + padded + 1),
+                    )
+                    .map_err(|e| LLMError::GpuError(format!("decode v2 seq_start_pos DtoD: {e}")))?;
+            }
+
+            self.meta_packed_offsets.set(PackedMetaOffsets {
+                token_ids: token_ids_off,
+                positions: positions_off,
+                context_lens: context_lens_off,
+                block_tables: block_tables_off,
+                slot_mapping: slot_mapping_off,
+                seq_start_pos: seq_start_pos_off,
+                num_token_ids: padded,
+                num_positions: padded,
+                num_context_lens: padded,
+                num_block_tables: bt_len,
+                num_slot_mapping: padded,
+                num_seq_start_pos: padded + 1,
+            });
+
+            Ok(())
+        }
+
+        pub fn upload_decode_metadata_flat_v2(
+            &self,
+            token_ids: &[u32],
+            positions: &[u32],
+            context_lens: &[u32],
+            block_tables_flat: &[u32],
+            slot_mapping: &[u32],
+            padded_batch: usize,
+        ) -> Result<()> {
+            let actual = token_ids.len();
+            let padded = padded_batch.max(actual);
+            let max_blocks = self.graph_max_blocks;
+            let bt_len = padded * max_blocks;
+            let token_ids_off = 0usize;
+            let positions_off = token_ids_off + padded;
+            let context_lens_off = positions_off + padded;
+            let block_tables_off = context_lens_off + padded;
+            let slot_mapping_off = block_tables_off + bt_len;
+            let seq_start_pos_off = slot_mapping_off + padded;
+            let total_len = seq_start_pos_off + padded + 1;
+
+            let dummy_ctx = context_lens.first().copied().unwrap_or(1) as i32;
+
+            let mut scratch = self.cpu_scratch.borrow_mut();
+            scratch.clear();
+            scratch.resize(total_len, 0i32);
+
+            for (idx, &tok) in token_ids.iter().enumerate() {
+                scratch[token_ids_off + idx] = tok as i32;
+            }
+            for (idx, &pos) in positions.iter().enumerate() {
+                scratch[positions_off + idx] = pos as i32;
+            }
+            for idx in 0..padded {
+                scratch[context_lens_off + idx] = context_lens
+                    .get(idx)
+                    .copied()
+                    .map(|v| v as i32)
+                    .unwrap_or(dummy_ctx);
+            }
+            for idx in 0..block_tables_flat.len().min(bt_len) {
+                scratch[block_tables_off + idx] = block_tables_flat[idx] as i32;
+            }
+            for (idx, &slot) in slot_mapping.iter().enumerate().take(padded) {
+                scratch[slot_mapping_off + idx] = slot as i32;
+            }
+            for idx in 0..=padded {
+                scratch[seq_start_pos_off + idx] = idx as i32;
+            }
+
+            self.meta_packed
+                .borrow_mut()
+                .upload(&scratch, &self.stream)
+                .map_err(|e| LLMError::GpuError(format!("decode flat v2 packed metadata HtoD: {e}")))?;
+
+            self.meta_packed_offsets.set(PackedMetaOffsets {
+                token_ids: token_ids_off,
+                positions: positions_off,
+                context_lens: context_lens_off,
+                block_tables: block_tables_off,
+                slot_mapping: slot_mapping_off,
+                seq_start_pos: seq_start_pos_off,
+                num_token_ids: padded,
+                num_positions: padded,
+                num_context_lens: padded,
+                num_block_tables: bt_len,
+                num_slot_mapping: padded,
+                num_seq_start_pos: padded + 1,
+            });
+
+            Ok(())
+        }
+
+        pub fn graph_max_blocks(&self) -> usize {
+            self.graph_max_blocks
+        }
+
         /// Run the forward pass using already-uploaded metadata buffers.
         ///
         /// Call `upload_metadata()` first. This method does NOT upload metadata --
@@ -2402,6 +2669,10 @@ mod cuda_impl {
         pub fn graph_capture_supported(&self, num_tokens: usize, is_prefill: bool) -> bool {
             self.forward_execution_plan(num_tokens, is_prefill)
                 .graph_capture_supported
+        }
+
+        pub fn graph_max_blocks(&self) -> usize {
+            self.graph_max_blocks
         }
 
         /// Get cublasLt reference (None when feature is off).
@@ -4230,6 +4501,24 @@ mod mock_impl {
             Err(LLMError::GpuError(
                 "GpuModelRunner requires the `cuda` feature".into(),
             ))
+        }
+
+        pub fn upload_decode_metadata_flat_v2(
+            &self,
+            _token_ids: &[u32],
+            _positions: &[u32],
+            _context_lens: &[u32],
+            _block_tables_flat: &[u32],
+            _slot_mapping: &[u32],
+            _padded_batch: usize,
+        ) -> Result<()> {
+            Err(LLMError::GpuError(
+                "GpuModelRunner requires the `cuda` feature".into(),
+            ))
+        }
+
+        pub fn graph_max_blocks(&self) -> usize {
+            0
         }
 
         pub fn upload_metadata(
