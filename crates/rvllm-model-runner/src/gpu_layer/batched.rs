@@ -369,8 +369,8 @@ impl GpuTransformerLayer {
         }
 
         // 6. Attention
-        let attn_out = if input.is_prefill {
-            Self::prefill_attention_f16io(
+        let owned_attn_out = if input.is_prefill {
+            Some(Self::prefill_attention_f16io(
                 &self.stream,
                 &self.loader,
                 &scratch.qkv.slice(..q_end),
@@ -386,9 +386,9 @@ impl GpuTransformerLayer {
                 head_dim,
                 input.max_context_len,
                 input.block_size,
-            )?
+            )?)
         } else {
-            Self::decode_attention_f16io(
+            Self::decode_attention_f16io_into(
                 &self.stream,
                 &self.loader,
                 &scratch.qkv.slice(..q_end),
@@ -403,11 +403,14 @@ impl GpuTransformerLayer {
                 head_dim,
                 input.max_context_len,
                 input.block_size,
-            )?
+                scratch.attn_out,
+            )?;
+            None
         };
+        let attn_out = owned_attn_out.as_ref().unwrap_or(&*scratch.attn_out);
 
         if dbg {
-            dbg_dump("attn_out", &attn_out, &self.stream);
+            dbg_dump("attn_out", attn_out, &self.stream);
         }
         if profile_enabled {
             mark_phase(|t| &mut t.attn)?;

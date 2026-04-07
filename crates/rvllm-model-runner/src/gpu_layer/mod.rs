@@ -1032,8 +1032,56 @@ mod inner {
             max_context_len: u32,
             block_size: usize,
         ) -> Result<CudaSlice<f16>> {
+            let out_len = num_tokens * num_heads * head_dim;
+            let mut output = unsafe { stream.alloc::<f16>(out_len) }
+                .map_err(|e| LLMError::GpuError(format!("v3 output alloc: {e}")))?;
+            Self::decode_attention_f16io_into(
+                stream,
+                loader,
+                q,
+                key_cache,
+                value_cache,
+                block_tables,
+                context_lens,
+                num_tokens,
+                num_seqs,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                max_context_len,
+                block_size,
+                &mut output,
+            )?;
+            Ok(output)
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub(crate) fn decode_attention_f16io_into(
+            stream: &Arc<CudaStream>,
+            loader: &KernelLoader,
+            q: &CudaView<'_, f16>,
+            key_cache: &CudaSlice<f16>,
+            value_cache: &CudaSlice<f16>,
+            block_tables: &CudaView<'_, i32>,
+            context_lens: &CudaView<'_, i32>,
+            num_tokens: usize,
+            num_seqs: usize,
+            num_heads: usize,
+            num_kv_heads: usize,
+            head_dim: usize,
+            max_context_len: u32,
+            block_size: usize,
+            output: &mut CudaSlice<f16>,
+        ) -> Result<()> {
             const DECODE_TILE_TOKENS: usize = 64;
             let out_len = num_tokens * num_heads * head_dim;
+            if output.len() < out_len {
+                return Err(LLMError::GpuError(format!(
+                    "decode_attention_f16io_into output too small: have {}, need {}",
+                    output.len(),
+                    out_len
+                )));
+            }
             let scale = 1.0f32 / (head_dim as f32).sqrt();
             let p_num_heads = num_heads as i32;
             let p_num_kv_heads = num_kv_heads as i32;
@@ -1076,6 +1124,7 @@ mod inner {
                     stream,
                     loader,
                     &v3_gqa,
+                    output,
                     q,
                     key_cache,
                     value_cache,
@@ -1093,7 +1142,6 @@ mod inner {
                     num_heads,
                     num_kv_heads,
                     head_dim,
-                    out_len,
                     shared_mem_bytes,
                     V3_THREADS,
                     true,
@@ -1121,6 +1169,7 @@ mod inner {
                     stream,
                     loader,
                     &v3_kernel,
+                    output,
                     q,
                     key_cache,
                     value_cache,
@@ -1138,7 +1187,6 @@ mod inner {
                     num_heads,
                     num_kv_heads,
                     head_dim,
-                    out_len,
                     shared_mem_bytes,
                     V3_THREADS,
                     false,
@@ -1157,6 +1205,7 @@ mod inner {
             stream: &Arc<CudaStream>,
             loader: &KernelLoader,
             kernel: &cudarc::driver::CudaFunction,
+            output: &mut CudaSlice<f16>,
             q: &CudaView<'_, f16>,
             key_cache: &CudaSlice<f16>,
             value_cache: &CudaSlice<f16>,
@@ -1174,14 +1223,11 @@ mod inner {
             num_heads: usize,
             num_kv_heads: usize,
             head_dim: usize,
-            out_len: usize,
             shared_mem_bytes: u32,
             threads: u32,
             is_gqa: bool,
-        ) -> Result<CudaSlice<f16>> {
+        ) -> Result<()> {
             let grid_y = if is_gqa { num_kv_heads } else { num_heads };
-            let mut output = unsafe { stream.alloc::<f16>(out_len) }
-                .map_err(|e| LLMError::GpuError(format!("v3 output alloc: {e}")))?;
 
             if num_splits == 1 {
                 let dummy = unsafe { stream.alloc::<f32>(1) }
@@ -1214,7 +1260,7 @@ mod inner {
                         .launch(cfg)
                         .map_err(|e| LLMError::GpuError(format!("v3 decode: {e}")))?;
                 }
-                return Ok(output);
+                return Ok(());
             }
 
             // Multi-split: workspace + combine kernel
@@ -1279,7 +1325,7 @@ mod inner {
                     .map_err(|e| LLMError::GpuError(format!("v3 combine: {e}")))?;
             }
 
-            Ok(output)
+            Ok(())
         }
 
         /// Fused SiLU*mul on a contiguous [gate || up] buffer.
