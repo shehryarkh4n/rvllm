@@ -32,6 +32,7 @@ use rvllm_core::prelude::{
     use rvllm_sequence::{Sequence, SequenceData, SequenceGroupMetadata, SequenceStatus};
     use rvllm_tokenizer::Tokenizer;
     use rvllm_worker::gpu_worker::{GpuWorker, GpuWorkerOutput};
+    use rvllm_worker::input::DecodeBatchDescriptor;
 
     use rvllm_speculative::{SelfDraftModel, SpeculativeConfig, SpeculativeEngine, TargetModel};
 
@@ -288,6 +289,7 @@ use rvllm_core::prelude::{
         worker: GpuWorker,
         tokenizer: Tokenizer,
         requests: HashMap<RequestId, EngineRequest>,
+        decode_batch: DecodeBatchDescriptor,
         next_request_id: std::sync::Arc<AtomicU64>,
         next_seq_id: u64,
         /// Shared queue for new requests arriving during GPU compute.
@@ -300,6 +302,7 @@ use rvllm_core::prelude::{
     pub struct StepPending {
         pub scheduled_groups: Vec<ScheduledSequenceGroup>,
         pub metadata: Vec<SequenceGroupMetadata>,
+        pub use_decode_batch: bool,
         /// Async batch size from execute_launch (Some = async DtoH pending).
         pub actual_batch: Option<usize>,
     }
@@ -328,6 +331,22 @@ use rvllm_core::prelude::{
             if let Some(dst) = req.decode_block_tables.get_mut(seq_idx) {
                 *dst = block_table;
             }
+        }
+
+        fn all_greedy_scheduled(&self, groups: &[ScheduledSequenceGroup]) -> bool {
+            groups.iter().all(|scheduled| {
+                self.requests
+                    .get(&scheduled.seq_group.request_id)
+                    .map(|req| {
+                        let p = &req.sampling_params;
+                        p.temperature == 0.0
+                            && matches!(p.response_format, ResponseFormat::Text)
+                            && p.repetition_penalty == 1.0
+                            && p.frequency_penalty == 0.0
+                            && p.presence_penalty == 0.0
+                    })
+                    .unwrap_or(false)
+            })
         }
 
         pub fn new(config: EngineConfig) -> Result<Self> {
@@ -479,6 +498,7 @@ use rvllm_core::prelude::{
                 worker,
                 tokenizer,
                 requests: HashMap::new(),
+                decode_batch: DecodeBatchDescriptor::new(),
                 next_request_id: std::sync::Arc::new(AtomicU64::new(1)),
                 next_seq_id: 0,
                 request_queue: None,
@@ -598,7 +618,7 @@ use rvllm_core::prelude::{
         /// launched, None if nothing to schedule. GPU computes asynchronously
         /// after this returns (~60us for graph replay path).
         pub fn step_launch(&mut self) -> Result<Option<StepPending>> {
-            let (scheduled_groups, metadata, aborted_seqs) = match self.prepare_step() {
+            let (scheduled_groups, metadata, aborted_seqs, use_decode_batch) = match self.prepare_step() {
                 Some(v) => v,
                 None => return Ok(None),
             };
@@ -621,12 +641,16 @@ use rvllm_core::prelude::{
             // Launch worker (returns quickly for async graph replay path)
             let actual_batch = self
                 .worker
-                .execute_launch(&metadata)
+                .execute_launch_with_decode_batch(
+                    &metadata,
+                    use_decode_batch.then_some(&self.decode_batch),
+                )
                 .map_err(|e| LLMError::GpuError(format!("worker launch failed: {e}")))?;
 
             Ok(Some(StepPending {
                 scheduled_groups,
                 metadata,
+                use_decode_batch,
                 actual_batch,
             }))
         }
@@ -641,7 +665,11 @@ use rvllm_core::prelude::{
 
             let worker_outputs = self
                 .worker
-                .execute_collect(pending.actual_batch, &pending.metadata)
+                .execute_collect_with_decode_batch(
+                    pending.actual_batch,
+                    &pending.metadata,
+                    pending.use_decode_batch.then_some(&self.decode_batch),
+                )
                 .map_err(|e| LLMError::GpuError(format!("worker collect failed: {e}")))?;
 
             let results = self.process_worker_outputs(&pending.scheduled_groups, &worker_outputs);
@@ -695,7 +723,7 @@ use rvllm_core::prelude::{
         ) -> Result<Vec<RequestOutput>> {
             let prof = std::env::var("RVLLM_PROFILE").is_ok();
             let ts = std::time::Instant::now();
-            let (scheduled_groups, metadata, aborted_seqs) = match self.prepare_step() {
+            let (scheduled_groups, metadata, aborted_seqs, use_decode_batch) = match self.prepare_step() {
                 Some(v) => v,
                 None => {
                     during_gpu();
@@ -722,7 +750,11 @@ use rvllm_core::prelude::{
             let tg = std::time::Instant::now();
             let worker_outputs = self
                 .worker
-                .execute_with_overlap(&metadata, during_gpu)
+                .execute_with_overlap_and_decode_batch(
+                    &metadata,
+                    use_decode_batch.then_some(&self.decode_batch),
+                    during_gpu,
+                )
                 .map_err(|e| LLMError::GpuError(format!("worker execute failed: {e}")))?;
             let t_gpu = tg.elapsed();
 
@@ -761,7 +793,7 @@ use rvllm_core::prelude::{
         }
 
         pub fn step_old(&mut self) -> Result<Vec<RequestOutput>> {
-            let (scheduled_groups, metadata, aborted_seqs) = match self.prepare_step() {
+            let (scheduled_groups, metadata, aborted_seqs, use_decode_batch) = match self.prepare_step() {
                 Some(v) => v,
                 None => return Ok(Vec::new()),
             };
@@ -783,7 +815,10 @@ use rvllm_core::prelude::{
 
             let worker_outputs = self
                 .worker
-                .execute(&metadata)
+                .execute_with_decode_batch(
+                    &metadata,
+                    use_decode_batch.then_some(&self.decode_batch),
+                )
                 .map_err(|e| LLMError::GpuError(format!("worker execute failed: {e}")))?;
             trace!(
                 num_outputs = worker_outputs.outputs.len(),
@@ -829,7 +864,7 @@ use rvllm_core::prelude::{
         }
 
         fn step_count_tokens_only(&mut self) -> Result<(usize, usize)> {
-            let (scheduled_groups, metadata, aborted_seqs) = match self.prepare_step() {
+            let (scheduled_groups, metadata, aborted_seqs, use_decode_batch) = match self.prepare_step() {
                 Some(v) => v,
                 None => return Ok((0, 0)),
             };
@@ -851,7 +886,10 @@ use rvllm_core::prelude::{
 
             let worker_outputs = self
                 .worker
-                .execute(&metadata)
+                .execute_with_decode_batch(
+                    &metadata,
+                    use_decode_batch.then_some(&self.decode_batch),
+                )
                 .map_err(|e| LLMError::GpuError(format!("worker execute failed: {e}")))?;
             self.process_worker_outputs_count_only(&scheduled_groups, &worker_outputs)
         }
@@ -864,6 +902,7 @@ use rvllm_core::prelude::{
             Vec<ScheduledSequenceGroup>,
             Vec<SequenceGroupMetadata>,
             std::collections::HashSet<SequenceId>,
+            bool,
         )> {
             let scheduled = self.scheduler.schedule().ok()?;
             debug!(
@@ -877,16 +916,28 @@ use rvllm_core::prelude::{
             }
 
             let scheduled_groups = scheduled.scheduled_seq_groups;
-            let (metadata, aborted_seqs) = self.build_metadata(&scheduled_groups);
+            let use_decode_batch = scheduled_groups.iter().all(|g| !g.is_prefill)
+                && self.all_greedy_scheduled(&scheduled_groups);
+            let (metadata, aborted_seqs) = if use_decode_batch {
+                (Vec::new(), self.build_decode_batch_descriptor(&scheduled_groups))
+            } else {
+                self.build_metadata(&scheduled_groups)
+            };
             if metadata.is_empty() {
-                return None;
+                if !use_decode_batch || self.decode_batch.seq_ids.is_empty() {
+                    return None;
+                }
             }
 
             trace!(
-                num_groups = metadata.len(),
+                num_groups = if use_decode_batch {
+                    self.decode_batch.seq_ids.len()
+                } else {
+                    metadata.len()
+                },
                 "pipelined: submitting to GPU thread"
             );
-            Some((scheduled_groups, metadata, aborted_seqs))
+            Some((scheduled_groups, metadata, aborted_seqs, use_decode_batch))
         }
 
         /// Process worker outputs: update scheduler, build request outputs,
@@ -1173,6 +1224,106 @@ use rvllm_core::prelude::{
         /// Build per-group metadata with block allocation.  Returns the
         /// metadata list plus a set of sequence IDs that were aborted because
         /// blocks could not be allocated.
+        fn build_decode_batch_descriptor(
+            &mut self,
+            groups: &[ScheduledSequenceGroup],
+        ) -> std::collections::HashSet<SequenceId> {
+            self.decode_batch.clear();
+            let mut aborted_seqs: std::collections::HashSet<SequenceId> =
+                std::collections::HashSet::new();
+
+            for scheduled in groups {
+                let group = &scheduled.seq_group;
+                for (seq_idx, seq) in group.sequences.iter().enumerate() {
+                    if seq.is_finished() {
+                        continue;
+                    }
+
+                    let decode_seq_data = self
+                        .requests
+                        .get(&group.request_id)
+                        .and_then(|req| req.decode_seq_data.get(seq_idx).cloned());
+                    let (existing, from_scheduler_fallback) = if let Some(cached) = self
+                        .requests
+                        .get(&group.request_id)
+                        .and_then(|req| req.decode_block_tables.get(seq_idx))
+                        .filter(|bt| !bt.is_empty())
+                        .cloned()
+                    {
+                        (Some(cached), false)
+                    } else {
+                        (self.scheduler.get_block_table(seq.seq_id), true)
+                    };
+
+                    let Some(existing) = existing else {
+                        warn!(
+                            seq_id = seq.seq_id.0,
+                            "missing block table for scheduled decode sequence"
+                        );
+                        let _ = self
+                            .scheduler
+                            .finish_seq(seq.seq_id, SequenceStatus::FinishedAborted);
+                        aborted_seqs.insert(seq.seq_id);
+                        continue;
+                    };
+
+                    if from_scheduler_fallback {
+                        if let Some(req) = self.requests.get_mut(&group.request_id) {
+                            Self::sync_decode_block_table(req, seq_idx, existing.clone());
+                        }
+                    }
+
+                    let seq_data = decode_seq_data.unwrap_or_else(|| {
+                        let seq_len = seq.prompt_token_ids.len() + seq.output_token_ids.len();
+                        let last_token_id = seq
+                            .output_token_ids
+                            .last()
+                            .or_else(|| seq.prompt_token_ids.last())
+                            .copied()
+                            .unwrap_or(0);
+                        SequenceData {
+                            prompt_token_ids: Vec::new(),
+                            output_token_ids: Vec::new(),
+                            cumulative_logprob: seq.cumulative_logprob,
+                            seq_len: seq_len as u32,
+                            last_token_id,
+                        }
+                    });
+
+                    let seq_len = seq_data.seq_len as usize;
+                    let block_idx = (seq_len.saturating_sub(1)) / self.config.cache.block_size;
+                    let block_offset =
+                        (seq_len.saturating_sub(1)) % self.config.cache.block_size;
+                    let slot = if block_idx < existing.len() {
+                        existing[block_idx].0 * self.config.cache.block_size as u32
+                            + block_offset as u32
+                    } else {
+                        0
+                    };
+
+                    self.decode_batch.seq_ids.push(seq.seq_id.0);
+                    self.decode_batch.token_ids.push(seq_data.last_token_id);
+                    self.decode_batch.position_ids.push(seq_len.saturating_sub(1) as u32);
+                    self.decode_batch.slot_mapping.push(slot);
+                    self.decode_batch.context_lens.push(seq_data.seq_len);
+                    self.decode_batch.query_lens.push(1);
+
+                    if self.decode_batch.block_tables.len() > self.decode_batch.seq_ids.len() - 1 {
+                        self.decode_batch.block_tables[self.decode_batch.seq_ids.len() - 1]
+                            .extend(existing.iter().map(|b| b.0));
+                    } else {
+                        self.decode_batch
+                            .block_tables
+                            .push(existing.iter().map(|b| b.0).collect());
+                    }
+                }
+            }
+            self.decode_batch
+                .block_tables
+                .truncate(self.decode_batch.seq_ids.len());
+            aborted_seqs
+        }
+
         fn build_metadata(
             &mut self,
             groups: &[ScheduledSequenceGroup],

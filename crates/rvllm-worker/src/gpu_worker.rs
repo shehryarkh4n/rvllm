@@ -634,6 +634,67 @@ impl GpuWorker {
         }
     }
 
+    fn gpu_forward_from_decode_batch_ex(
+        &mut self,
+        decode_batch: &input::DecodeBatchDescriptor,
+        greedy_only: bool,
+    ) -> Result<ForwardOutput> {
+        self.forward_count += 1;
+
+        let batch = decode_batch.token_ids.len();
+        let profile_decode = phase_profile_batches().contains(&batch);
+        #[cfg(feature = "cuda")]
+        {
+            let dispatch = self.decode_graph_dispatch(batch, false, true)?;
+            if dispatch.execution.use_batched_v2 {
+                match dispatch.action {
+                    DecodeGraphAction::Replay => {
+                        let runner =
+                            self.gpu_model_runner.as_ref().ok_or_else(|| {
+                                LLMError::GpuError("GPU model runner not initialized".into())
+                            })?;
+                        input::prepare_decode_batch_graph_reuse(
+                            &mut self.decode_input_scratch,
+                            decode_batch,
+                            runner.graph_max_blocks(),
+                        );
+                        return self.replay_decode_graph(dispatch.execution, None);
+                    }
+                    DecodeGraphAction::Capture => {
+                        let runner =
+                            self.gpu_model_runner.as_ref().ok_or_else(|| {
+                                LLMError::GpuError("GPU model runner not initialized".into())
+                            })?;
+                        input::prepare_decode_batch_graph_reuse(
+                            &mut self.decode_input_scratch,
+                            decode_batch,
+                            runner.graph_max_blocks(),
+                        );
+                        return match self.capture_decode_graph(dispatch.execution, None) {
+                            Ok(output) => Ok(output),
+                            Err(e) => {
+                                warn!(
+                                    graph_batch = dispatch.execution.graph_tokens,
+                                    "decode batch graph capture failed, falling back: {e}"
+                                );
+                                let model_input = input::model_input_from_decode_batch(decode_batch);
+                                self.gpu_forward_prepared_ex(&model_input, greedy_only)
+                            }
+                        };
+                    }
+                    DecodeGraphAction::Raw => {}
+                }
+            }
+        }
+
+        let model_input = input::model_input_from_decode_batch(decode_batch);
+        if profile_decode {
+            self.profiled_gpu_forward_ex(&model_input, greedy_only)
+        } else {
+            self.gpu_forward_prepared_ex(&model_input, greedy_only)
+        }
+    }
+
     /// Convenience constructor from EngineConfig and model path.
     pub fn from_engine_config(
         model_path: &str,
@@ -1487,11 +1548,25 @@ impl GpuWorker {
     /// Call `execute_collect` to sync and get results.
     /// Returns None if nothing to launch (empty metadata or non-graph path).
     pub fn execute_launch(&mut self, metadata: &[SequenceGroupMetadata]) -> Result<Option<usize>> {
+        self.execute_launch_with_decode_batch(metadata, None)
+    }
+
+    pub fn execute_launch_with_decode_batch(
+        &mut self,
+        metadata: &[SequenceGroupMetadata],
+        decode_batch: Option<&input::DecodeBatchDescriptor>,
+    ) -> Result<Option<usize>> {
         if metadata.is_empty() {
-            return Ok(None);
+            if decode_batch.is_none() {
+                return Ok(None);
+            }
         }
         let greedy_only = Self::all_greedy(metadata);
-        let fwd_output = self.gpu_forward_from_metadata_ex(metadata, greedy_only)?;
+        let fwd_output = if let Some(batch) = decode_batch {
+            self.gpu_forward_from_decode_batch_ex(batch, greedy_only)?
+        } else {
+            self.gpu_forward_from_metadata_ex(metadata, greedy_only)?
+        };
         match fwd_output {
             ForwardOutput::TokenIdsPending { actual_batch } => Ok(Some(actual_batch)),
             _ => {
@@ -1508,16 +1583,33 @@ impl GpuWorker {
         actual_batch: Option<usize>,
         metadata: &[SequenceGroupMetadata],
     ) -> Result<GpuWorkerOutput> {
+        self.execute_collect_with_decode_batch(actual_batch, metadata, None)
+    }
+
+    pub fn execute_collect_with_decode_batch(
+        &mut self,
+        actual_batch: Option<usize>,
+        metadata: &[SequenceGroupMetadata],
+        decode_batch: Option<&input::DecodeBatchDescriptor>,
+    ) -> Result<GpuWorkerOutput> {
         if let Some(batch) = actual_batch {
             // Async path: sync and read from pinned buffer
-            let outputs = self.sample_pending_tokens_from_pinned(batch, metadata)?;
+            let outputs = if let Some(decode_batch) = decode_batch {
+                self.sample_pending_tokens_from_pinned_decode(batch, decode_batch)?
+            } else {
+                self.sample_pending_tokens_from_pinned(batch, metadata)?
+            };
             return Ok(GpuWorkerOutput { outputs });
         }
         // Sync path: output was stored in pending_sync_output
         if let Some((fwd_output, _stored_meta)) = self.pending_sync_output.take() {
             let outputs = match fwd_output {
                 ForwardOutput::TokenIds(ref token_ids) => {
-                    self.sample_tokens_from_gpu_argmax(token_ids, metadata)?
+                    if let Some(decode_batch) = decode_batch {
+                        self.sample_tokens_from_gpu_argmax_decode(token_ids, decode_batch)?
+                    } else {
+                        self.sample_tokens_from_gpu_argmax(token_ids, metadata)?
+                    }
                 }
                 ForwardOutput::Logits(ref logits) => self.sample_tokens(logits, metadata)?,
                 ForwardOutput::TokenIdsPending { .. } => unreachable!(),
@@ -1537,26 +1629,49 @@ impl GpuWorker {
         metadata: &[SequenceGroupMetadata],
         during_gpu: F,
     ) -> Result<GpuWorkerOutput> {
+        self.execute_with_overlap_and_decode_batch(metadata, None, during_gpu)
+    }
+
+    pub fn execute_with_overlap_and_decode_batch<F: FnOnce()>(
+        &mut self,
+        metadata: &[SequenceGroupMetadata],
+        decode_batch: Option<&input::DecodeBatchDescriptor>,
+        during_gpu: F,
+    ) -> Result<GpuWorkerOutput> {
         if metadata.is_empty() {
-            during_gpu();
-            return Ok(GpuWorkerOutput {
-                outputs: Vec::new(),
-            });
+            if decode_batch.is_none() {
+                during_gpu();
+                return Ok(GpuWorkerOutput {
+                    outputs: Vec::new(),
+                });
+            }
         }
 
         let greedy_only = Self::all_greedy(metadata);
-        let fwd_output = self.gpu_forward_from_metadata_ex(metadata, greedy_only)?;
+        let fwd_output = if let Some(batch) = decode_batch {
+            self.gpu_forward_from_decode_batch_ex(batch, greedy_only)?
+        } else {
+            self.gpu_forward_from_metadata_ex(metadata, greedy_only)?
+        };
 
         let outputs = match fwd_output {
             ForwardOutput::TokenIdsPending { actual_batch } => {
                 // GPU is computing async. Run the overlap closure NOW.
                 during_gpu();
                 // THEN sync and read results.
-                self.sample_pending_tokens_from_pinned(actual_batch, metadata)?
+                if let Some(decode_batch) = decode_batch {
+                    self.sample_pending_tokens_from_pinned_decode(actual_batch, decode_batch)?
+                } else {
+                    self.sample_pending_tokens_from_pinned(actual_batch, metadata)?
+                }
             }
             ForwardOutput::TokenIds(ref token_ids) => {
                 during_gpu();
-                self.sample_tokens_from_gpu_argmax(token_ids, metadata)?
+                if let Some(decode_batch) = decode_batch {
+                    self.sample_tokens_from_gpu_argmax_decode(token_ids, decode_batch)?
+                } else {
+                    self.sample_tokens_from_gpu_argmax(token_ids, metadata)?
+                }
             }
             ForwardOutput::Logits(ref logits) => {
                 during_gpu();
@@ -1568,26 +1683,48 @@ impl GpuWorker {
 
     /// Execute one inference step with real GPU matmuls.
     pub fn execute(&mut self, metadata: &[SequenceGroupMetadata]) -> Result<GpuWorkerOutput> {
+        self.execute_with_decode_batch(metadata, None)
+    }
+
+    pub fn execute_with_decode_batch(
+        &mut self,
+        metadata: &[SequenceGroupMetadata],
+        decode_batch: Option<&input::DecodeBatchDescriptor>,
+    ) -> Result<GpuWorkerOutput> {
         if metadata.is_empty() {
-            return Ok(GpuWorkerOutput {
-                outputs: Vec::new(),
-            });
+            if decode_batch.is_none() {
+                return Ok(GpuWorkerOutput {
+                    outputs: Vec::new(),
+                });
+            }
         }
 
         let t_start = std::time::Instant::now();
 
         let greedy_only = Self::all_greedy(metadata);
-        let fwd_output = self.gpu_forward_from_metadata_ex(metadata, greedy_only)?;
+        let fwd_output = if let Some(batch) = decode_batch {
+            self.gpu_forward_from_decode_batch_ex(batch, greedy_only)?
+        } else {
+            self.gpu_forward_from_metadata_ex(metadata, greedy_only)?
+        };
         let t_input = t_start.elapsed();
         let t_forward = t_start.elapsed();
 
         let outputs = match fwd_output {
             ForwardOutput::TokenIds(ref token_ids) => {
-                self.sample_tokens_from_gpu_argmax(token_ids, metadata)?
+                if let Some(decode_batch) = decode_batch {
+                    self.sample_tokens_from_gpu_argmax_decode(token_ids, decode_batch)?
+                } else {
+                    self.sample_tokens_from_gpu_argmax(token_ids, metadata)?
+                }
             }
             ForwardOutput::TokenIdsPending { actual_batch } => {
                 // Async DtoH was enqueued. Sync now and read from pinned buffer.
-                self.sample_pending_tokens_from_pinned(actual_batch, metadata)?
+                if let Some(decode_batch) = decode_batch {
+                    self.sample_pending_tokens_from_pinned_decode(actual_batch, decode_batch)?
+                } else {
+                    self.sample_pending_tokens_from_pinned(actual_batch, metadata)?
+                }
             }
             ForwardOutput::Logits(ref logits) => self.sample_tokens(logits, metadata)?,
         };
@@ -1622,14 +1759,28 @@ impl GpuWorker {
         &mut self,
         metadata: &[SequenceGroupMetadata],
     ) -> Result<Option<GpuWorkerOutput>> {
+        self.execute_async_with_decode_batch(metadata, None)
+    }
+
+    pub fn execute_async_with_decode_batch(
+        &mut self,
+        metadata: &[SequenceGroupMetadata],
+        decode_batch: Option<&input::DecodeBatchDescriptor>,
+    ) -> Result<Option<GpuWorkerOutput>> {
         if metadata.is_empty() {
-            return Ok(Some(GpuWorkerOutput {
-                outputs: Vec::new(),
-            }));
+            if decode_batch.is_none() {
+                return Ok(Some(GpuWorkerOutput {
+                    outputs: Vec::new(),
+                }));
+            }
         }
 
         let greedy_only = Self::all_greedy(metadata);
-        let fwd_output = self.gpu_forward_from_metadata_ex(metadata, greedy_only)?;
+        let fwd_output = if let Some(batch) = decode_batch {
+            self.gpu_forward_from_decode_batch_ex(batch, greedy_only)?
+        } else {
+            self.gpu_forward_from_metadata_ex(metadata, greedy_only)?
+        };
 
         match fwd_output {
             ForwardOutput::TokenIdsPending { .. } => {
@@ -1637,7 +1788,11 @@ impl GpuWorker {
                 Ok(None)
             }
             ForwardOutput::TokenIds(ref token_ids) => {
-                let outputs = self.sample_tokens_from_gpu_argmax(token_ids, metadata)?;
+                let outputs = if let Some(decode_batch) = decode_batch {
+                    self.sample_tokens_from_gpu_argmax_decode(token_ids, decode_batch)?
+                } else {
+                    self.sample_tokens_from_gpu_argmax(token_ids, metadata)?
+                };
                 Ok(Some(GpuWorkerOutput { outputs }))
             }
             ForwardOutput::Logits(ref logits) => {
@@ -1656,9 +1811,23 @@ impl GpuWorker {
         &mut self,
         metadata: &[SequenceGroupMetadata],
     ) -> Result<GpuWorkerOutput> {
+        self.collect_async_output_with_decode_batch(metadata, None)
+    }
+
+    pub fn collect_async_output_with_decode_batch(
+        &mut self,
+        metadata: &[SequenceGroupMetadata],
+        decode_batch: Option<&input::DecodeBatchDescriptor>,
+    ) -> Result<GpuWorkerOutput> {
         // Determine actual batch size from metadata
-        let actual_batch: usize = metadata.iter().map(|g| g.seq_data.len()).sum();
-        let outputs = self.sample_pending_tokens_from_pinned(actual_batch, metadata)?;
+        let actual_batch = decode_batch
+            .map(|batch| batch.seq_ids.len())
+            .unwrap_or_else(|| metadata.iter().map(|g| g.seq_data.len()).sum());
+        let outputs = if let Some(decode_batch) = decode_batch {
+            self.sample_pending_tokens_from_pinned_decode(actual_batch, decode_batch)?
+        } else {
+            self.sample_pending_tokens_from_pinned(actual_batch, metadata)?
+        };
         Ok(GpuWorkerOutput { outputs })
     }
 
@@ -2187,6 +2356,27 @@ impl GpuWorker {
         self.sample_tokens_from_gpu_argmax(&slice[..actual_batch], metadata)
     }
 
+    #[cfg(feature = "cuda")]
+    fn sample_pending_tokens_from_pinned_decode(
+        &mut self,
+        actual_batch: usize,
+        decode_batch: &input::DecodeBatchDescriptor,
+    ) -> Result<Vec<GpuSamplerResult>> {
+        let runner = self
+            .gpu_model_runner
+            .as_ref()
+            .ok_or_else(|| LLMError::GpuError("GPU model runner not initialized".into()))?;
+        runner.sync_stream()?;
+        let pinned = self
+            .pinned_output
+            .as_ref()
+            .ok_or_else(|| LLMError::GpuError("pinned output buffer not allocated".into()))?;
+        let slice = pinned
+            .as_slice()
+            .map_err(|e| LLMError::GpuError(format!("pinned buf read: {e}")))?;
+        self.sample_tokens_from_gpu_argmax_decode(&slice[..actual_batch], decode_batch)
+    }
+
     #[cfg(not(feature = "cuda"))]
     fn collect_pending_tokens(&mut self, _actual_batch: usize) -> Result<Vec<i32>> {
         Err(LLMError::GpuError(
@@ -2199,6 +2389,17 @@ impl GpuWorker {
         &mut self,
         _actual_batch: usize,
         _metadata: &[SequenceGroupMetadata],
+    ) -> Result<Vec<GpuSamplerResult>> {
+        Err(LLMError::GpuError(
+            "async DtoH requires cuda feature".into(),
+        ))
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    fn sample_pending_tokens_from_pinned_decode(
+        &mut self,
+        _actual_batch: usize,
+        _decode_batch: &input::DecodeBatchDescriptor,
     ) -> Result<Vec<GpuSamplerResult>> {
         Err(LLMError::GpuError(
             "async DtoH requires cuda feature".into(),
@@ -2248,6 +2449,34 @@ impl GpuWorker {
             }
         }
 
+        Ok(results)
+    }
+
+    fn sample_tokens_from_gpu_argmax_decode(
+        &self,
+        token_ids: &[i32],
+        decode_batch: &input::DecodeBatchDescriptor,
+    ) -> Result<Vec<GpuSamplerResult>> {
+        let mut results = Vec::with_capacity(decode_batch.seq_ids.len());
+        for (idx, &seq_id) in decode_batch.seq_ids.iter().enumerate() {
+            let token_id = if idx < token_ids.len() {
+                token_ids[idx] as u32
+            } else {
+                warn!(
+                    seq_id,
+                    token_ids_len = token_ids.len(),
+                    expected_idx = idx,
+                    "argmax decode token_ids too short, producing dummy token"
+                );
+                0
+            };
+            results.push(GpuSamplerResult {
+                seq_id,
+                token_id,
+                logprob: 0.0,
+                top_logprobs: Vec::new(),
+            });
+        }
         Ok(results)
     }
 

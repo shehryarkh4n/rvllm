@@ -419,6 +419,90 @@ impl Default for DecodeInputScratch {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct DecodeBatchDescriptor {
+    pub seq_ids: Vec<u64>,
+    pub token_ids: Vec<u32>,
+    pub position_ids: Vec<u32>,
+    pub slot_mapping: Vec<u32>,
+    pub context_lens: Vec<u32>,
+    pub block_tables: Vec<Vec<u32>>,
+    pub query_lens: Vec<u32>,
+}
+
+impl DecodeBatchDescriptor {
+    pub fn new() -> Self {
+        Self {
+            seq_ids: Vec::with_capacity(64),
+            token_ids: Vec::with_capacity(64),
+            position_ids: Vec::with_capacity(64),
+            slot_mapping: Vec::with_capacity(64),
+            context_lens: Vec::with_capacity(64),
+            block_tables: Vec::with_capacity(64),
+            query_lens: Vec::with_capacity(64),
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.seq_ids.clear();
+        self.token_ids.clear();
+        self.position_ids.clear();
+        self.slot_mapping.clear();
+        self.context_lens.clear();
+        for row in &mut self.block_tables {
+            row.clear();
+        }
+        self.query_lens.clear();
+    }
+
+    pub fn max_context_len(&self) -> u32 {
+        self.context_lens.iter().copied().max().unwrap_or(0)
+    }
+}
+
+impl Default for DecodeBatchDescriptor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub fn model_input_from_decode_batch(batch: &DecodeBatchDescriptor) -> ModelInput {
+    ModelInput {
+        token_ids: batch.token_ids.clone(),
+        position_ids: batch.position_ids.clone(),
+        attention_metadata: AttentionMetadata {
+            slot_mapping: batch.slot_mapping.clone(),
+            query_lens: batch.query_lens.clone(),
+            context_lens: batch.context_lens.clone(),
+            block_tables: batch.block_tables.clone(),
+            max_context_len: batch.max_context_len(),
+        },
+        is_prefill: false,
+    }
+}
+
+pub fn prepare_decode_batch_graph_reuse(
+    scratch: &mut DecodeInputScratch,
+    batch: &DecodeBatchDescriptor,
+    max_blocks: usize,
+) {
+    scratch.clear();
+    scratch.token_ids.extend_from_slice(&batch.token_ids);
+    scratch.position_ids.extend_from_slice(&batch.position_ids);
+    scratch.slot_mapping.extend_from_slice(&batch.slot_mapping);
+    scratch.context_lens.extend_from_slice(&batch.context_lens);
+    scratch.query_lens.extend_from_slice(&batch.query_lens);
+    for (idx, row) in batch.block_tables.iter().enumerate() {
+        if idx < scratch.block_tables.len() {
+            scratch.block_tables[idx].extend_from_slice(row);
+        } else {
+            scratch.block_tables.push(row.clone());
+        }
+    }
+    scratch.block_tables.truncate(batch.block_tables.len());
+    scratch.rebuild_block_tables_flat(max_blocks);
+}
+
 fn fill_decode_scratch(
     scratch: &mut DecodeInputScratch,
     metadata: &[SequenceGroupMetadata],
