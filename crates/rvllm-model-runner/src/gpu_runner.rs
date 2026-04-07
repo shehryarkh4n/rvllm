@@ -1564,7 +1564,6 @@ mod cuda_impl {
                     },
                     self.cublaslt_ref(),
                     scratch_ref_opt.as_mut(),
-                    None,
                     self.gemm_strategy,
                     self.cutlass.as_deref(),
                 )?;
@@ -1895,7 +1894,6 @@ mod cuda_impl {
                     },
                     self.cublaslt_ref(),
                     scratch_ref_opt.as_mut(),
-                    None,
                     self.gemm_strategy,
                     self.cutlass.as_deref(),
                 )?;
@@ -2263,7 +2261,6 @@ mod cuda_impl {
                     },
                     self.cublaslt_ref(),
                     scratch_ref_opt.as_mut(),
-                    None,
                     self.gemm_strategy,
                     self.cutlass.as_deref(),
                 )?;

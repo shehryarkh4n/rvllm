@@ -103,6 +103,7 @@ impl GpuTransformerLayer {
                 info!("DEBUG L0 {label}: first5={first5:?} last5={last5:?} max={max:.4} mean={mean:.6} nan={nan} len={}", vals.len());
             }
         };
+        let profile_enabled = phase_timings.is_some();
         let mut phase_start = std::time::Instant::now();
         let mut mark_phase =
             |slot: fn(&mut BatchedLayerPhaseTimings) -> &mut std::time::Duration| -> Result<()> {
@@ -145,7 +146,7 @@ impl GpuTransformerLayer {
             )?;
             residual_from_fused = false;
         };
-        if phase_timings.is_some() {
+        if profile_enabled {
             mark_phase(|t| &mut t.pre_attn_norm)?;
         }
 
@@ -167,7 +168,7 @@ impl GpuTransformerLayer {
                 weights, blas, lt, scratch, num_tokens, qkv_dim, hidden, q_dim, kv_dim,
             )?;
         }
-        if phase_timings.is_some() {
+        if profile_enabled {
             mark_phase(|t| &mut t.qkv)?;
         }
 
@@ -228,7 +229,7 @@ impl GpuTransformerLayer {
                 )?;
             }
         }
-        if phase_timings.is_some() {
+        if profile_enabled {
             mark_phase(|t| &mut t.rope_cache)?;
         }
 
@@ -273,7 +274,7 @@ impl GpuTransformerLayer {
         if dbg {
             dbg_dump("attn_out", &attn_out, &self.stream);
         }
-        if phase_timings.is_some() {
+        if profile_enabled {
             mark_phase(|t| &mut t.attn)?;
         }
 
@@ -348,7 +349,7 @@ impl GpuTransformerLayer {
                 scratch.residual,
             )?;
         }
-        if phase_timings.is_some() {
+        if profile_enabled {
             mark_phase(|t| &mut t.oproj_norm)?;
         }
 
@@ -485,7 +486,7 @@ impl GpuTransformerLayer {
                         .map_err(|e| LLMError::GpuError(format!("silu_interleaved: {e}")))?;
                 }
             }
-            if phase_timings.is_some() {
+            if profile_enabled {
                 mark_phase(|t| &mut t.gateup_silu)?;
             }
 
@@ -503,13 +504,13 @@ impl GpuTransformerLayer {
                 weights.down_proj_fp8,
                 scratch.down,
             )?;
-            if phase_timings.is_some() {
+            if profile_enabled {
                 mark_phase(|t| &mut t.down)?;
             }
             return Ok(());
         }
 
-        if phase_timings.is_some() {
+        if profile_enabled {
             mark_phase(|t| &mut t.gateup_silu)?;
         }
         Self::hgemm_dispatch_fp8_into(
@@ -525,7 +526,7 @@ impl GpuTransformerLayer {
             weights.down_proj_fp8,
             scratch.down,
         )?;
-        if phase_timings.is_some() {
+        if profile_enabled {
             mark_phase(|t| &mut t.down)?;
         }
 
