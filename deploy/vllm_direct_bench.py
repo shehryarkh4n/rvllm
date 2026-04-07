@@ -40,7 +40,7 @@ PROMPTS = [
 ]
 
 
-def bench_concurrency(llm, sampling_params, n, max_tokens, warmup=True):
+def bench_concurrency(llm, sampling_params, n, warmup=True):
     """Benchmark at concurrency N by batching N prompts."""
     prompts = [PROMPTS[i % len(PROMPTS)] for i in range(n)]
 
@@ -57,9 +57,10 @@ def bench_concurrency(llm, sampling_params, n, max_tokens, warmup=True):
     return {
         "n": n,
         "total_tokens": total_tokens,
-        "elapsed_sec": round(elapsed, 3),
+        "elapsed_ms": round(elapsed * 1000),
         "tok_per_sec": round(tok_per_sec, 1),
         "avg_tokens_per_req": round(total_tokens / n, 1),
+        "failed": 0,
     }
 
 
@@ -71,6 +72,8 @@ def main():
     parser.add_argument("--output", default="/root/results_vllm_direct.json")
     parser.add_argument("--concurrency", type=str, default="1,4,16,32,64,128",
                         help="Comma-separated concurrency levels")
+    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--ignore-eos", action="store_true", default=True)
     args = parser.parse_args()
 
     from vllm import LLM, SamplingParams
@@ -87,8 +90,9 @@ def main():
     print(f"Model loaded in {load_time:.1f}s")
 
     sampling_params = SamplingParams(
-        temperature=0.8,
+        temperature=args.temperature,
         max_tokens=args.max_tokens,
+        ignore_eos=args.ignore_eos,
     )
 
     concurrency_levels = [int(x) for x in args.concurrency.split(",")]
@@ -100,14 +104,17 @@ def main():
     print("-" * 45)
 
     for n in concurrency_levels:
-        r = bench_concurrency(llm, sampling_params, n, args.max_tokens, warmup=(n == concurrency_levels[0]))
+        r = bench_concurrency(llm, sampling_params, n, warmup=(n == concurrency_levels[0]))
         results.append(r)
-        print(f"{r['n']:>6} | {r['tok_per_sec']:>10,.1f} | {r['total_tokens']:>8,} | {r['elapsed_sec']:>7.2f}s")
+        print(f"{r['n']:>6} | {r['tok_per_sec']:>10,.1f} | {r['total_tokens']:>8,} | {r['elapsed_ms'] / 1000:>7.2f}s")
 
     output = {
+        "engine": "vllm",
         "model": args.model,
-        "max_tokens": args.max_tokens,
+        "output_len": args.max_tokens,
         "gpu_memory_utilization": args.gpu_memory_utilization,
+        "temperature": args.temperature,
+        "ignore_eos": args.ignore_eos,
         "load_time_sec": round(load_time, 1),
         "results": results,
     }

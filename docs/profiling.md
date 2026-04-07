@@ -107,3 +107,28 @@ scp -P PORT root@HOST:/root/rvllm_prof.nsys-rep .
 ```
 
 The GUI shows a timeline view where you can see kernel overlap, stream utilization, and identify bubbles between kernel launches.
+
+## rvLLM vs vLLM comparison pipeline
+
+For a publishable side-by-side profile run, use:
+
+```bash
+scripts/profile_compare.sh \
+  --model /root/models/Qwen2.5-7B \
+  --n 1,32,64,96,128 \
+  --output-len 128 \
+  --profile-ns 1,32,64,96,128 \
+  --profile-output-len 16
+```
+
+This produces:
+
+- benchmark JSON for `rvLLM` and `vLLM 0.19`
+- `nsys` traces for both engines
+- exported kernel and memcpy summaries
+- rendered comparison artifacts:
+  - `rendered/profile_compare.svg`
+  - `rendered/profile_compare.html`
+  - `rendered/summary.json`
+
+The pipeline uses the direct-engine benchmark path for both systems, `temperature=0.0`, and `ignore_eos=true` so the throughput and profile captures stay aligned.
