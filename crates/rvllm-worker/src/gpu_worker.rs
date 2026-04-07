@@ -551,6 +551,9 @@ impl GpuWorker {
         if batch == 0 {
             return Ok(None);
         }
+        if phase_profile_batches().contains(&batch) {
+            return Ok(None);
+        }
 
         let dispatch = self.decode_graph_dispatch(batch, false, true)?;
         if !dispatch.execution.use_batched_v2 || matches!(dispatch.action, DecodeGraphAction::Raw)
