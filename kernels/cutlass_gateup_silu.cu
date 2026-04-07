@@ -113,8 +113,8 @@ using GateFusionOp = cutlass::epilogue::fusion::LinCombDeEltAct<
     ElementAccum
 >;
 
-using GateKernelSchedule = cutlass::gemm::KernelTmaWarpSpecializedCooperative;
-using GateEpilogueSchedule = cutlass::epilogue::TmaWarpSpecializedCooperative;
+using GateKernelSchedule = cutlass::gemm::KernelTmaWarpSpecialized;
+using GateEpilogueSchedule = cutlass::epilogue::TmaWarpSpecialized;
 
 using GateCollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
     cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp,
@@ -370,8 +370,12 @@ int cutlass_gate_silu_mul(
         },
         {}
     };
-    args.epilogue.ptr_C = nullptr;
-    args.epilogue.dC = {};
+    // LinCombDeEltAct is a source-supported TMA epilogue. Even with beta=0,
+    // the cooperative TMA path still expects a valid source tensor descriptor.
+    // Point C at the output tile so the descriptor is well-formed while keeping
+    // beta=0 so the source values are ignored mathematically.
+    args.epilogue.ptr_C = reinterpret_cast<const ElementC*>(output);
+    args.epilogue.dC = stride_D;
     args.epilogue.ptr_D = reinterpret_cast<ElementC*>(output);
     args.epilogue.dD = stride_D;
     args.epilogue.thread.alpha = ElementAccum(1.0f);

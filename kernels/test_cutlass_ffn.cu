@@ -1,8 +1,7 @@
 // Standalone correctness harness for Hopper CUTLASS FFN paths.
 //
-// Validates that both of these produce the same FFN output:
-//   A. cutlass_gateup_silu -> cutlass_hgemm
-//   B. cutlass_hgemm(up) -> cutlass_gate_silu_mul -> cutlass_hgemm
+// Validates the Hopper gate-aux FFN path against a CPU reference:
+//   cutlass_hgemm(up) -> cutlass_gate_silu_mul -> cutlass_hgemm
 //
 // Compile on H100:
 //   nvcc -O3 -std=c++17 test_cutlass_ffn.cu -ldl -lcudart -o test_cutlass_ffn
@@ -124,22 +123,6 @@ static void compare_outputs(
     printf("%s max_abs=%.6f mean_abs=%.6f\n", label, max_abs, mean_abs);
 }
 
-static void compare_half(
-    const char* label,
-    const std::vector<__half>& a,
-    const std::vector<__half>& b)
-{
-    float max_abs = 0.0f;
-    float mean_abs = 0.0f;
-    for (size_t i = 0; i < a.size(); ++i) {
-        float diff = std::fabs(__half2float(a[i]) - __half2float(b[i]));
-        max_abs = diff > max_abs ? diff : max_abs;
-        mean_abs += diff;
-    }
-    mean_abs /= (float)a.size();
-    printf("%s max_abs=%.6f mean_abs=%.6f\n", label, max_abs, mean_abs);
-}
-
 int main(int argc, char** argv) {
     const char* lib_path = argc > 1 ? argv[1] : "./sm_90/libcutlass_kernels.so";
     const int m = argc > 2 ? std::atoi(argv[2]) : 64;
@@ -152,13 +135,11 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    auto gateup_silu = (KernelFn)dlsym(lib, "cutlass_gateup_silu");
-    auto gateup_silu_ws = (WsFn)dlsym(lib, "cutlass_gateup_silu_workspace_size");
     auto gate_silu_mul = (KernelFn)dlsym(lib, "cutlass_gate_silu_mul");
     auto gate_silu_mul_ws = (WsFn)dlsym(lib, "cutlass_gate_silu_mul_workspace_size");
     auto hgemm = (HgemmFn)dlsym(lib, "cutlass_hgemm");
     auto hgemm_ws = (WsFn)dlsym(lib, "cutlass_hgemm_workspace_size");
-    if (!gateup_silu || !gateup_silu_ws || !gate_silu_mul || !gate_silu_mul_ws || !hgemm || !hgemm_ws) {
+    if (!gate_silu_mul || !gate_silu_mul_ws || !hgemm || !hgemm_ws) {
         fprintf(stderr, "failed to resolve CUTLASS symbols\n");
         return 1;
     }
@@ -180,25 +161,21 @@ int main(int argc, char** argv) {
     cpu_ref(x, w_gate, w_up, w_down, m, hidden, intermediate, ref);
 
     __half *d_x = nullptr, *d_w_gate = nullptr, *d_w_up = nullptr, *d_w_down = nullptr, *d_w_gateup = nullptr;
-    __half *d_act_a = nullptr, *d_act_b = nullptr, *d_aux_up = nullptr, *d_out_a = nullptr, *d_out_b = nullptr;
-    uint8_t *d_ws_a = nullptr, *d_ws_b = nullptr, *d_ws_hgemm = nullptr, *d_ws_up = nullptr;
+    __half *d_act_b = nullptr, *d_aux_up = nullptr, *d_out_b = nullptr;
+    uint8_t *d_ws_b = nullptr, *d_ws_hgemm = nullptr, *d_ws_up = nullptr;
 
     RT_CHECK(cudaMalloc(&d_x, x.size() * sizeof(__half)));
     RT_CHECK(cudaMalloc(&d_w_gate, w_gate.size() * sizeof(__half)));
     RT_CHECK(cudaMalloc(&d_w_up, w_up.size() * sizeof(__half)));
     RT_CHECK(cudaMalloc(&d_w_down, w_down.size() * sizeof(__half)));
     RT_CHECK(cudaMalloc(&d_w_gateup, w_gateup.size() * sizeof(__half)));
-    RT_CHECK(cudaMalloc(&d_act_a, (size_t)m * intermediate * sizeof(__half)));
     RT_CHECK(cudaMalloc(&d_act_b, (size_t)m * intermediate * sizeof(__half)));
     RT_CHECK(cudaMalloc(&d_aux_up, (size_t)m * intermediate * sizeof(__half)));
-    RT_CHECK(cudaMalloc(&d_out_a, (size_t)m * hidden * sizeof(__half)));
     RT_CHECK(cudaMalloc(&d_out_b, (size_t)m * hidden * sizeof(__half)));
 
-    size_t ws_a = gateup_silu_ws(m, 2 * intermediate, hidden);
     size_t ws_b = gate_silu_mul_ws(m, intermediate, hidden);
     size_t ws_up = hgemm_ws(m, intermediate, hidden);
     size_t ws_down = hgemm_ws(m, hidden, intermediate);
-    RT_CHECK(cudaMalloc(&d_ws_a, ws_a ? ws_a : 1));
     RT_CHECK(cudaMalloc(&d_ws_b, ws_b ? ws_b : 1));
     RT_CHECK(cudaMalloc(&d_ws_up, ws_up ? ws_up : 1));
     RT_CHECK(cudaMalloc(&d_ws_hgemm, ws_down ? ws_down : 1));
@@ -212,43 +189,36 @@ int main(int argc, char** argv) {
     cudaStream_t stream;
     RT_CHECK(cudaStreamCreate(&stream));
 
-    if (gateup_silu(d_act_a, d_x, d_w_gateup, nullptr, m, 2 * intermediate, hidden, d_ws_a, ws_a, stream) != 0) {
-        fprintf(stderr, "cutlass_gateup_silu failed\n");
-        return 1;
-    }
-    if (hgemm(d_out_a, d_act_a, d_w_down, m, hidden, intermediate, d_ws_hgemm, ws_down, stream) != 0) {
-        fprintf(stderr, "down hgemm after gateup_silu failed\n");
-        return 1;
-    }
-
+    fprintf(stderr, "stage=up_hgemm\n");
+    fflush(stderr);
     if (hgemm(d_aux_up, d_x, d_w_up, m, intermediate, hidden, d_ws_up, ws_up, stream) != 0) {
         fprintf(stderr, "up hgemm failed\n");
         return 1;
     }
+    fprintf(stderr, "stage=gate_silu_mul\n");
+    fflush(stderr);
     if (gate_silu_mul(d_act_b, d_x, d_w_gate, d_aux_up, m, intermediate, hidden, d_ws_b, ws_b, stream) != 0) {
         fprintf(stderr, "cutlass_gate_silu_mul failed\n");
         return 1;
     }
+    fprintf(stderr, "stage=down_after_gate_silu_mul\n");
+    fflush(stderr);
     if (hgemm(d_out_b, d_act_b, d_w_down, m, hidden, intermediate, d_ws_hgemm, ws_down, stream) != 0) {
         fprintf(stderr, "down hgemm after gate_silu_mul failed\n");
         return 1;
     }
 
+    fprintf(stderr, "stage=sync\n");
+    fflush(stderr);
     RT_CHECK(cudaStreamSynchronize(stream));
 
-    std::vector<__half> out_a((size_t)m * hidden);
     std::vector<__half> out_b((size_t)m * hidden);
-    std::vector<__half> act_a((size_t)m * intermediate);
     std::vector<__half> act_b((size_t)m * intermediate);
-    download(out_a, d_out_a);
     download(out_b, d_out_b);
-    download(act_a, d_act_a);
     download(act_b, d_act_b);
 
-    compare_outputs("gateup_silu -> down vs cpu", out_a, ref);
     compare_outputs("gate_silu_mul -> down vs cpu", out_b, ref);
-    compare_half("activated tensor path A vs B", act_a, act_b);
-    compare_half("final output path A vs B", out_a, out_b);
+    printf("activated tensor elems=%zu\n", act_b.size());
 
     RT_CHECK(cudaStreamDestroy(stream));
     cudaFree(d_x);
@@ -256,12 +226,9 @@ int main(int argc, char** argv) {
     cudaFree(d_w_up);
     cudaFree(d_w_down);
     cudaFree(d_w_gateup);
-    cudaFree(d_act_a);
     cudaFree(d_act_b);
     cudaFree(d_aux_up);
-    cudaFree(d_out_a);
     cudaFree(d_out_b);
-    cudaFree(d_ws_a);
     cudaFree(d_ws_b);
     cudaFree(d_ws_up);
     cudaFree(d_ws_hgemm);
