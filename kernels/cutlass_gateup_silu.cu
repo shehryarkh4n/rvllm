@@ -44,6 +44,37 @@ using LayoutA = cutlass::layout::RowMajor;
 using LayoutB = cutlass::layout::ColumnMajor;
 using LayoutC = cutlass::layout::RowMajor;
 
+#ifndef RVLLM_CUTLASS_GATE_TILE_M
+#define RVLLM_CUTLASS_GATE_TILE_M 128
+#endif
+
+#ifndef RVLLM_CUTLASS_GATE_TILE_N
+#define RVLLM_CUTLASS_GATE_TILE_N 256
+#endif
+
+#ifndef RVLLM_CUTLASS_GATE_TILE_K
+#define RVLLM_CUTLASS_GATE_TILE_K 64
+#endif
+
+#ifndef RVLLM_CUTLASS_GATE_CLUSTER_M
+#define RVLLM_CUTLASS_GATE_CLUSTER_M 1
+#endif
+
+#ifndef RVLLM_CUTLASS_GATE_CLUSTER_N
+#define RVLLM_CUTLASS_GATE_CLUSTER_N 2
+#endif
+
+#ifndef RVLLM_CUTLASS_GATE_CLUSTER_K
+#define RVLLM_CUTLASS_GATE_CLUSTER_K 1
+#endif
+
+#ifndef RVLLM_CUTLASS_GATE_SCHEDULE
+#define RVLLM_CUTLASS_GATE_SCHEDULE 0
+#endif
+
+#define RVLLM_CUTE_INT_(x) _##x
+#define RVLLM_CUTE_INT(x) RVLLM_CUTE_INT_(x)
+
 // ============================================================================
 // CUTLASS 3.x SM90 GEMM: optimized tile for wide N (37888)
 // 128x256x64 tile gives better N-coverage for this shape
@@ -113,12 +144,28 @@ using GateFusionOp = cutlass::epilogue::fusion::LinCombDeEltAct<
     ElementAccum
 >;
 
+using GateTileShape = Shape<
+    RVLLM_CUTE_INT(RVLLM_CUTLASS_GATE_TILE_M),
+    RVLLM_CUTE_INT(RVLLM_CUTLASS_GATE_TILE_N),
+    RVLLM_CUTE_INT(RVLLM_CUTLASS_GATE_TILE_K)
+>;
+using GateClusterShape = Shape<
+    RVLLM_CUTE_INT(RVLLM_CUTLASS_GATE_CLUSTER_M),
+    RVLLM_CUTE_INT(RVLLM_CUTLASS_GATE_CLUSTER_N),
+    RVLLM_CUTE_INT(RVLLM_CUTLASS_GATE_CLUSTER_K)
+>;
+
+#if RVLLM_CUTLASS_GATE_SCHEDULE == 1
+using GateKernelSchedule = cutlass::gemm::KernelTmaWarpSpecializedCooperative;
+using GateEpilogueSchedule = cutlass::epilogue::TmaWarpSpecializedCooperative;
+#else
 using GateKernelSchedule = cutlass::gemm::KernelTmaWarpSpecialized;
 using GateEpilogueSchedule = cutlass::epilogue::TmaWarpSpecialized;
+#endif
 
 using GateCollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
     cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp,
-    TileShape, ClusterShape,
+    GateTileShape, GateClusterShape,
     cutlass::epilogue::collective::EpilogueTileAuto,
     ElementAccum, ElementAccum,
     void, LayoutC, 8,
@@ -132,8 +179,8 @@ using GateCollectiveMainloop = typename cutlass::gemm::collective::CollectiveBui
     ElementA, LayoutA, 8,
     ElementB, LayoutB, 8,
     ElementAccum,
-    TileShape,
-    ClusterShape,
+    GateTileShape,
+    GateClusterShape,
     cutlass::gemm::collective::StageCountAutoCarveout<
         static_cast<int>(sizeof(typename GateCollectiveEpilogue::SharedStorage))>,
     GateKernelSchedule

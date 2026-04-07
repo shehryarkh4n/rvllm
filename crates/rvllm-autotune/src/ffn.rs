@@ -38,12 +38,56 @@ pub struct FfnSweepArgs {
     pub harness_timeout_s: u64,
 }
 
+#[derive(Debug, Clone, Args)]
+pub struct FfnKernelSweepArgs {
+    #[arg(long, default_value = "target/release/rvllm")]
+    pub rvllm_bin: PathBuf,
+    #[arg(long, default_value = "kernels/build_cutlass_so.sh")]
+    pub build_script: PathBuf,
+    #[arg(long, default_value = "sm_90")]
+    pub arch: String,
+    #[arg(long, default_value = "/root/cutlass")]
+    pub cutlass_dir: PathBuf,
+    #[arg(long)]
+    pub model: String,
+    #[arg(long, default_value = "1,32,64,96,128")]
+    pub n: String,
+    #[arg(long, default_value_t = 128)]
+    pub output_len: usize,
+    #[arg(long, default_value_t = 3584)]
+    pub hidden: usize,
+    #[arg(long, default_value_t = 18944)]
+    pub intermediate: usize,
+    #[arg(long)]
+    pub harness_bin: PathBuf,
+    #[arg(long)]
+    pub out_dir: Option<PathBuf>,
+    #[arg(long, default_value = "ffn-kernel-sweep")]
+    pub label: String,
+    #[arg(long, default_value_t = 20)]
+    pub harness_timeout_s: u64,
+    #[arg(long, default_value_t = false)]
+    pub skip_baseline: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FfnCandidate {
     pub name: String,
     pub batched_gemm_strategy: Option<String>,
     pub cutlass_gate_aux: Option<bool>,
     pub requires_cutlass_gate_harness: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GateBuildConfig {
+    pub name: String,
+    pub tile_m: usize,
+    pub tile_n: usize,
+    pub tile_k: usize,
+    pub cluster_m: usize,
+    pub cluster_n: usize,
+    pub cluster_k: usize,
+    pub cooperative: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,6 +117,7 @@ pub struct SweepRecord {
     pub gpu_name: Option<String>,
     pub driver_version: Option<String>,
     pub candidate: FfnCandidate,
+    pub gate_build: Option<GateBuildConfig>,
     pub n: usize,
     pub output_len: usize,
     pub hidden: usize,
@@ -86,6 +131,7 @@ pub struct SweepRecord {
 pub struct WinnerSummary {
     pub n: usize,
     pub winner: Option<FfnCandidate>,
+    pub gate_build: Option<GateBuildConfig>,
     pub tok_per_sec: Option<f64>,
 }
 
@@ -193,6 +239,7 @@ pub fn run_ffn_sweep(args: &FfnSweepArgs) -> Result<(), String> {
                 gpu_name: metadata.gpu_name.clone(),
                 driver_version: metadata.driver_version.clone(),
                 candidate: candidate.clone(),
+                gate_build: None,
                 n,
                 output_len: args.output_len,
                 hidden: args.hidden,
@@ -207,6 +254,7 @@ pub fn run_ffn_sweep(args: &FfnSweepArgs) -> Result<(), String> {
         winners.push(WinnerSummary {
             n,
             winner: best.as_ref().map(|(candidate, _)| candidate.clone()),
+            gate_build: None,
             tok_per_sec: best.as_ref().map(|(_, tok_per_sec)| *tok_per_sec),
         });
     }
@@ -236,19 +284,193 @@ pub fn run_ffn_sweep(args: &FfnSweepArgs) -> Result<(), String> {
     Ok(())
 }
 
+pub fn run_ffn_kernel_sweep(args: &FfnKernelSweepArgs) -> Result<(), String> {
+    let shapes = parse_csv_usize(&args.n)?;
+    if shapes.is_empty() {
+        return Err("shape list is empty".into());
+    }
+
+    let out_dir = args
+        .out_dir
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("results").join("autotune").join(format!("{}-{}", args.label, now_s())));
+    fs::create_dir_all(&out_dir).map_err(|e| format!("create {}: {e}", out_dir.display()))?;
+    let records_path = out_dir.join("ffn_sweep.jsonl");
+    let summary_path = out_dir.join("summary.json");
+
+    let metadata = probe_metadata();
+    let cutlass_so = built_cutlass_so_path(&args.build_script, &args.arch)?;
+    let baseline = FfnCandidate {
+        name: "default".into(),
+        batched_gemm_strategy: None,
+        cutlass_gate_aux: None,
+        requires_cutlass_gate_harness: false,
+    };
+    let gate_candidate = FfnCandidate {
+        name: "hybrid_gate_aux_on".into(),
+        batched_gemm_strategy: Some("hybrid".into()),
+        cutlass_gate_aux: Some(true),
+        requires_cutlass_gate_harness: true,
+    };
+    let configs = default_gate_build_configs();
+    let mut winners: Vec<Option<(FfnCandidate, Option<GateBuildConfig>, f64)>> =
+        vec![None; shapes.len()];
+
+    if !args.skip_baseline {
+        for (idx, &n) in shapes.iter().enumerate() {
+            let benchmark = run_benchmark_inner(
+                &args.rvllm_bin,
+                &args.model,
+                args.output_len,
+                &baseline,
+                n,
+            )?;
+            let tok = benchmark.tok_per_sec;
+            winners[idx] = Some((baseline.clone(), None, tok));
+            let record = SweepRecord {
+                timestamp_s: now_s(),
+                commit: metadata.commit.clone(),
+                hostname: metadata.hostname.clone(),
+                gpu_name: metadata.gpu_name.clone(),
+                driver_version: metadata.driver_version.clone(),
+                candidate: baseline.clone(),
+                gate_build: None,
+                n,
+                output_len: args.output_len,
+                hidden: args.hidden,
+                intermediate: args.intermediate,
+                harness: None,
+                benchmark: Some(benchmark),
+                skipped_reason: None,
+            };
+            append_jsonl(&records_path, &record)?;
+        }
+    }
+
+    for config in &configs {
+        build_gate_variant(&args.build_script, &args.arch, &args.cutlass_dir, config)?;
+
+        for (idx, &n) in shapes.iter().enumerate() {
+            let harness = run_harness(
+                &args.harness_bin,
+                &cutlass_so,
+                n,
+                args.hidden,
+                args.intermediate,
+                args.harness_timeout_s,
+            )?;
+            let skipped_reason = if harness.ok {
+                None
+            } else {
+                Some("cutlass_harness_failed".to_string())
+            };
+            let benchmark = if skipped_reason.is_none() {
+                Some(run_benchmark_inner(
+                    &args.rvllm_bin,
+                    &args.model,
+                    args.output_len,
+                    &gate_candidate,
+                    n,
+                )?)
+            } else {
+                None
+            };
+
+            if let Some(bench) = benchmark.as_ref() {
+                if bench.failed == 0 {
+                    match winners[idx].as_ref() {
+                        Some((_, _, current)) if *current >= bench.tok_per_sec => {}
+                        _ => {
+                            winners[idx] =
+                                Some((gate_candidate.clone(), Some(config.clone()), bench.tok_per_sec))
+                        }
+                    }
+                }
+            }
+
+            let record = SweepRecord {
+                timestamp_s: now_s(),
+                commit: metadata.commit.clone(),
+                hostname: metadata.hostname.clone(),
+                gpu_name: metadata.gpu_name.clone(),
+                driver_version: metadata.driver_version.clone(),
+                candidate: gate_candidate.clone(),
+                gate_build: Some(config.clone()),
+                n,
+                output_len: args.output_len,
+                hidden: args.hidden,
+                intermediate: args.intermediate,
+                harness: Some(harness),
+                benchmark,
+                skipped_reason,
+            };
+            append_jsonl(&records_path, &record)?;
+        }
+    }
+
+    let summary = SweepSummary {
+        timestamp_s: now_s(),
+        label: args.label.clone(),
+        commit: metadata.commit,
+        hostname: metadata.hostname,
+        gpu_name: metadata.gpu_name,
+        driver_version: metadata.driver_version,
+        rvllm_bin: args.rvllm_bin.display().to_string(),
+        model: args.model.clone(),
+        output_len: args.output_len,
+        hidden: args.hidden,
+        intermediate: args.intermediate,
+        shapes: shapes.clone(),
+        records_path: records_path.display().to_string(),
+        winners: shapes
+            .into_iter()
+            .enumerate()
+            .map(|(idx, n)| WinnerSummary {
+                n,
+                winner: winners[idx].as_ref().map(|(candidate, _, _)| candidate.clone()),
+                gate_build: winners[idx].as_ref().and_then(|(_, gate_build, _)| gate_build.clone()),
+                tok_per_sec: winners[idx].as_ref().map(|(_, _, tok_per_sec)| *tok_per_sec),
+            })
+            .collect(),
+    };
+    let summary_json =
+        serde_json::to_string_pretty(&summary).map_err(|e| format!("summary json: {e}"))?;
+    fs::write(&summary_path, summary_json)
+        .map_err(|e| format!("write {}: {e}", summary_path.display()))?;
+
+    println!("{}", summary_path.display());
+    Ok(())
+}
+
 fn run_benchmark(
     args: &FfnSweepArgs,
     candidate: &FfnCandidate,
     n: usize,
 ) -> Result<BenchmarkResult, String> {
-    let mut cmd = Command::new(&args.rvllm_bin);
+    run_benchmark_inner(
+        &args.rvllm_bin,
+        &args.model,
+        args.output_len,
+        candidate,
+        n,
+    )
+}
+
+fn run_benchmark_inner(
+    rvllm_bin: &Path,
+    model: &str,
+    output_len: usize,
+    candidate: &FfnCandidate,
+    n: usize,
+) -> Result<BenchmarkResult, String> {
+    let mut cmd = Command::new(rvllm_bin);
     cmd.arg("benchmark")
         .arg("--model")
-        .arg(&args.model)
+        .arg(model)
         .arg("--n")
         .arg(n.to_string())
         .arg("--output-len")
-        .arg(args.output_len.to_string())
+        .arg(output_len.to_string())
         .arg("--json");
     cmd.env_remove("RVLLM_PHASE_PROFILE_BATCHES");
     cmd.env_remove("RVLLM_BATCHED_GEMM_STRATEGY");
@@ -263,7 +485,7 @@ fn run_benchmark(
     let output = cmd.output().map_err(|e| {
         format!(
             "spawn benchmark {} for n={n}: {e}",
-            args.rvllm_bin.display()
+            rvllm_bin.display()
         )
     })?;
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -391,6 +613,71 @@ fn default_candidates() -> Vec<FfnCandidate> {
     ]
 }
 
+fn default_gate_build_configs() -> Vec<GateBuildConfig> {
+    vec![
+        GateBuildConfig {
+            name: "tile128x256x64_cluster1x2x1_ws".into(),
+            tile_m: 128,
+            tile_n: 256,
+            tile_k: 64,
+            cluster_m: 1,
+            cluster_n: 2,
+            cluster_k: 1,
+            cooperative: false,
+        },
+        GateBuildConfig {
+            name: "tile128x256x64_cluster1x2x1_coop".into(),
+            tile_m: 128,
+            tile_n: 256,
+            tile_k: 64,
+            cluster_m: 1,
+            cluster_n: 2,
+            cluster_k: 1,
+            cooperative: true,
+        },
+        GateBuildConfig {
+            name: "tile128x128x64_cluster1x2x1_ws".into(),
+            tile_m: 128,
+            tile_n: 128,
+            tile_k: 64,
+            cluster_m: 1,
+            cluster_n: 2,
+            cluster_k: 1,
+            cooperative: false,
+        },
+        GateBuildConfig {
+            name: "tile128x128x64_cluster1x1x1_ws".into(),
+            tile_m: 128,
+            tile_n: 128,
+            tile_k: 64,
+            cluster_m: 1,
+            cluster_n: 1,
+            cluster_k: 1,
+            cooperative: false,
+        },
+        GateBuildConfig {
+            name: "tile64x256x64_cluster1x2x1_ws".into(),
+            tile_m: 64,
+            tile_n: 256,
+            tile_k: 64,
+            cluster_m: 1,
+            cluster_n: 2,
+            cluster_k: 1,
+            cooperative: false,
+        },
+        GateBuildConfig {
+            name: "tile64x128x64_cluster1x1x1_ws".into(),
+            tile_m: 64,
+            tile_n: 128,
+            tile_k: 64,
+            cluster_m: 1,
+            cluster_n: 1,
+            cluster_k: 1,
+            cooperative: false,
+        },
+    ]
+}
+
 fn parse_csv_usize(value: &str) -> Result<Vec<usize>, String> {
     value
         .split(',')
@@ -453,4 +740,45 @@ fn now_s() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+fn built_cutlass_so_path(build_script: &Path, arch: &str) -> Result<PathBuf, String> {
+    let kernel_dir = build_script
+        .parent()
+        .ok_or_else(|| format!("build script has no parent: {}", build_script.display()))?;
+    Ok(kernel_dir.join(arch).join("libcutlass_kernels.so"))
+}
+
+fn build_gate_variant(
+    build_script: &Path,
+    arch: &str,
+    cutlass_dir: &Path,
+    config: &GateBuildConfig,
+) -> Result<(), String> {
+    let output = Command::new(build_script)
+        .arg(arch)
+        .arg(cutlass_dir)
+        .env("RVLLM_CUTLASS_GATE_TILE_M", config.tile_m.to_string())
+        .env("RVLLM_CUTLASS_GATE_TILE_N", config.tile_n.to_string())
+        .env("RVLLM_CUTLASS_GATE_TILE_K", config.tile_k.to_string())
+        .env("RVLLM_CUTLASS_GATE_CLUSTER_M", config.cluster_m.to_string())
+        .env("RVLLM_CUTLASS_GATE_CLUSTER_N", config.cluster_n.to_string())
+        .env("RVLLM_CUTLASS_GATE_CLUSTER_K", config.cluster_k.to_string())
+        .env(
+            "RVLLM_CUTLASS_GATE_SCHEDULE",
+            if config.cooperative { "1" } else { "0" },
+        )
+        .output()
+        .map_err(|e| format!("spawn {} for {}: {e}", build_script.display(), config.name))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "build {} failed: status={:?}\nstdout:\n{}\nstderr:\n{}",
+            config.name,
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ))
+    }
 }

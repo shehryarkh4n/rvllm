@@ -14,6 +14,8 @@ struct Cli {
 enum Command {
     /// Sweep FFN runtime candidates across decode shapes with correctness gating.
     FfnSweep(ffn::FfnSweepArgs),
+    /// Sweep Hopper gate-aux CUTLASS build configs across decode shapes.
+    FfnKernelSweep(ffn::FfnKernelSweepArgs),
 }
 
 fn main() -> Result<(), String> {
@@ -29,5 +31,6 @@ fn main() -> Result<(), String> {
     let cli = Cli::parse();
     match cli.command {
         Command::FfnSweep(args) => ffn::run_ffn_sweep(&args),
+        Command::FfnKernelSweep(args) => ffn::run_ffn_kernel_sweep(&args),
     }
 }

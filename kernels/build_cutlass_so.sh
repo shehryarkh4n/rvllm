@@ -28,7 +28,25 @@ NVCC_FLAGS="-std=c++17 -arch=${ARCH}a --expt-relaxed-constexpr -O3 --use_fast_ma
     -I${CUTLASS_DIR}/examples/45_dual_gemm \
     --compiler-options -fPIC"
 
+GATE_DEFINES=""
+for var in \
+    RVLLM_CUTLASS_GATE_TILE_M \
+    RVLLM_CUTLASS_GATE_TILE_N \
+    RVLLM_CUTLASS_GATE_TILE_K \
+    RVLLM_CUTLASS_GATE_CLUSTER_M \
+    RVLLM_CUTLASS_GATE_CLUSTER_N \
+    RVLLM_CUTLASS_GATE_CLUSTER_K \
+    RVLLM_CUTLASS_GATE_SCHEDULE; do
+    val="${!var:-}"
+    if [ -n "$val" ]; then
+        GATE_DEFINES="$GATE_DEFINES -D${var}=${val}"
+    fi
+done
+
 echo "Building CUTLASS shared library for $ARCH..."
+if [ -n "$GATE_DEFINES" ]; then
+    echo "  cutlass_gateup_silu.cu defines:$GATE_DEFINES"
+fi
 
 # Compile each .cu to an object file separately to avoid template conflicts
 OK=0
@@ -39,8 +57,12 @@ for f in cutlass_qkv_bias.cu cutlass_oproj_residual.cu cutlass_gateup_silu.cu cu
     [ -f "$f" ] || continue
     stem=${f%.cu}
     obj="/tmp/rvllm_${stem}.o"
+    EXTRA_FLAGS=""
+    if [ "$f" = "cutlass_gateup_silu.cu" ]; then
+        EXTRA_FLAGS="$GATE_DEFINES"
+    fi
     echo -n "  $f -> ${stem}.o ... "
-    if $NVCC -c $NVCC_FLAGS -o "$obj" "$f" 2>/tmp/nvcc_so_${stem}.log; then
+    if $NVCC -c $NVCC_FLAGS $EXTRA_FLAGS -o "$obj" "$f" 2>/tmp/nvcc_so_${stem}.log; then
         echo "ok"
         OBJS="$OBJS $obj"
         OK=$((OK + 1))
