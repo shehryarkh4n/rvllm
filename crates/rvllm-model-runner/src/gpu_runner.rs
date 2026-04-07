@@ -2280,83 +2280,6 @@ mod cuda_impl {
             Ok(())
         }
 
-        pub fn upload_decode_metadata_flat_v2(
-            &self,
-            token_ids: &[u32],
-            positions: &[u32],
-            context_lens: &[u32],
-            block_tables_flat: &[u32],
-            slot_mapping: &[u32],
-            padded_batch: usize,
-        ) -> Result<()> {
-            let actual = token_ids.len();
-            let padded = padded_batch.max(actual);
-            let max_blocks = self.graph_max_blocks;
-            let bt_len = padded * max_blocks;
-            let token_ids_off = 0usize;
-            let positions_off = token_ids_off + padded;
-            let context_lens_off = positions_off + padded;
-            let block_tables_off = context_lens_off + padded;
-            let slot_mapping_off = block_tables_off + bt_len;
-            let seq_start_pos_off = slot_mapping_off + padded;
-            let total_len = seq_start_pos_off + padded + 1;
-
-            let dummy_ctx = context_lens.first().copied().unwrap_or(1) as i32;
-
-            let mut scratch = self.cpu_scratch.borrow_mut();
-            scratch.clear();
-            scratch.resize(total_len, 0i32);
-
-            for (idx, &tok) in token_ids.iter().enumerate() {
-                scratch[token_ids_off + idx] = tok as i32;
-            }
-            for (idx, &pos) in positions.iter().enumerate() {
-                scratch[positions_off + idx] = pos as i32;
-            }
-            for idx in 0..padded {
-                scratch[context_lens_off + idx] = context_lens
-                    .get(idx)
-                    .copied()
-                    .map(|v| v as i32)
-                    .unwrap_or(dummy_ctx);
-            }
-            for idx in 0..block_tables_flat.len().min(bt_len) {
-                scratch[block_tables_off + idx] = block_tables_flat[idx] as i32;
-            }
-            for (idx, &slot) in slot_mapping.iter().enumerate().take(padded) {
-                scratch[slot_mapping_off + idx] = slot as i32;
-            }
-            for idx in 0..=padded {
-                scratch[seq_start_pos_off + idx] = idx as i32;
-            }
-
-            self.meta_packed
-                .borrow_mut()
-                .upload(&scratch, &self.stream)
-                .map_err(|e| LLMError::GpuError(format!("decode flat v2 packed metadata HtoD: {e}")))?;
-
-            self.meta_packed_offsets.set(PackedMetaOffsets {
-                token_ids: token_ids_off,
-                positions: positions_off,
-                context_lens: context_lens_off,
-                block_tables: block_tables_off,
-                slot_mapping: slot_mapping_off,
-                seq_start_pos: seq_start_pos_off,
-                num_token_ids: padded,
-                num_positions: padded,
-                num_context_lens: padded,
-                num_block_tables: bt_len,
-                num_slot_mapping: padded,
-                num_seq_start_pos: padded + 1,
-            });
-
-            Ok(())
-        }
-
-        pub fn graph_max_blocks(&self) -> usize {
-            self.graph_max_blocks
-        }
-
         /// Run the forward pass using already-uploaded metadata buffers.
         ///
         /// Call `upload_metadata()` first. This method does NOT upload metadata --
@@ -4501,24 +4424,6 @@ mod mock_impl {
             Err(LLMError::GpuError(
                 "GpuModelRunner requires the `cuda` feature".into(),
             ))
-        }
-
-        pub fn upload_decode_metadata_flat_v2(
-            &self,
-            _token_ids: &[u32],
-            _positions: &[u32],
-            _context_lens: &[u32],
-            _block_tables_flat: &[u32],
-            _slot_mapping: &[u32],
-            _padded_batch: usize,
-        ) -> Result<()> {
-            Err(LLMError::GpuError(
-                "GpuModelRunner requires the `cuda` feature".into(),
-            ))
-        }
-
-        pub fn graph_max_blocks(&self) -> usize {
-            0
         }
 
         pub fn upload_metadata(
