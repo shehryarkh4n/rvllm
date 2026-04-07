@@ -1119,11 +1119,6 @@ use rvllm_core::prelude::{
 
             for scheduled in groups {
                 let group = &scheduled.seq_group;
-                let decode_fast_path = self
-                    .requests
-                    .get(&group.request_id)
-                    .map(|req| matches!(req.sampling_params.response_format, ResponseFormat::Text))
-                    .unwrap_or(false);
                 let prompt_len = group.prompt_len();
                 let is_prompt = scheduled.is_prefill;
                 let chunk_end = if is_prompt {
@@ -1173,7 +1168,7 @@ use rvllm_core::prelude::{
                                     .copied()
                                     .unwrap_or(0),
                             }
-                        } else if decode_fast_path {
+                        } else {
                             let seq_len = seq.prompt_token_ids.len() + seq.output_token_ids.len();
                             let last_token_id = seq
                                 .output_token_ids
@@ -1187,20 +1182,6 @@ use rvllm_core::prelude::{
                                 cumulative_logprob: seq.cumulative_logprob,
                                 seq_len: seq_len as u32,
                                 last_token_id,
-                            }
-                        } else {
-                            SequenceData {
-                                prompt_token_ids: seq.prompt_token_ids.clone(),
-                                output_token_ids: seq.output_token_ids.clone(),
-                                cumulative_logprob: seq.cumulative_logprob,
-                                seq_len: (seq.prompt_token_ids.len() + seq.output_token_ids.len())
-                                    as u32,
-                                last_token_id: seq
-                                    .output_token_ids
-                                    .last()
-                                    .or_else(|| seq.prompt_token_ids.last())
-                                    .copied()
-                                    .unwrap_or(0),
                             }
                         },
                     );
