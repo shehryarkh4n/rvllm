@@ -228,6 +228,9 @@ mod cuda_impl {
         pub max_tokens: usize,
         pub qkv: CudaSlice<f16>,      // [max_tokens * qkv_dim]
         pub attn_out: CudaSlice<f16>, // [max_tokens * q_dim]
+        pub attn_split_out: CudaSlice<f32>, // [max_splits * max_tokens * q_dim]
+        pub attn_split_max: CudaSlice<f32>, // [max_splits * max_tokens * num_heads]
+        pub attn_split_sum: CudaSlice<f32>, // [max_splits * max_tokens * num_heads]
         pub o_proj: CudaSlice<f16>,   // [max_tokens * hidden]
         pub normed: CudaSlice<f16>,   // [max_tokens * hidden]
         pub gate_up: CudaSlice<f16>,  // [max_tokens * intermediate * 2]
@@ -258,6 +261,7 @@ mod cuda_impl {
     }
 
     const DEFAULT_F16_SCRATCH_TOKENS: usize = 512;
+    const MAX_DECODE_ATTENTION_SPLITS: usize = 16;
 
     struct DecodePhaseProfileSummary {
         target_bucket: usize,
@@ -951,6 +955,10 @@ mod cuda_impl {
                 unsafe { self.stream.alloc::<f16>(n) }
                     .map_err(|e| LLMError::GpuError(format!("f16 scratch alloc ({n} elems): {e}")))
             };
+            let alloc_f32 = |n: usize| -> Result<CudaSlice<f32>> {
+                unsafe { self.stream.alloc::<f32>(n.max(1)) }
+                    .map_err(|e| LLMError::GpuError(format!("f32 scratch alloc ({n} elems): {e}")))
+            };
             let alloc_u8 = |n: usize| -> Result<CudaSlice<u8>> {
                 unsafe { self.stream.alloc::<u8>(n.max(1)) }
                     .map_err(|e| LLMError::GpuError(format!("u8 scratch alloc ({n} elems): {e}")))
@@ -970,6 +978,9 @@ mod cuda_impl {
                 max_tokens,
                 qkv: alloc(max_tokens * qkv_dim)?,
                 attn_out: alloc(max_tokens * q_dim)?,
+                attn_split_out: alloc_f32(MAX_DECODE_ATTENTION_SPLITS * max_tokens * q_dim)?,
+                attn_split_max: alloc_f32(MAX_DECODE_ATTENTION_SPLITS * max_tokens * self.config.num_heads)?,
+                attn_split_sum: alloc_f32(MAX_DECODE_ATTENTION_SPLITS * max_tokens * self.config.num_heads)?,
                 o_proj: alloc(max_tokens * hidden)?,
                 normed: alloc(max_tokens * hidden)?,
                 gate_up: alloc(max_tokens * intermediate * 2)?,
@@ -1257,6 +1268,9 @@ mod cuda_impl {
                             residual: write_res,
                             qkv: &mut s.qkv,
                             attn_out: &mut s.attn_out,
+                            attn_split_out: &mut s.attn_split_out,
+                            attn_split_max: &mut s.attn_split_max,
+                            attn_split_sum: &mut s.attn_split_sum,
                             o_proj: &mut s.o_proj,
                             gate_up: &mut s.gate_up,
                             gateup_ws: &mut s.gateup_ws,
@@ -1664,6 +1678,9 @@ mod cuda_impl {
                                 residual: write_res,
                                 qkv: &mut s.qkv,
                                 attn_out: &mut s.attn_out,
+                                attn_split_out: &mut s.attn_split_out,
+                                attn_split_max: &mut s.attn_split_max,
+                                attn_split_sum: &mut s.attn_split_sum,
                                 o_proj: &mut s.o_proj,
                                 gate_up: &mut s.gate_up,
                                 gateup_ws: &mut s.gateup_ws,

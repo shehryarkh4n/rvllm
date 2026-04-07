@@ -93,6 +93,9 @@ mod inner {
         pub residual: &'a mut CudaSlice<f16>,
         pub qkv: &'a mut CudaSlice<f16>,
         pub attn_out: &'a mut CudaSlice<f16>,
+        pub attn_split_out: &'a mut CudaSlice<f32>,
+        pub attn_split_max: &'a mut CudaSlice<f32>,
+        pub attn_split_sum: &'a mut CudaSlice<f32>,
         pub o_proj: &'a mut CudaSlice<f16>,
         pub gate_up: &'a mut CudaSlice<f16>,
         pub gateup_ws: &'a mut CudaSlice<u8>,
@@ -1051,6 +1054,9 @@ mod inner {
                 max_context_len,
                 block_size,
                 &mut output,
+                None,
+                None,
+                None,
             )?;
             Ok(output)
         }
@@ -1072,6 +1078,9 @@ mod inner {
             max_context_len: u32,
             block_size: usize,
             output: &mut CudaSlice<f16>,
+            partial_out: Option<&mut CudaSlice<f32>>,
+            partial_max: Option<&mut CudaSlice<f32>>,
+            partial_sum: Option<&mut CudaSlice<f32>>,
         ) -> Result<()> {
             const DECODE_TILE_TOKENS: usize = 64;
             let out_len = num_tokens * num_heads * head_dim;
@@ -1263,14 +1272,58 @@ mod inner {
                 return Ok(());
             }
 
-            // Multi-split: workspace + combine kernel
             let ws_size = (num_splits as usize) * num_seqs * num_heads;
-            let mut p_out = unsafe { stream.alloc::<f32>(ws_size * head_dim) }
-                .map_err(|e| LLMError::GpuError(format!("v3 p_out: {e}")))?;
-            let mut p_max = unsafe { stream.alloc::<f32>(ws_size) }
-                .map_err(|e| LLMError::GpuError(format!("v3 p_max: {e}")))?;
-            let mut p_sum = unsafe { stream.alloc::<f32>(ws_size) }
-                .map_err(|e| LLMError::GpuError(format!("v3 p_sum: {e}")))?;
+            let mut owned_p_out = None;
+            let mut owned_p_max = None;
+            let mut owned_p_sum = None;
+            let p_out: &mut CudaSlice<f32> = if let Some(buf) = partial_out {
+                if buf.len() < ws_size * head_dim {
+                    return Err(LLMError::GpuError(format!(
+                        "decode attention split_out too small: have {}, need {}",
+                        buf.len(),
+                        ws_size * head_dim
+                    )));
+                }
+                buf
+            } else {
+                owned_p_out = Some(
+                    unsafe { stream.alloc::<f32>(ws_size * head_dim) }
+                        .map_err(|e| LLMError::GpuError(format!("v3 p_out: {e}")))?,
+                );
+                owned_p_out.as_mut().unwrap()
+            };
+            let p_max: &mut CudaSlice<f32> = if let Some(buf) = partial_max {
+                if buf.len() < ws_size {
+                    return Err(LLMError::GpuError(format!(
+                        "decode attention split_max too small: have {}, need {}",
+                        buf.len(),
+                        ws_size
+                    )));
+                }
+                buf
+            } else {
+                owned_p_max = Some(
+                    unsafe { stream.alloc::<f32>(ws_size) }
+                        .map_err(|e| LLMError::GpuError(format!("v3 p_max: {e}")))?,
+                );
+                owned_p_max.as_mut().unwrap()
+            };
+            let p_sum: &mut CudaSlice<f32> = if let Some(buf) = partial_sum {
+                if buf.len() < ws_size {
+                    return Err(LLMError::GpuError(format!(
+                        "decode attention split_sum too small: have {}, need {}",
+                        buf.len(),
+                        ws_size
+                    )));
+                }
+                buf
+            } else {
+                owned_p_sum = Some(
+                    unsafe { stream.alloc::<f32>(ws_size) }
+                        .map_err(|e| LLMError::GpuError(format!("v3 p_sum: {e}")))?,
+                );
+                owned_p_sum.as_mut().unwrap()
+            };
 
             let cfg = LaunchConfig {
                 grid_dim: (num_seqs as u32, grid_y as u32, num_splits as u32),
@@ -1281,9 +1334,9 @@ mod inner {
                 stream
                     .launch_builder(kernel)
                     .arg(&mut *output)
-                    .arg(&mut p_out)
-                    .arg(&mut p_max)
-                    .arg(&mut p_sum)
+                    .arg(&mut *p_out)
+                    .arg(&mut *p_max)
+                    .arg(&mut *p_sum)
                     .arg(q)
                     .arg(key_cache)
                     .arg(value_cache)
@@ -1309,9 +1362,9 @@ mod inner {
                 stream
                     .launch_builder(&combine)
                     .arg(&mut *output)
-                    .arg(&p_out)
-                    .arg(&p_max)
-                    .arg(&p_sum)
+                    .arg(&*p_out)
+                    .arg(&*p_max)
+                    .arg(&*p_sum)
                     .arg(context_lens)
                     .arg(&p_num_seqs)
                     .arg(&p_num_heads)

@@ -404,6 +404,9 @@ impl GpuTransformerLayer {
                 input.max_context_len,
                 input.block_size,
                 scratch.attn_out,
+                Some(scratch.attn_split_out),
+                Some(scratch.attn_split_max),
+                Some(scratch.attn_split_sum),
             )?;
             None
         };
