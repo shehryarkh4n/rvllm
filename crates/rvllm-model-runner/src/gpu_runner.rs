@@ -1113,7 +1113,7 @@ mod cuda_impl {
                 let (key_cache, value_cache) = &gpu_cache[layer_idx];
 
                 // Double-buffer: even layers write A read B, odd write B read A.
-                let use_double_buf = use_scratch && scratch_borrow.is_some();
+                let use_double_buf = plan.use_scratch && scratch_borrow.is_some();
                 let (scratch_ref_opt, hs_ref, pmo_ref): (
                     Option<LayerScratchRef<'_>>,
                     &CudaSlice<f16>,
