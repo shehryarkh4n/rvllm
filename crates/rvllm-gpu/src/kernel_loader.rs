@@ -182,6 +182,7 @@ static KERNEL_FUNCTIONS: &[(&str, &[&str])] = &[
         "fused_lm_head_argmax_f16",
         &["fused_lm_head_argmax_f16_kernel"],
     ),
+    ("argmax_f16", &["argmax_f16_kernel"]),
 ];
 
 /// Wrapper for a raw CUmodule loaded from cubin bytes.

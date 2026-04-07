@@ -1502,10 +1502,11 @@ mod cuda_impl {
             } else {
                 None
             };
-            if num_tokens == 1 && greedy_only {
-                let token_ids_gpu = self.gpu_fused_lm_head_argmax_f16_hidden(
+            if greedy_only {
+                let token_ids_gpu = self.gpu_greedy_lm_head_argmax_f16_hidden(
                     &normed_f16,
                     &self.lm_head_weight,
+                    num_tokens,
                     vocab_size,
                     hidden_size,
                 )?;
@@ -1532,22 +1533,6 @@ mod cuda_impl {
                 hidden_size,
                 &self.blas,
             )?;
-
-            if greedy_only {
-                let token_ids_gpu = self.gpu_argmax(&logits_gpu, num_tokens, vocab_size)?;
-                let token_ids_cpu = self
-                    .stream
-                    .clone_dtoh(&token_ids_gpu)
-                    .map_err(|e| LLMError::GpuError(format!("argmax DtoH: {e}")))?;
-                if let Some(summary) = phase_profile.as_mut() {
-                    self.stream
-                        .synchronize()
-                        .map_err(|e| LLMError::GpuError(format!("phase profile sync: {e}")))?;
-                    summary.lm_head_ns = lm_head_start.unwrap().elapsed().as_nanos() as u64;
-                    summary.log(num_tokens, num_layers);
-                }
-                return Ok(ForwardOutput::TokenIds(token_ids_cpu));
-            }
 
             let logits_cpu = self
                 .stream
@@ -2516,11 +2501,12 @@ mod cuda_impl {
             };
             drop(scratch_borrow);
 
-            // LM head + argmax: f16 hidden -> fused argmax
-            if num_tokens == 1 && greedy_only {
-                let token_ids_gpu = self.gpu_fused_lm_head_argmax_f16_hidden(
+            // LM head + argmax
+            if greedy_only {
+                let token_ids_gpu = self.gpu_greedy_lm_head_argmax_f16_hidden(
                     &normed_f16,
                     &self.lm_head_weight,
+                    num_tokens,
                     vocab_size,
                     hidden_size,
                 )?;
@@ -2540,15 +2526,6 @@ mod cuda_impl {
                 hidden_size,
                 &self.blas,
             )?;
-
-            if greedy_only {
-                let token_ids_gpu = self.gpu_argmax(&logits_gpu, num_tokens, vocab_size)?;
-                let token_ids_cpu = self
-                    .stream
-                    .clone_dtoh(&token_ids_gpu)
-                    .map_err(|e| LLMError::GpuError(format!("argmax DtoH: {e}")))?;
-                return Ok(ForwardOutput::TokenIds(token_ids_cpu));
-            }
 
             let logits_cpu = self
                 .stream
@@ -2977,38 +2954,14 @@ mod cuda_impl {
             };
             drop(scratch_borrow);
 
-            if num_tokens == 1 {
-                let token_ids_gpu = self.gpu_fused_lm_head_argmax_f16_hidden(
-                    &normed_f16,
-                    &self.lm_head_weight,
-                    vocab_size,
-                    hidden_size,
-                )?;
-                self.write_graph_output(&token_ids_gpu, num_tokens)?;
-            } else {
-                let logits_gpu = CudaLinearLayer::forward_f16_in(
-                    &normed_f16,
-                    &self.lm_head_weight,
-                    num_tokens,
-                    vocab_size,
-                    hidden_size,
-                    &self.blas,
-                )?;
-                let mut out = self.graph_output.borrow_mut();
-                let dst = out.as_mut().ok_or_else(|| {
-                    LLMError::GpuError(
-                        "graph_output not preallocated -- call prepare_for_graph_capture first"
-                            .into(),
-                    )
-                })?;
-                if dst.len() < num_tokens {
-                    return Err(LLMError::GpuError(format!(
-                        "graph_output too small for {num_tokens} tokens (have {})",
-                        dst.len()
-                    )));
-                }
-                self.gpu_argmax_into(&logits_gpu, dst, num_tokens, vocab_size)?;
-            }
+            let token_ids_gpu = self.gpu_greedy_lm_head_argmax_f16_hidden(
+                &normed_f16,
+                &self.lm_head_weight,
+                num_tokens,
+                vocab_size,
+                hidden_size,
+            )?;
+            self.write_graph_output(&token_ids_gpu, num_tokens)?;
 
             Ok(())
         }
@@ -3128,6 +3081,110 @@ mod cuda_impl {
             }
 
             Ok(())
+        }
+
+        fn gpu_argmax_f16(
+            &self,
+            logits_gpu: &CudaSlice<f16>,
+            num_tokens: usize,
+            vocab_size: usize,
+        ) -> Result<CudaSlice<i32>> {
+            let output: CudaSlice<i32> = self
+                .stream
+                .alloc_zeros::<i32>(num_tokens)
+                .map_err(|e| LLMError::GpuError(format!("argmax_f16 alloc: {e}")))?;
+            self.gpu_argmax_f16_into(logits_gpu, &output, num_tokens, vocab_size)?;
+            Ok(output)
+        }
+
+        fn gpu_argmax_f16_into(
+            &self,
+            logits_gpu: &CudaSlice<f16>,
+            output: &CudaSlice<i32>,
+            num_tokens: usize,
+            vocab_size: usize,
+        ) -> Result<()> {
+            let kernel = self.loader.get_func("argmax_f16", "argmax_f16_kernel")?;
+
+            let block_dim = vocab_size.min(1024) as u32;
+            let cfg = LaunchConfig {
+                grid_dim: (num_tokens as u32, 1, 1),
+                block_dim: (block_dim, 1, 1),
+                shared_mem_bytes: 0,
+            };
+
+            unsafe {
+                self.stream
+                    .launch_builder(&kernel)
+                    .arg(logits_gpu)
+                    .arg(output)
+                    .arg(&(vocab_size as i32))
+                    .launch(cfg)
+                    .map_err(|e| LLMError::GpuError(format!("argmax_f16_kernel launch: {e}")))?;
+            }
+
+            Ok(())
+        }
+
+        fn gpu_greedy_lm_head_argmax_f16_hidden(
+            &self,
+            hidden_state_f16: &CudaSlice<f16>,
+            weight: &CudaSlice<f16>,
+            num_tokens: usize,
+            vocab_size: usize,
+            hidden_size: usize,
+        ) -> Result<CudaSlice<i32>> {
+            if num_tokens == 1 {
+                return self.gpu_fused_lm_head_argmax_f16_hidden(
+                    hidden_state_f16,
+                    weight,
+                    vocab_size,
+                    hidden_size,
+                );
+            }
+
+            let mut logits_f16 = unsafe { self.stream.alloc::<f16>(num_tokens * vocab_size) }
+                .map_err(|e| LLMError::GpuError(format!("lm_head f16 logits alloc: {e}")))?;
+            self.blas.hgemm(
+                num_tokens,
+                vocab_size,
+                hidden_size,
+                f16::ONE,
+                hidden_state_f16,
+                weight,
+                f16::ZERO,
+                &mut logits_f16,
+            )?;
+
+            let token_ids_gpu = self.gpu_argmax_f16(&logits_f16, num_tokens, vocab_size)?;
+
+            if std::env::var("RVLLM_VALIDATE_BATCHED_LM_HEAD").map_or(false, |v| v == "1") {
+                let logits_f32 = CudaLinearLayer::forward_f16_in(
+                    hidden_state_f16,
+                    weight,
+                    num_tokens,
+                    vocab_size,
+                    hidden_size,
+                    &self.blas,
+                )?;
+                let token_ids_ref = self.gpu_argmax(&logits_f32, num_tokens, vocab_size)?;
+                let got = self
+                    .stream
+                    .clone_dtoh(&token_ids_gpu)
+                    .map_err(|e| LLMError::GpuError(format!("lm_head validate got dtoh: {e}")))?;
+                let expected = self.stream.clone_dtoh(&token_ids_ref).map_err(|e| {
+                    LLMError::GpuError(format!("lm_head validate ref dtoh: {e}"))
+                })?;
+                if got != expected {
+                    return Err(LLMError::GpuError(format!(
+                        "batched lm_head argmax mismatch: got {:?} expected {:?}",
+                        &got[..got.len().min(8)],
+                        &expected[..expected.len().min(8)]
+                    )));
+                }
+            }
+
+            Ok(token_ids_gpu)
         }
 
         /// Fused LM-head matvec + argmax for single-token greedy decode (f16 weights).
@@ -3660,9 +3717,10 @@ mod cuda_impl {
             // LM head + argmax
             let vocab_size = self.config.vocab_size;
             if greedy_only {
-                let token_ids_gpu = self.gpu_fused_lm_head_argmax_f16_hidden(
+                let token_ids_gpu = self.gpu_greedy_lm_head_argmax_f16_hidden(
                     &normed_f16,
                     &self.lm_head_weight,
+                    1,
                     vocab_size,
                     hidden,
                 )?;
@@ -3715,9 +3773,10 @@ mod cuda_impl {
             let vocab_size = self.config.vocab_size;
             let hidden = self.config.hidden_size;
             if greedy_only {
-                let token_ids_gpu = self.gpu_fused_lm_head_argmax_f16_hidden(
+                let token_ids_gpu = self.gpu_greedy_lm_head_argmax_f16_hidden(
                     &normed_f16,
                     &self.lm_head_weight,
+                    num_tokens,
                     vocab_size,
                     hidden,
                 )?;
@@ -3762,9 +3821,10 @@ mod cuda_impl {
                 max_context_len,
                 block_size,
             )?;
-            let token_ids_gpu = self.gpu_fused_lm_head_argmax_f16_hidden(
+            let token_ids_gpu = self.gpu_greedy_lm_head_argmax_f16_hidden(
                 &normed_f16,
                 &self.lm_head_weight,
+                num_tokens,
                 self.config.vocab_size,
                 self.config.hidden_size,
             )?;
