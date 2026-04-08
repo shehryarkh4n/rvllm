@@ -18,6 +18,15 @@ def parse_num(value: str) -> float:
     return float(value)
 
 
+def estimate_legend_width(labeled: list[dict]) -> int:
+    if not labeled:
+        return 900
+    longest = max(len(f"[{i}] {item['title']}") for i, item in enumerate(labeled, start=1))
+    # Monospace 11px text ends up around 6.5-7 px per glyph in the exported renders.
+    estimated = int(longest * 6.8) + 70
+    return max(760, min(980, estimated))
+
+
 def main() -> int:
     if len(sys.argv) != 3:
         print("usage: make_flagged_flamegraph.py INPUT.svg OUTPUT.svg", file=sys.stderr)
@@ -32,10 +41,6 @@ def main() -> int:
 
     orig_width = int(float(root.attrib["width"]))
     orig_height = int(float(root.attrib["height"]))
-    legend_width = 2200
-    new_width = orig_width + legend_width
-    legend_x = orig_width + 30
-
     labeled = []
     for g in frames.findall(q("g")):
         text = g.find(q("text"))
@@ -56,6 +61,10 @@ def main() -> int:
         )
 
     labeled.sort(key=lambda item: (item["y"], item["x"], item["title"]))
+
+    legend_width = estimate_legend_width(labeled)
+    new_width = orig_width + legend_width
+    legend_x = orig_width + 24
 
     root.set("width", str(new_width))
     root.set("viewBox", f"0 0 {new_width} {orig_height}")
