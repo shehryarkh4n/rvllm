@@ -4,11 +4,11 @@
   "output_len": 128,
   "results": [
     {
-      "elapsed_ms": 964,
+      "elapsed_ms": 11576,
       "failed": 0,
       "n": 64,
-      "tok_per_sec": 8496.9,
-      "total_tokens": 8192
+      "tok_per_sec": 8491.6,
+      "total_tokens": 98304
     }
   ]
 }
