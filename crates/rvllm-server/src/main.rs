@@ -372,13 +372,6 @@ async fn main() -> anyhow::Result<()> {
                     return Ok(()); // We handled everything via subprocesses
                 }
 
-                let flamegraph_guard = flamegraph_out.as_ref().map(|_| {
-                    pprof::ProfilerGuardBuilder::default()
-                        .frequency(999)
-                        .blocklist(&["libc", "libgcc", "pthread", "vdso"])
-                        .build()
-                }).transpose()?;
-
                 let mut results = Vec::new();
 
                 for &batch in &batch_sizes {
@@ -406,6 +399,13 @@ async fn main() -> anyhow::Result<()> {
                         ignore_eos: true,
                         ..Default::default()
                     };
+
+                    let flamegraph_guard = flamegraph_out.as_ref().map(|_| {
+                        pprof::ProfilerGuardBuilder::default()
+                            .frequency(999)
+                            .blocklist(&["libc", "libgcc", "pthread", "vdso"])
+                            .build()
+                    }).transpose()?;
 
                     let t0 = std::time::Instant::now();
                     for i in 0..batch {
@@ -444,6 +444,14 @@ async fn main() -> anyhow::Result<()> {
                             },
                         );
                     }
+
+                    if let Some(path) = flamegraph_out.as_ref() {
+                        let guard = flamegraph_guard
+                            .ok_or_else(|| anyhow::anyhow!("flamegraph guard missing"))?;
+                        let report = guard.report().build()?;
+                        let file = std::fs::File::create(path)?;
+                        report.flamegraph(file)?;
+                    }
                     // engine dropped here (single iteration when running as subprocess)
                 }
 
@@ -459,13 +467,6 @@ async fn main() -> anyhow::Result<()> {
                     );
                 }
 
-                if let Some(path) = flamegraph_out.as_ref() {
-                    let guard = flamegraph_guard
-                        .ok_or_else(|| anyhow::anyhow!("flamegraph guard missing"))?;
-                    let report = guard.report().build()?;
-                    let file = std::fs::File::create(path)?;
-                    report.flamegraph(file)?;
-                }
             } // #[cfg(feature = "cuda")]
         }
     }
