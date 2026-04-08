@@ -40,6 +40,15 @@ impl GpuTransformerLayer {
         matches!(strategy, GemmStrategy::Hybrid | GemmStrategy::Cutlass)
     }
 
+    #[inline]
+    fn fixed_batched_v2_policy() -> BatchedPipelinePolicy {
+        BatchedPipelinePolicy {
+            use_cutlass_qkv: false,
+            use_cutlass_oproj: false,
+            use_cutlass_gateup: false,
+        }
+    }
+
     /// Batched forward pass into pre-allocated scratch buffers.
     ///
     /// Results are written to `scratch.residual` and `scratch.down`.
@@ -131,7 +140,7 @@ impl GpuTransformerLayer {
         gemm_strategy: GemmStrategy,
         cutlass: Option<&rvllm_gpu::cutlass_ffi::CutlassKernels>,
     ) -> Result<()> {
-        let policy = self.batched_v2_policy(cutlass);
+        let _ = (gemm_strategy, cutlass);
         self.forward_batched_with_policy(
             input,
             weights,
@@ -142,7 +151,7 @@ impl GpuTransformerLayer {
             phase_timings,
             gemm_strategy,
             cutlass,
-            policy,
+            Self::fixed_batched_v2_policy(),
         )
     }
 
@@ -156,18 +165,6 @@ impl GpuTransformerLayer {
             use_cutlass_qkv: Self::use_cutlass_qkv(gemm_strategy) && cutlass.is_some(),
             use_cutlass_oproj: Self::use_cutlass_oproj(gemm_strategy) && cutlass.is_some(),
             use_cutlass_gateup: Self::use_cutlass_gateup(gemm_strategy) && cutlass.is_some(),
-        }
-    }
-
-    fn batched_v2_policy(
-        &self,
-        cutlass: Option<&rvllm_gpu::cutlass_ffi::CutlassKernels>,
-    ) -> BatchedPipelinePolicy {
-        let cutlass_loaded = cutlass.is_some();
-        BatchedPipelinePolicy {
-            use_cutlass_qkv: cutlass_loaded && self.batched_v2_policy.use_cutlass_qkv,
-            use_cutlass_oproj: cutlass_loaded && self.batched_v2_policy.use_cutlass_oproj,
-            use_cutlass_gateup: cutlass_loaded && self.batched_v2_policy.use_cutlass_gateup,
         }
     }
 
