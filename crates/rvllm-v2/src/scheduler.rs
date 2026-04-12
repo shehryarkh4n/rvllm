@@ -231,6 +231,15 @@ impl<B: BlockManagerOps> Scheduler<B> {
     }
 
     fn preempt_if_needed(&mut self, diff: &mut StepDiff) {
+        // Only preempt when there's actual admission pressure. If nothing is
+        // waiting or swapped, evicting running sequences just wastes progress
+        // (especially in Recompute mode where evicted sequences restart from
+        // scratch). The watermark gates admission via can_allocate/usable_gpu_blocks;
+        // preemption should only fire to make room for pending requests.
+        if self.waiting.is_empty() && self.swapped.is_empty() {
+            return;
+        }
+
         let mut preempted = 0usize;
 
         while !self.running.is_empty()
@@ -378,6 +387,8 @@ impl<B: BlockManagerOps> Scheduler<B> {
     }
 
     fn build_continued(&mut self, diff: &mut StepDiff, num_batched_tokens: &mut usize) {
+        let budget = self.config.max_num_batched_tokens;
+
         for added in &diff.added {
             let chunk_len = added.token_chunk.end - added.token_chunk.start;
             if chunk_len > 0 {
@@ -394,6 +405,10 @@ impl<B: BlockManagerOps> Scheduler<B> {
                 continue;
             }
 
+            if *num_batched_tokens >= budget {
+                break;
+            }
+
             let req = match self.requests.get(rid) {
                 Some(r) => r,
                 None => continue,
@@ -401,6 +416,12 @@ impl<B: BlockManagerOps> Scheduler<B> {
 
             if req.is_prefilling() {
                 let chunk_size = self.chunk_size(req);
+                let remaining_budget = budget.saturating_sub(*num_batched_tokens);
+                let chunk_size = chunk_size.min(remaining_budget);
+                if chunk_size == 0 {
+                    break;
+                }
+
                 let start = req.num_prompt_computed;
                 let end = (start + chunk_size).min(req.prompt_len());
 

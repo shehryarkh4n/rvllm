@@ -4,6 +4,7 @@
 //! halving weight memory on GPU. Runs once at startup so CPU perf is fine.
 
 use half::f16;
+use tracing::warn;
 
 const FP8_E4M3_MAX: f32 = 448.0;
 
@@ -74,6 +75,7 @@ pub fn quantize_weight_fp8(weights: &[f16], out_dim: usize, in_dim: usize) -> Fp
 
     let mut data = vec![0u8; out_dim * in_dim];
     let mut scales = vec![f16::ZERO; out_dim];
+    let mut clamp_count = 0u64;
 
     for row in 0..out_dim {
         let row_start = row * in_dim;
@@ -100,8 +102,20 @@ pub fn quantize_weight_fp8(weights: &[f16], out_dim: usize, in_dim: usize) -> Fp
         // Quantize each element
         let out_row = &mut data[row_start..row_start + in_dim];
         for (j, &v) in row_slice.iter().enumerate() {
-            out_row[j] = float_to_fp8_e4m3(v.to_f32() * inv_scale);
+            let scaled = v.to_f32() * inv_scale;
+            if scaled.abs() > FP8_E4M3_MAX {
+                clamp_count += 1;
+            }
+            out_row[j] = float_to_fp8_e4m3(scaled);
         }
+    }
+
+    if clamp_count > 0 {
+        let total = (out_dim * in_dim) as u64;
+        warn!(
+            "FP8 per-row quantization: {clamp_count}/{total} values clamped ({:.4}%)",
+            clamp_count as f64 / total as f64 * 100.0
+        );
     }
 
     Fp8QuantizedWeight {
@@ -148,8 +162,21 @@ pub fn quantize_weight_fp8_per_tensor(
     let inv_scale = 1.0 / scale;
 
     let mut data = vec![0u8; out_dim * in_dim];
+    let mut clamp_count = 0u64;
     for (i, &v) in weights.iter().enumerate() {
-        data[i] = float_to_fp8_e4m3(v.to_f32() * inv_scale);
+        let scaled = v.to_f32() * inv_scale;
+        if scaled.abs() > FP8_E4M3_MAX {
+            clamp_count += 1;
+        }
+        data[i] = float_to_fp8_e4m3(scaled);
+    }
+
+    if clamp_count > 0 {
+        let total = (out_dim * in_dim) as u64;
+        warn!(
+            "FP8 per-tensor quantization: {clamp_count}/{total} values clamped ({:.4}%)",
+            clamp_count as f64 / total as f64 * 100.0
+        );
     }
 
     Fp8QuantizedWeightPerTensor {

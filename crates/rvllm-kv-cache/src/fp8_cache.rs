@@ -18,7 +18,11 @@ use half::f16;
 use rvllm_core::prelude::{BlockId, LLMError, Result};
 use rvllm_gpu::prelude::{CpuBuffer, GpuAllocator, GpuBuffer, GpuStream};
 use std::mem;
-use tracing::{debug, info};
+use std::sync::atomic::{AtomicU64, Ordering};
+use tracing::{debug, info, warn};
+
+static FP8_KV_CLAMP_COUNT: AtomicU64 = AtomicU64::new(0);
+static FP8_KV_TOTAL_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// Maximum representable magnitude in FP8 E4M3 format.
 const FP8_E4M3_MAX: f32 = 448.0;
@@ -201,6 +205,7 @@ fn fp8_e4m3_to_float(fp8: u8) -> f32 {
 pub fn quantize_heads(input: &[f32], num_heads: usize, head_dim: usize) -> (Vec<u8>, Vec<f32>) {
     let mut output = vec![0u8; num_heads * head_dim];
     let mut scales = vec![0.0f32; num_heads];
+    let mut local_clamps = 0u64;
 
     for h in 0..num_heads {
         let base = h * head_dim;
@@ -213,8 +218,29 @@ pub fn quantize_heads(input: &[f32], num_heads: usize, head_dim: usize) -> (Vec<
 
         let inv_scale = 1.0 / scale;
         for d in 0..head_dim {
-            output[base + d] = float_to_fp8_e4m3(head_slice[d] * inv_scale);
+            let scaled = head_slice[d] * inv_scale;
+            if scaled.abs() > FP8_E4M3_MAX {
+                local_clamps += 1;
+            }
+            output[base + d] = float_to_fp8_e4m3(scaled);
         }
+    }
+
+    if local_clamps > 0 {
+        let prev = FP8_KV_CLAMP_COUNT.fetch_add(local_clamps, Ordering::Relaxed);
+        let total = FP8_KV_TOTAL_COUNT.fetch_add((num_heads * head_dim) as u64, Ordering::Relaxed)
+            + (num_heads * head_dim) as u64;
+        // Log every 10k clamps to avoid spam
+        if prev / 10_000 != (prev + local_clamps) / 10_000 {
+            warn!(
+                "FP8 KV cache: {} total values clamped out of {} ({:.4}%)",
+                prev + local_clamps,
+                total,
+                (prev + local_clamps) as f64 / total as f64 * 100.0
+            );
+        }
+    } else {
+        FP8_KV_TOTAL_COUNT.fetch_add((num_heads * head_dim) as u64, Ordering::Relaxed);
     }
 
     (output, scales)

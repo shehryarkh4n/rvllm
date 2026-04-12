@@ -52,6 +52,9 @@ struct Cli {
     #[arg(long, default_value_t = 512)]
     output_len: usize,
 
+    #[arg(long, default_value_t = 3)]
+    iters: usize,
+
     #[arg(long)]
     num_gpu_blocks: Option<usize>,
 
@@ -93,9 +96,14 @@ fn main() -> anyhow::Result<()> {
         .filter_map(|s| s.trim().parse().ok())
         .collect();
 
-    if batch_sizes.len() > 1 {
+    let iters = cli.iters.max(1);
+
+    if batch_sizes.len() > 1 || iters > 1 {
         eprintln!("rvLLM v2 benchmark -- direct engine, no HTTP");
-        eprintln!("model: {}  output_len: {}", cli.model, cli.output_len);
+        eprintln!(
+            "model: {}  output_len: {}  iters: {}",
+            cli.model, cli.output_len, iters
+        );
     }
 
     let mut json_results = Vec::new();
@@ -114,10 +122,10 @@ fn main() -> anyhow::Result<()> {
 
         let mut engine = init_engine(&config);
 
-        // Warmup: short requests to trigger graph capture
+        // Warmup: use same output_len as bench to prime identical kernel paths
         let warmup_params = SamplingParams {
             temperature: 0.0,
-            max_tokens: 5,
+            max_tokens: cli.output_len,
             ignore_eos: true,
             ..Default::default()
         };
@@ -128,8 +136,9 @@ fn main() -> anyhow::Result<()> {
         while engine.has_pending_work() {
             engine.step().map_err(|e| anyhow::anyhow!("{e}"))?;
         }
+        engine.sync().map_err(|e| anyhow::anyhow!("{e}"))?;
 
-        // Bench run
+        // Bench runs
         let params = SamplingParams {
             temperature: 0.0,
             max_tokens: cli.output_len,
@@ -137,52 +146,65 @@ fn main() -> anyhow::Result<()> {
             ..Default::default()
         };
 
-        for i in 0..batch {
-            let prompt = BENCH_PROMPTS[i % BENCH_PROMPTS.len()].to_string();
-            engine
-                .add_request(prompt, params.clone())
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-        }
+        let mut tps_samples = Vec::with_capacity(iters);
 
-        let t0 = Instant::now();
-        let mut total_tokens = 0usize;
-        let mut finished = 0usize;
+        for _ in 0..iters {
+            for i in 0..batch {
+                let prompt = BENCH_PROMPTS[i % BENCH_PROMPTS.len()].to_string();
+                engine
+                    .add_request(prompt, params.clone())
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+            }
 
-        while engine.has_pending_work() {
-            let outputs = engine.step().map_err(|e| anyhow::anyhow!("{e}"))?;
-            for out in &outputs {
-                total_tokens += 1;
-                if out.finished {
-                    finished += 1;
+            let t0 = Instant::now();
+            let mut total_tokens = 0usize;
+            let mut finished = 0usize;
+
+            while engine.has_pending_work() {
+                let outputs = engine.step().map_err(|e| anyhow::anyhow!("{e}"))?;
+                for out in &outputs {
+                    total_tokens += 1;
+                    if out.finished {
+                        finished += 1;
+                    }
                 }
             }
+
+            engine.sync().map_err(|e| anyhow::anyhow!("{e}"))?;
+            let elapsed = t0.elapsed();
+            let tps = total_tokens as f64 / elapsed.as_secs_f64();
+            tps_samples.push(tps);
         }
 
-        engine.sync().map_err(|e| anyhow::anyhow!("{e}"))?;
-        let elapsed = t0.elapsed();
-        let failed = batch.saturating_sub(finished);
-        let tps = total_tokens as f64 / elapsed.as_secs_f64();
+        let mean_tps = tps_samples.iter().sum::<f64>() / tps_samples.len() as f64;
+        let min_tps = tps_samples.iter().cloned().fold(f64::INFINITY, f64::min);
+        let max_tps = tps_samples
+            .iter()
+            .cloned()
+            .fold(f64::NEG_INFINITY, f64::max);
+        let stdev = if tps_samples.len() > 1 {
+            let variance =
+                tps_samples.iter().map(|&x| (x - mean_tps).powi(2)).sum::<f64>()
+                    / (tps_samples.len() - 1) as f64;
+            variance.sqrt()
+        } else {
+            0.0
+        };
 
         if cli.json {
             json_results.push(serde_json::json!({
                 "n": batch,
-                "total_tokens": total_tokens,
-                "elapsed_ms": elapsed.as_millis(),
-                "tok_per_sec": (tps * 10.0).round() / 10.0,
-                "failed": failed,
+                "iters": iters,
+                "mean_tok_per_sec": (mean_tps * 10.0).round() / 10.0,
+                "min_tok_per_sec": (min_tps * 10.0).round() / 10.0,
+                "max_tok_per_sec": (max_tps * 10.0).round() / 10.0,
+                "stdev": (stdev * 10.0).round() / 10.0,
+                "samples": tps_samples.iter().map(|&x| (x * 10.0).round() / 10.0).collect::<Vec<_>>(),
             }));
         } else {
             eprintln!(
-                "N={:<4} {:>6} tok  {:>6}ms  {:>8.1} tok/s  {}",
-                batch,
-                total_tokens,
-                elapsed.as_millis(),
-                tps,
-                if failed > 0 {
-                    format!("({failed} failed)")
-                } else {
-                    "ok".into()
-                },
+                "N={:<4} {:>8.1} tok/s  (min={:.1} max={:.1} stdev={:.1}, {} iters)",
+                batch, mean_tps, min_tps, max_tps, stdev, iters,
             );
         }
     }
@@ -194,6 +216,7 @@ fn main() -> anyhow::Result<()> {
                 "engine": "rvllm-v2",
                 "model": cli.model,
                 "output_len": cli.output_len,
+                "iters": iters,
                 "results": json_results,
             }))?
         );
