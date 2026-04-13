@@ -625,22 +625,27 @@ fn load_model_and_build_runner(
         loaded
     };
 
-    // 6b. Load CUTLASS autotune cache
-    let autotune = {
+    // 6b. Load CUTLASS autotune cache (required when CUTLASS is loaded)
+    let autotune = if cutlass.is_some() {
         let cache_path = CutlassAutotuneCache::cache_path();
         let cache = CutlassAutotuneCache::load(&cache_path);
         if cache.is_empty() {
-            info!("no CUTLASS autotune cache found, using cuBLAS fallback");
-            None
-        } else {
-            info!(
-                hgemm = cache.hgemm.len(),
-                oproj = cache.oproj_residual.len(),
-                gateup = cache.gateup_silu.len(),
-                "loaded CUTLASS autotune cache"
+            panic!(
+                "CUTLASS kernels loaded but autotune cache is empty at {}. \
+                 Run autotune-cutlass first: target/release/autotune-cutlass --so kernels/sm_90/libcutlass_kernels.so",
+                cache_path.display()
             );
-            Some(cache)
         }
+        info!(
+            hgemm = cache.hgemm.len(),
+            oproj = cache.oproj_residual.len(),
+            gateup = cache.gateup_silu.len(),
+            fp8 = cache.fp8_gemm.len(),
+            "loaded CUTLASS autotune cache"
+        );
+        Some(cache)
+    } else {
+        None
     };
 
     // 7. Create transformer layers

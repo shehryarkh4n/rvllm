@@ -1,10 +1,9 @@
 //! CUTLASS GEMM autotuning: benchmark all tile/schedule variants for a given
 //! (M,N,K) shape, pick the fastest, cache results to JSON on disk.
 //!
-//! The autotune pass runs each compiled CUTLASS variant plus a cuBLAS baseline,
-//! times them with CUDA events, and stores the winner per shape. If cuBLAS beats
-//! all CUTLASS variants for a given shape, no entry is stored (caller falls back
-//! to cuBLAS).
+//! The autotune pass runs each compiled CUTLASS variant, times them with CUDA
+//! events, and stores the best variant per shape. When CUTLASS is loaded at
+//! runtime, every shape MUST have a cache entry -- missing entries panic.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -15,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::cutlass_ffi::{FP8_GEMM_VARIANTS, GATEUP_SILU_VARIANTS, HGEMM_VARIANTS, OPROJ_RESIDUAL_VARIANTS};
 
 /// Persistent cache mapping (M,N,K) shapes to the best CUTLASS variant index.
-/// If a shape has no entry, cuBLAS was faster than all CUTLASS variants.
+/// Every shape used at runtime must have an entry -- missing entries panic.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CutlassAutotuneCache {
     #[serde(default)]
@@ -536,8 +535,8 @@ pub fn bench_cublas_hgemm(
 }
 
 /// Autotune HGEMM: benchmark all CUTLASS variants vs cuBLAS.
-/// Returns the winning CUTLASS variant only if it beats cuBLAS.
-/// Returns None if cuBLAS wins (caller should use cuBLAS).
+/// Returns the best CUTLASS variant only if it beats cuBLAS.
+/// Returns None if cuBLAS wins -- runtime uses cuBLAS for that shape.
 #[cfg(feature = "cuda")]
 pub fn autotune_hgemm_vs_cublas(
     cutlass: &CutlassKernels,
@@ -556,22 +555,17 @@ pub fn autotune_hgemm_vs_cublas(
     if cutlass_best.1 < cublas_time {
         let speedup_pct = (1.0 - cutlass_best.1 / cublas_time) * 100.0;
         tracing::info!(
-            m,
-            n,
-            k,
+            m, n, k,
             variant = cutlass_best.0,
             cutlass_us = format!("{:.1}", cutlass_best.1),
             cublas_us = format!("{:.1}", cublas_time),
             speedup_pct = format!("{:.1}", speedup_pct),
-            "CUTLASS hgemm v{} wins",
-            cutlass_best.0,
+            "CUTLASS hgemm v{} wins", cutlass_best.0,
         );
         Some(cutlass_best)
     } else {
         tracing::info!(
-            m,
-            n,
-            k,
+            m, n, k,
             cublas_us = format!("{:.1}", cublas_time),
             best_cutlass_us = format!("{:.1}", cutlass_best.1),
             "cuBLAS wins for hgemm"

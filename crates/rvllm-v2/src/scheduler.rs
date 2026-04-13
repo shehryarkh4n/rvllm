@@ -506,4 +506,80 @@ impl<B: BlockManagerOps> Scheduler<B> {
             remaining
         }
     }
+
+    // =================================================================
+    // Decode lane support
+    // =================================================================
+
+    /// True when every running request has finished its prefill and is in decode phase.
+    pub fn all_running_decode(&self) -> bool {
+        self.running.iter().all(|rid| {
+            self.requests.get(rid).map_or(true, |r| !r.is_prefilling())
+        })
+    }
+
+    /// Number of currently running requests (includes both prefill and decode).
+    pub fn num_running(&self) -> usize {
+        self.running.len()
+    }
+
+    /// True when there are requests in the waiting or swapped queues.
+    pub fn has_pending_admissions(&self) -> bool {
+        !self.waiting.is_empty() || !self.swapped.is_empty()
+    }
+
+    /// Schedule a decode-only step. Retires finished requests and emits continued
+    /// entries for running decode sequences, but does NOT admit new requests or
+    /// advance prefill chunks. This keeps the batch uniform and graph-capturable.
+    pub fn schedule_decode_only(&mut self) -> SchedulerOutput {
+        let mut diff = StepDiff {
+            added: Vec::new(),
+            removed: Vec::new(),
+            continued: Vec::new(),
+            block_ops: BlockOps::default(),
+        };
+        let mut num_batched_tokens = 0usize;
+
+        self.retire_finished(&mut diff);
+
+        for rid in &self.running {
+            let req = match self.requests.get(rid) {
+                Some(r) => r,
+                None => continue,
+            };
+
+            if req.is_prefilling() {
+                continue;
+            }
+
+            let new_token = req.last_new_token.unwrap_or(0);
+            let block_table_update = self.block_manager.get_block_table_update(req.seq_id);
+
+            diff.continued.push(ContinuedRequest {
+                request_id: req.request_id,
+                seq_id: req.seq_id,
+                new_token_id: new_token,
+                block_table_update,
+            });
+
+            self.block_manager.mark_table_sent(req.seq_id);
+            num_batched_tokens += 1;
+        }
+
+        self.cow_for_running(&mut diff);
+
+        for rid in &self.running {
+            if let Some(req) = self.requests.get_mut(rid) {
+                req.was_running = true;
+                req.last_new_token = None;
+            }
+        }
+
+        SchedulerOutput {
+            diff,
+            num_running: self.running.len(),
+            num_waiting: self.waiting.len() + self.swapped.len(),
+            total_batched_tokens: num_batched_tokens,
+        }
+    }
 }

@@ -29,6 +29,10 @@ pub struct StepPending {
     sched_out: SchedulerOutput,
 }
 
+/// Maximum consecutive decode-only steps before forcing an admission round.
+/// At ~5ms/step on H100, 64 steps = ~320ms max TTFT delay under load.
+const MAX_DECODE_STEPS_BEFORE_ADMIT: usize = 64;
+
 pub struct Engine<B: BlockManagerOps> {
     scheduler: Scheduler<B>,
     worker: Worker,
@@ -39,6 +43,7 @@ pub struct Engine<B: BlockManagerOps> {
     spec_config: SpecDecodeConfig,
     drafter: NgramDrafter,
     block_size: usize,
+    decode_steps_since_admission: usize,
 }
 
 impl<B: BlockManagerOps> Engine<B> {
@@ -57,6 +62,7 @@ impl<B: BlockManagerOps> Engine<B> {
             spec_config,
             drafter,
             block_size,
+            decode_steps_since_admission: 0,
         }
     }
 
@@ -123,7 +129,14 @@ impl<B: BlockManagerOps> Engine<B> {
     }
 
     pub fn step(&mut self) -> Result<Vec<V2RequestOutput>, EngineError> {
-        let sched_out = self.scheduler.schedule();
+        let sched_out = if self.should_use_decode_lane() {
+            self.decode_steps_since_admission += 1;
+            self.scheduler.schedule_decode_only()
+        } else {
+            self.decode_steps_since_admission = 0;
+            self.scheduler.schedule()
+        };
+
         if sched_out.diff.is_empty() {
             return Ok(Vec::new());
         }
@@ -136,7 +149,14 @@ impl<B: BlockManagerOps> Engine<B> {
     }
 
     pub fn step_launch(&mut self) -> Result<Option<StepPending>, EngineError> {
-        let sched_out = self.scheduler.schedule();
+        let sched_out = if self.should_use_decode_lane() {
+            self.decode_steps_since_admission += 1;
+            self.scheduler.schedule_decode_only()
+        } else {
+            self.decode_steps_since_admission = 0;
+            self.scheduler.schedule()
+        };
+
         if sched_out.diff.is_empty() {
             return Ok(None);
         }
@@ -146,6 +166,22 @@ impl<B: BlockManagerOps> Engine<B> {
             .map_err(|e| EngineError::Worker(e.to_string()))?;
 
         Ok(Some(StepPending { sched_out }))
+    }
+
+    /// Decode lane policy: use decode-only schedule when all running requests
+    /// are in decode phase, protecting graph capture from prefill contamination.
+    fn should_use_decode_lane(&self) -> bool {
+        let num_running = self.scheduler.num_running();
+        if num_running == 0 {
+            return false;
+        }
+        if !self.scheduler.all_running_decode() {
+            return false;
+        }
+        if !self.scheduler.has_pending_admissions() {
+            return true;
+        }
+        self.decode_steps_since_admission < MAX_DECODE_STEPS_BEFORE_ADMIT
     }
 
     pub fn step_collect(

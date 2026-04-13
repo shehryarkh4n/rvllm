@@ -1,4 +1,4 @@
-//! Standalone CUTLASS HGEMM autotune benchmark.
+//! Standalone CUTLASS autotune benchmark: HGEMM, oproj+residual, gateup+SiLU.
 //!
 //! For each (M, N, K) shape used by Qwen2.5-7B decode, benchmarks all compiled
 //! CUTLASS WGMMA tile/cluster/schedule variants plus cuBLAS baseline.
@@ -12,7 +12,7 @@ use cudarc::driver::sys as cu_sys;
 use cudarc::driver::{CudaContext, DevicePtr, DevicePtrMut};
 use half::f16;
 use rvllm_gpu::cutlass_autotune::CutlassAutotuneCache;
-use rvllm_gpu::cutlass_ffi::{CutlassKernels, HGEMM_VARIANTS};
+use rvllm_gpu::cutlass_ffi::{CutlassKernels, HGEMM_VARIANTS, OPROJ_RESIDUAL_VARIANTS, GATEUP_SILU_VARIANTS};
 use std::ffi::c_void;
 use std::path::PathBuf;
 
@@ -23,6 +23,17 @@ const SHAPES: &[(usize, usize, &str)] = &[
     (37888, 3584, "gate_up"),
     (3584, 18944, "down"),
     (152064, 3584, "LM head"),
+];
+
+// Fused family shapes: oproj+residual and gateup+silu
+// oproj: C = A @ W + residual, shape (M, hidden, q_dim) = (M, 3584, 3584)
+const OPROJ_SHAPES: &[(usize, usize, &str)] = &[
+    (3584, 3584, "O-proj+residual"),
+];
+
+// gateup+silu: C = SiLU(A @ W), shape (M, gate_up_dim, hidden) = (M, 37888, 3584)
+const GATEUP_SHAPES: &[(usize, usize, &str)] = &[
+    (37888, 3584, "gate_up+SiLU"),
 ];
 
 const M_VALUES: &[usize] = &[1, 2, 4, 8, 16, 32, 64, 128, 256];
@@ -270,6 +281,84 @@ fn bench_cublas(
     median(&mut times)
 }
 
+/// Time a single oproj+residual variant. Returns median microseconds or None.
+fn bench_oproj_residual_variant(
+    cutlass: &CutlassKernels,
+    variant: usize,
+    cu_stream: cu_sys::CUstream,
+    m: usize, n: usize, k: usize,
+    a_ptr: u64, b_ptr: u64, c_ptr: u64, r_ptr: u64,
+    ws_ptr: u64, ws_size: usize, stream_ptr: u64,
+) -> Option<f32> {
+    let ws_needed = cutlass.oproj_residual_variant_workspace_size(variant, m as i32, n as i32, k as i32)?;
+    if ws_needed > ws_size { return None; }
+
+    if cutlass.oproj_residual_variant(variant, c_ptr, a_ptr, b_ptr, r_ptr,
+        m as i32, n as i32, k as i32, ws_ptr, ws_size, stream_ptr).is_err() {
+        return None;
+    }
+    let r = unsafe { cu_sys::cuStreamSynchronize(cu_stream) };
+    if r != cu_sys::CUresult::CUDA_SUCCESS { return None; }
+
+    for _ in 0..WARMUP_ITERS {
+        let _ = cutlass.oproj_residual_variant(variant, c_ptr, a_ptr, b_ptr, r_ptr,
+            m as i32, n as i32, k as i32, ws_ptr, ws_size, stream_ptr);
+    }
+    unsafe { cu_sys::cuStreamSynchronize(cu_stream); }
+
+    let mut times = Vec::with_capacity(BENCH_ITERS);
+    for _ in 0..BENCH_ITERS {
+        let start = CuEvent::new();
+        let stop = CuEvent::new();
+        start.record(cu_stream);
+        let _ = cutlass.oproj_residual_variant(variant, c_ptr, a_ptr, b_ptr, r_ptr,
+            m as i32, n as i32, k as i32, ws_ptr, ws_size, stream_ptr);
+        stop.record(cu_stream);
+        stop.sync();
+        times.push(stop.elapsed_ms(&start) * 1000.0);
+    }
+    Some(median(&mut times))
+}
+
+/// Time a single gateup+silu variant. Returns median microseconds or None.
+fn bench_gateup_silu_variant(
+    cutlass: &CutlassKernels,
+    variant: usize,
+    cu_stream: cu_sys::CUstream,
+    m: usize, n: usize, k: usize,
+    a_ptr: u64, b_ptr: u64, c_ptr: u64,
+    ws_ptr: u64, ws_size: usize, stream_ptr: u64,
+) -> Option<f32> {
+    let ws_needed = cutlass.gateup_silu_variant_workspace_size(variant, m as i32, n as i32, k as i32)?;
+    if ws_needed > ws_size { return None; }
+
+    if cutlass.gateup_silu_variant(variant, c_ptr, a_ptr, b_ptr,
+        m as i32, n as i32, k as i32, ws_ptr, ws_size, stream_ptr).is_err() {
+        return None;
+    }
+    let r = unsafe { cu_sys::cuStreamSynchronize(cu_stream) };
+    if r != cu_sys::CUresult::CUDA_SUCCESS { return None; }
+
+    for _ in 0..WARMUP_ITERS {
+        let _ = cutlass.gateup_silu_variant(variant, c_ptr, a_ptr, b_ptr,
+            m as i32, n as i32, k as i32, ws_ptr, ws_size, stream_ptr);
+    }
+    unsafe { cu_sys::cuStreamSynchronize(cu_stream); }
+
+    let mut times = Vec::with_capacity(BENCH_ITERS);
+    for _ in 0..BENCH_ITERS {
+        let start = CuEvent::new();
+        let stop = CuEvent::new();
+        start.record(cu_stream);
+        let _ = cutlass.gateup_silu_variant(variant, c_ptr, a_ptr, b_ptr,
+            m as i32, n as i32, k as i32, ws_ptr, ws_size, stream_ptr);
+        stop.record(cu_stream);
+        stop.sync();
+        times.push(stop.elapsed_ms(&start) * 1000.0);
+    }
+    Some(median(&mut times))
+}
+
 // -- Detailed results for the report JSON --
 
 #[derive(serde::Serialize)]
@@ -314,7 +403,7 @@ fn main() {
         }
     }
 
-    println!("CUTLASS HGEMM Autotune Benchmark");
+    println!("CUTLASS Full Autotune Benchmark");
     println!("================================");
     println!("Library: {}", so_path.display());
     println!("Output:  {}", out_path.display());
@@ -341,9 +430,13 @@ fn main() {
 
     // Load CUTLASS
     let cutlass = CutlassKernels::load(&so_path).expect("load CUTLASS .so");
-    let loaded = cutlass.hgemm_variant_count();
-    println!("Loaded {loaded}/{HGEMM_VARIANTS} HGEMM variants");
-    if loaded == 0 {
+    let hgemm_loaded = cutlass.hgemm_variant_count();
+    let oproj_loaded = cutlass.oproj_residual_variant_count();
+    let gateup_loaded = cutlass.gateup_silu_variant_count();
+    println!("Loaded {hgemm_loaded}/{HGEMM_VARIANTS} HGEMM variants");
+    println!("Loaded {oproj_loaded}/{OPROJ_RESIDUAL_VARIANTS} oproj+residual variants");
+    println!("Loaded {gateup_loaded}/{GATEUP_SILU_VARIANTS} gateup+SiLU variants");
+    if hgemm_loaded == 0 {
         eprintln!("ERROR: No HGEMM autotune variants in .so -- build cutlass_hgemm_autotune.cu first");
         std::process::exit(1);
     }
@@ -351,26 +444,34 @@ fn main() {
     // cuBLAS baseline
     let cublas = CublasBaseline::new(cu_stream);
 
-    // Pre-allocate GPU buffers for largest shapes
+    // Pre-allocate GPU buffers for largest shapes (including fused family shapes)
     let max_m = *M_VALUES.iter().max().unwrap();
-    let max_a = SHAPES.iter().map(|&(_, k, _)| max_m * k).max().unwrap();
-    let max_b = SHAPES.iter().map(|&(n, k, _)| n * k).max().unwrap();
-    let max_c = SHAPES.iter().map(|&(n, _, _)| max_m * n).max().unwrap();
+    let all_shapes: Vec<(usize, usize)> = SHAPES.iter().map(|&(n, k, _)| (n, k))
+        .chain(OPROJ_SHAPES.iter().map(|&(n, k, _)| (n, k)))
+        .chain(GATEUP_SHAPES.iter().map(|&(n, k, _)| (n, k)))
+        .collect();
+    let max_a = all_shapes.iter().map(|&(_, k)| max_m * k).max().unwrap();
+    let max_b = all_shapes.iter().map(|&(n, k)| n * k).max().unwrap();
+    let max_c = all_shapes.iter().map(|&(n, _)| max_m * n).max().unwrap();
 
     let a_buf = stream.alloc_zeros::<f16>(max_a).expect("alloc A");
     let b_buf = stream.alloc_zeros::<f16>(max_b).expect("alloc B");
     let mut c_buf = stream.alloc_zeros::<f16>(max_c).expect("alloc C");
     let mut ws_buf = stream.alloc_zeros::<u8>(WORKSPACE_BYTES).expect("alloc workspace");
+    // Extra residual buffer for oproj+residual (same size as output)
+    let r_buf = stream.alloc_zeros::<f16>(max_c).expect("alloc residual");
 
     let (a_ptr, _ag) = DevicePtr::device_ptr(&a_buf, &stream);
     let (b_ptr, _bg) = DevicePtr::device_ptr(&b_buf, &stream);
     let (c_ptr, _cg) = DevicePtrMut::device_ptr_mut(&mut c_buf, &stream);
     let (ws_ptr, _wg) = DevicePtrMut::device_ptr_mut(&mut ws_buf, &stream);
+    let (r_ptr, _rg) = DevicePtr::device_ptr(&r_buf, &stream);
 
     let a_ptr = a_ptr as u64;
     let b_ptr = b_ptr as u64;
     let c_ptr = c_ptr as u64;
     let ws_ptr = ws_ptr as u64;
+    let r_ptr = r_ptr as u64;
 
     // Benchmark all shapes
     let mut cache = CutlassAutotuneCache::default();
@@ -425,12 +526,17 @@ fn main() {
                     let spd = cublas_us / us;
                     cache.insert_hgemm(m, n, k, v);
                     cutlass_wins += 1;
-                    println!("  WINNER: v{v} ({us:.1} us, {spd:.2}x vs cuBLAS)");
+                    println!("  WINNER: CUTLASS v{v} ({us:.1} us, {spd:.2}x vs cuBLAS)");
                     (format!("v{v}"), us, spd)
                 }
-                _ => {
+                Some((_, us)) => {
                     cublas_wins += 1;
-                    println!("  WINNER: cuBLAS ({cublas_us:.1} us)");
+                    println!("  WINNER: cuBLAS ({cublas_us:.1} us, best CUTLASS was {us:.1} us)");
+                    ("cuBLAS".to_string(), cublas_us, 1.0)
+                }
+                None => {
+                    cublas_wins += 1;
+                    println!("  WINNER: cuBLAS ({cublas_us:.1} us, no CUTLASS variant worked)");
                     ("cuBLAS".to_string(), cublas_us, 1.0)
                 }
             };
@@ -447,6 +553,114 @@ fn main() {
         }
     }
 
+    // ===================================================================
+    // Fused oproj+residual variants (output = input @ weight + residual)
+    // ===================================================================
+    if oproj_loaded > 0 {
+        println!();
+        println!("Benchmarking oproj+residual ({oproj_loaded} variants)");
+        println!("{}", "=".repeat(72));
+
+        for &(n, k, proj) in OPROJ_SHAPES {
+            println!();
+            println!("--- {proj} (N={n}, K={k}) ---");
+
+            for &m in M_VALUES {
+                println!();
+                println!("Shape M={m} N={n} K={k}:");
+
+                let mut best: Option<(usize, f32)> = None;
+                for v in 0..OPROJ_RESIDUAL_VARIANTS {
+                    match bench_oproj_residual_variant(
+                        &cutlass, v, cu_stream, m, n, k,
+                        a_ptr, b_ptr, c_ptr, r_ptr, ws_ptr, WORKSPACE_BYTES, stream_ptr,
+                    ) {
+                        Some(us) => {
+                            println!("  v{v}: {us:8.1} us");
+                            match best {
+                                None => best = Some((v, us)),
+                                Some((_, bt)) if us < bt => best = Some((v, us)),
+                                _ => {}
+                            }
+                        }
+                        None => {}
+                    }
+                }
+
+                // cuBLAS baseline (plain GEMM, no residual fuse -- unfair comparison but logged for reference)
+                let cublas_us = bench_cublas(&cublas, cu_stream, m, n, k, a_ptr, b_ptr, c_ptr);
+                println!("  cuBLAS (GEMM only, no residual): {cublas_us:8.1} us");
+
+                total += 1;
+                match best {
+                    Some((v, us)) => {
+                        cache.insert_oproj_residual(m, n, k, v);
+                        cutlass_wins += 1;
+                        println!("  BEST: v{v} ({us:.1} us) -- fused GEMM+residual, always stored");
+                    }
+                    None => {
+                        cublas_wins += 1;
+                        println!("  NO OPROJ VARIANT WORKED for M={m} N={n} K={k}");
+                    }
+                }
+            }
+        }
+    }
+
+    // ===================================================================
+    // Fused gateup+silu variants (output = SiLU(input @ weight))
+    // ===================================================================
+    if gateup_loaded > 0 {
+        println!();
+        println!("Benchmarking gateup+SiLU ({gateup_loaded} variants)");
+        println!("{}", "=".repeat(72));
+
+        for &(n, k, proj) in GATEUP_SHAPES {
+            println!();
+            println!("--- {proj} (N={n}, K={k}) ---");
+
+            for &m in M_VALUES {
+                println!();
+                println!("Shape M={m} N={n} K={k}:");
+
+                let mut best: Option<(usize, f32)> = None;
+                for v in 0..GATEUP_SILU_VARIANTS {
+                    match bench_gateup_silu_variant(
+                        &cutlass, v, cu_stream, m, n, k,
+                        a_ptr, b_ptr, c_ptr, ws_ptr, WORKSPACE_BYTES, stream_ptr,
+                    ) {
+                        Some(us) => {
+                            println!("  v{v}: {us:8.1} us");
+                            match best {
+                                None => best = Some((v, us)),
+                                Some((_, bt)) if us < bt => best = Some((v, us)),
+                                _ => {}
+                            }
+                        }
+                        None => {}
+                    }
+                }
+
+                // cuBLAS baseline (GEMM only, no SiLU -- unfair comparison but logged for reference)
+                let cublas_us = bench_cublas(&cublas, cu_stream, m, n, k, a_ptr, b_ptr, c_ptr);
+                println!("  cuBLAS (GEMM only, no SiLU): {cublas_us:8.1} us");
+
+                total += 1;
+                match best {
+                    Some((v, us)) => {
+                        cache.insert_gateup_silu(m, n, k, v);
+                        cutlass_wins += 1;
+                        println!("  BEST: v{v} ({us:.1} us) -- fused GEMM+SiLU, always stored");
+                    }
+                    None => {
+                        cublas_wins += 1;
+                        println!("  NO GATEUP VARIANT WORKED for M={m} N={n} K={k}");
+                    }
+                }
+            }
+        }
+    }
+
     // Summary
     println!();
     println!("{}", "=".repeat(72));
@@ -459,6 +673,8 @@ fn main() {
     println!();
     println!("Runtime cache saved to: {}", out_path.display());
     println!("  hgemm entries: {}", cache.hgemm.len());
+    println!("  oproj_residual entries: {}", cache.oproj_residual.len());
+    println!("  gateup_silu entries: {}", cache.gateup_silu.len());
 
     // Compact table
     println!();

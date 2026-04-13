@@ -222,7 +222,7 @@ impl Worker {
                 }
             }
 
-            // Normal forward (warmup or fallback)
+            // Normal forward (pre-graph-capture warmup)
             let token_ids_i32 = self.runner
                 .forward_greedy(&input, &self.kv_cache)
                 .map_err(|e| WorkerError::Runner(format!("{e}")))?;
@@ -232,9 +232,15 @@ impl Worker {
                 logprobs: Vec::new(),
             })
         } else {
-            let logits = self.execute_forward(&input)?;
-            let output = self.sample_greedy(&logits, &input);
-            Ok(output)
+            // Mixed batch (prefill + decode): still use GPU argmax to avoid massive logits DtoH
+            let token_ids_i32 = self.runner
+                .forward_greedy(&input, &self.kv_cache)
+                .map_err(|e| WorkerError::Runner(format!("{e}")))?;
+            let token_ids: Vec<TokenId> = token_ids_i32.iter().map(|&t| t as TokenId).collect();
+            Ok(ForwardOutput {
+                token_ids,
+                logprobs: Vec::new(),
+            })
         }
     }
 
@@ -279,11 +285,11 @@ impl Worker {
             self.forward_count += 1;
             self.pending = Some(PendingForward { num_seqs, is_decode: true, stored_output: None });
         } else {
-            // Mixed prefill+decode: run synchronously, store result
+            // Mixed prefill+decode: GPU argmax (no full logits DtoH)
+            self.runner.forward_greedy_launch(&input, &self.kv_cache)
+                .map_err(|e| WorkerError::Runner(format!("{e}")))?;
             self.forward_count += 1;
-            let logits = self.execute_forward(&input)?;
-            let output = self.sample_greedy(&logits, &input);
-            self.pending = Some(PendingForward { num_seqs, is_decode: false, stored_output: Some(output) });
+            self.pending = Some(PendingForward { num_seqs, is_decode: true, stored_output: None });
         }
 
         Ok(())

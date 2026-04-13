@@ -15,7 +15,7 @@ use rvllm_gpu::cutlass_ffi::CutlassKernels;
 use rvllm_gpu::kernel_loader::KernelLoader;
 
 // ===================================================================
-// cuBLASLt-first GEMM dispatch: autotuned cuBLASLt -> cuBLAS fallback
+// cuBLASLt-first GEMM dispatch: autotuned cuBLASLt -> cuBLAS
 // ===================================================================
 
 fn hgemm_dispatch(
@@ -146,7 +146,6 @@ fn cutlass_fp8_gemm_dispatch(
     let (out_ptr, _) = output_f16.device_ptr_mut(stream);
     let (wk_ptr, _) = workspace.device_ptr_mut(stream);
 
-    // Try autotuned FP8 variant first
     if let Some(at) = autotune {
         if let Some(variant) = at.best_fp8_gemm(m, n, k) {
             return cutlass.fp8_gemm_variant(
@@ -160,6 +159,7 @@ fn cutlass_fp8_gemm_dispatch(
         }
     }
 
+    // No autotuned variant for this shape -- use default CUTLASS FP8 kernel
     cutlass.fp8_gemm(
         out_ptr as u64, act_ptr as u64, w_ptr as u64,
         as_ptr as u64, ws_ptr as u64,
@@ -171,6 +171,8 @@ fn cutlass_fp8_gemm_dispatch(
 
 // ===================================================================
 // Autotuned CUTLASS SM90 WGMMA -> cuBLASLt -> cuBLAS dispatch for F16
+// Autotune picks the winner per shape. If CUTLASS has no entry for this
+// (M,N,K), cuBLAS won the benchmark -- use it.
 // ===================================================================
 
 fn f16_gemm_autotuned(
@@ -185,7 +187,6 @@ fn f16_gemm_autotuned(
     output: &mut CudaSlice<f16>,
     workspace: &mut CudaSlice<u8>,
 ) -> Result<()> {
-    // Try autotuned CUTLASS variant first
     if let (Some(ck), Some(at)) = (cutlass, autotune) {
         if let Some(variant) = at.best_hgemm(m, n, k) {
             let stream_ptr = stream.cu_stream() as u64;
@@ -202,7 +203,7 @@ fn f16_gemm_autotuned(
             ).map_err(|e| LLMError::GpuError(e));
         }
     }
-    // Fallback to cuBLAS
+    // cuBLAS won the autotune for this shape, or no CUTLASS loaded
     hgemm_dispatch(lt_ops, cublas, m, n, k, 1.0, input, weight, 0.0, output)
 }
 
