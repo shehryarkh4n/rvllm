@@ -14,6 +14,8 @@ pub mod worker;
 #[cfg(feature = "cuda")]
 pub mod engine;
 #[cfg(feature = "cuda")]
+pub mod speculative;
+#[cfg(feature = "cuda")]
 pub mod integration;
 
 #[cfg(feature = "advanced")]

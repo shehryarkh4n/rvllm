@@ -7,6 +7,9 @@ use rvllm_core::prelude::{
 use rvllm_tokenizer::Tokenizer;
 
 use crate::scheduler::{BlockManagerOps, Scheduler};
+use crate::speculative::{
+    self, NgramDrafter, SpecDecodeConfig, VerifySequence,
+};
 use crate::types::{ForwardOutput, SchedulerOutput, StepDiff, V2RequestOutput};
 use crate::worker::Worker;
 
@@ -33,11 +36,17 @@ pub struct Engine<B: BlockManagerOps> {
     requests: HashMap<RequestId, EngineRequest>,
     next_request_id: AtomicU64,
     eos_token_id: Option<TokenId>,
+    spec_config: SpecDecodeConfig,
+    drafter: NgramDrafter,
+    block_size: usize,
 }
 
 impl<B: BlockManagerOps> Engine<B> {
     pub fn new(scheduler: Scheduler<B>, worker: Worker, tokenizer: Tokenizer) -> Self {
         let eos_token_id = tokenizer.eos_token_id();
+        let spec_config = SpecDecodeConfig::default();
+        let drafter = NgramDrafter::new(&spec_config);
+        let block_size = worker.block_size();
         Self {
             scheduler,
             worker,
@@ -45,7 +54,21 @@ impl<B: BlockManagerOps> Engine<B> {
             requests: HashMap::new(),
             next_request_id: AtomicU64::new(1),
             eos_token_id,
+            spec_config,
+            drafter,
+            block_size,
         }
+    }
+
+    /// Enable speculative decoding with custom config.
+    pub fn enable_spec_decode(&mut self, config: SpecDecodeConfig) {
+        self.drafter = NgramDrafter::new(&config);
+        self.spec_config = config;
+    }
+
+    /// Disable speculative decoding.
+    pub fn disable_spec_decode(&mut self) {
+        self.spec_config.max_draft_len = 0;
     }
 
     pub fn add_request(
@@ -139,6 +162,158 @@ impl<B: BlockManagerOps> Engine<B> {
             .step_collect()
             .map_err(|e| EngineError::Worker(e.to_string()))?;
         Ok(self.process_forward_output(&pending.sched_out, &fwd_output))
+    }
+
+    /// Speculative decode step: draft K tokens per sequence, verify in one forward pass,
+    /// accept the matching prefix + 1 correct token per sequence.
+    fn spec_decode_step(
+        &mut self,
+        sched_out: SchedulerOutput,
+    ) -> Result<Vec<V2RequestOutput>, EngineError> {
+        let diff = &sched_out.diff;
+
+        // Apply diff to worker state (block ops, request tracking)
+        self.worker
+            .step_apply_diff(diff)
+            .map_err(|e| EngineError::Worker(e.to_string()))?;
+
+        // Draft K tokens for each continuing decode sequence
+        let mut verify_seqs: Vec<VerifySequence> = Vec::new();
+        let mut draft_map: HashMap<RequestId, Vec<TokenId>> = HashMap::new();
+
+        for cont in &diff.continued {
+            if let Some(req) = self.requests.get(&cont.request_id) {
+                // Build full context for n-gram lookup
+                let context: Vec<TokenId> = req
+                    .prompt_token_ids
+                    .iter()
+                    .chain(req.output_token_ids.iter())
+                    .copied()
+                    .collect();
+
+                self.drafter.build_table(&context);
+                let mut draft = self.drafter.draft(&context);
+
+                // Clamp to max_draft_len
+                draft.truncate(self.spec_config.max_draft_len);
+
+                if draft.is_empty() {
+                    // No draft possible: fall back to single-token decode
+                    draft.clear();
+                }
+
+                let last_token = *context.last().unwrap_or(&0);
+                let seq_len = context.len();
+
+                // Get block table from worker state
+                let block_table: Vec<u32> = self
+                    .worker
+                    .requests()
+                    .get(&cont.request_id)
+                    .map(|wr| wr.block_table.iter().map(|b| b.0).collect())
+                    .unwrap_or_default();
+
+                verify_seqs.push(VerifySequence {
+                    seq_id: cont.seq_id.0,
+                    last_token,
+                    seq_len,
+                    draft_tokens: draft.clone(),
+                    block_table,
+                });
+
+                draft_map.insert(cont.request_id, draft);
+            }
+        }
+
+        if verify_seqs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Check if any sequences actually have drafts
+        let has_drafts = verify_seqs.iter().any(|s| !s.draft_tokens.is_empty());
+        if !has_drafts {
+            // No n-gram matches: fall back to normal single-token step
+            let fwd_output = self
+                .worker
+                .step_forward_only()
+                .map_err(|e| EngineError::Worker(e.to_string()))?;
+            return Ok(self.process_forward_output(&sched_out, &fwd_output));
+        }
+
+        // Build verify input and run forward
+        let verify_input =
+            speculative::build_verify_input(&verify_seqs, self.block_size);
+        let token_ids = self
+            .worker
+            .forward_greedy_custom(&verify_input)
+            .map_err(|e| EngineError::Worker(e.to_string()))?;
+
+        // Process results: verify and accept tokens for each sequence
+        let mut request_outputs: Vec<V2RequestOutput> = Vec::new();
+        let mut step_results: Vec<(SequenceId, TokenId, bool)> = Vec::new();
+        let mut token_idx = 0;
+
+        for cont in &diff.continued {
+            let draft = draft_map.get(&cont.request_id).unwrap();
+            let k_plus_1 = draft.len() + 1;
+
+            // Slice this sequence's verify results
+            let end_idx = (token_idx + k_plus_1).min(token_ids.len());
+            let target_slice: Vec<TokenId> = token_ids[token_idx..end_idx]
+                .iter()
+                .map(|&t| t as TokenId)
+                .collect();
+            token_idx += k_plus_1;
+
+            let accepted = speculative::verify_and_accept(draft, &target_slice);
+
+            // Check finish for each accepted token (immutable borrows first)
+            let mut finish_at: Option<(usize, FinishReason)> = None;
+            for (i, &tok) in accepted.iter().enumerate() {
+                if self.check_finish(cont.request_id, tok) {
+                    let reason = self.determine_finish_reason(cont.request_id, tok);
+                    finish_at = Some((i, reason));
+                    break;
+                }
+            }
+
+            // Now apply mutations
+            if let Some(req) = self.requests.get_mut(&cont.request_id) {
+                let accept_count = match finish_at {
+                    Some((i, _)) => i + 1,
+                    None => accepted.len(),
+                };
+                for &tok in &accepted[..accept_count] {
+                    req.output_token_ids.push(tok);
+                }
+                if let Some((_, reason)) = finish_at {
+                    req.finished = true;
+                    req.finish_reason = Some(reason);
+                }
+
+                let last_accepted = *accepted[..accept_count].last().unwrap_or(&0);
+                step_results.push((cont.seq_id, last_accepted, req.finished));
+            }
+
+            // Build output (separate borrow scope)
+            if let Some(req) = self.requests.get(&cont.request_id) {
+                let output_text = self.decode_output_tokens(req);
+                request_outputs.push(V2RequestOutput {
+                    request_id: cont.request_id,
+                    output_text,
+                    output_token_ids: req.output_token_ids.clone(),
+                    finished: req.finished,
+                    finish_reason: req.finish_reason,
+                    logprobs: Vec::new(),
+                });
+            }
+        }
+
+        // Advance scheduler state (1 step result per sequence, multi-token handled above)
+        self.scheduler.process_step_result(&step_results);
+        self.cleanup_finished();
+
+        Ok(request_outputs)
     }
 
     fn process_forward_output(

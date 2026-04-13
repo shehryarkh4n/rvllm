@@ -726,8 +726,13 @@ impl GpuTransformerLayer {
                 &mut scratch.qkv_buf, &mut scratch.cutlass_workspace)?;
         }
 
-        self.apply_rope(&mut scratch.qkv_buf, attn, q_dim, kv_dim, q_end, num_tokens)?;
-        self.kv_cache_write(&mut scratch.qkv_buf, attn, q_end, k_end, kv_dim, num_tokens)?;
+        if !attn.is_prefill && num_tokens > 1 {
+            // All-decode batch: fused RoPE + KV cache write (1 kernel instead of 2 per layer)
+            self.fused_rope_cache_write_batch(&mut scratch.qkv_buf, attn, num_tokens)?;
+        } else {
+            self.apply_rope(&mut scratch.qkv_buf, attn, q_dim, kv_dim, q_end, num_tokens)?;
+            self.kv_cache_write(&mut scratch.qkv_buf, attn, q_end, k_end, kv_dim, num_tokens)?;
+        }
 
         self.attention(
             &scratch.qkv_buf,
@@ -1154,6 +1159,59 @@ impl GpuTransformerLayer {
                     shared_mem_bytes: 0,
                 })
                 .map_err(|e| LLMError::GpuError(format!("fused_rope_cache_write: {e}")))?;
+        }
+        Ok(())
+    }
+
+    /// Fused RoPE + KV cache write for batched decode (num_tokens > 1, all-decode).
+    /// Same kernel as single-token fused path but with grid.x = num_tokens.
+    fn fused_rope_cache_write_batch(
+        &self,
+        qkv: &mut CudaSlice<f16>,
+        attn: &AttentionMeta<'_>,
+        num_tokens: usize,
+    ) -> Result<()> {
+        let cfg = &self.config;
+        let q_dim = cfg.q_dim();
+        let kv_dim = cfg.kv_dim();
+        let num_heads = cfg.num_heads;
+        let num_kv_heads = cfg.num_kv_heads;
+        let head_dim = cfg.head_dim;
+        let half_dim = head_dim / 2;
+        let grid_y = num_heads.max(num_kv_heads) as u32;
+
+        let kernel = self
+            .loader
+            .get_func("fused_rope_cache", "fused_rope_cache_f16_kernel")
+            .map_err(|e| LLMError::GpuError(format!("fused_rope_cache kernel: {e}")))?;
+
+        let q_end = num_tokens * q_dim;
+        let (mut q_part, mut kv_rest) = qkv.split_at_mut(q_end);
+        let (mut k_part, v_rest) = kv_rest.split_at_mut(num_tokens * kv_dim);
+        let v_view = v_rest.slice(..num_tokens * kv_dim);
+
+        unsafe {
+            self.stream
+                .launch_builder(&kernel)
+                .arg(&mut q_part)
+                .arg(&mut k_part)
+                .arg(&v_view)
+                .arg(attn.key_cache)
+                .arg(attn.value_cache)
+                .arg(attn.rope_cos)
+                .arg(attn.rope_sin)
+                .arg(&attn.positions)
+                .arg(&attn.slot_mapping)
+                .arg(&(num_tokens as i32))
+                .arg(&(num_heads as i32))
+                .arg(&(num_kv_heads as i32))
+                .arg(&(head_dim as i32))
+                .launch(LaunchConfig {
+                    grid_dim: (num_tokens as u32, grid_y, 1),
+                    block_dim: (half_dim.min(1024) as u32, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+                .map_err(|e| LLMError::GpuError(format!("fused_rope_cache_write_batch: {e}")))?;
         }
         Ok(())
     }

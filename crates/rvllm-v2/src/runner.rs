@@ -464,12 +464,13 @@ impl GpuModelRunner {
         Ok(logits_cpu)
     }
 
-    /// Fast greedy decode path: runs full forward, GPU argmax, returns only token IDs.
-    /// Avoids the massive DtoH of full logits (N * vocab_size * 4 bytes).
-    pub fn forward_greedy(&mut self, input: &GpuBatchInput, kv_cache: &CudaKVCache) -> Result<Vec<i32>> {
+    /// Launch greedy forward (GPU-only, no DtoH, no sync).
+    /// Runs embedding -> layers -> norm -> LM head -> GPU argmax into argmax_output.
+    /// Call `read_graph_output()` afterward to collect results.
+    pub fn forward_greedy_launch(&mut self, input: &GpuBatchInput, kv_cache: &CudaKVCache) -> Result<usize> {
         let num_tokens = total_tokens(input);
         if num_tokens == 0 {
-            return Ok(Vec::new());
+            return Ok(0);
         }
 
         let hidden_size = self.config.hidden_size;
@@ -505,7 +506,6 @@ impl GpuModelRunner {
             ref embed_output,
             ref loader,
             ref mut argmax_output,
-            ref mut pinned_argmax,
             ..
         } = *self;
 
@@ -615,29 +615,19 @@ impl GpuModelRunner {
                 .map_err(|e| LLMError::GpuError(format!("argmax launch: {e}")))?;
         }
 
-        // DtoH into pinned host memory (pageable Vec makes cuMemcpyDtoHAsync synchronous)
-        let bytes = num_tokens * std::mem::size_of::<i32>();
-        let src_dev_ptr = {
-            let (ptr, _) = argmax_output.device_ptr(stream);
-            ptr
-        };
-        unsafe {
-            cudarc::driver::sys::cuMemcpyDtoHAsync_v2(
-                pinned_argmax.as_mut_ptr() as *mut std::ffi::c_void,
-                src_dev_ptr,
-                bytes,
-                stream.cu_stream(),
-            )
-            .result()
-            .map_err(|e| LLMError::GpuError(format!("pinned argmax DtoH: {e}")))?;
-        }
-        stream.synchronize()
-            .map_err(|e| LLMError::GpuError(format!("stream sync: {e}")))?;
-        Ok(pinned_argmax.as_slice()[..num_tokens].to_vec())
+        Ok(num_tokens)
+    }
+
+    /// Fast greedy decode path: runs full forward, GPU argmax, returns only token IDs.
+    /// Avoids the massive DtoH of full logits (N * vocab_size * 4 bytes).
+    pub fn forward_greedy(&mut self, input: &GpuBatchInput, kv_cache: &CudaKVCache) -> Result<Vec<i32>> {
+        let n = self.forward_greedy_launch(input, kv_cache)?;
+        if n == 0 { return Ok(Vec::new()); }
+        self.read_graph_output(n)
     }
 
     /// Pack all metadata fields into one contiguous GPU buffer (1 memcpy).
-    fn upload_metadata(&mut self, input: &GpuBatchInput) -> Result<PackedMetaOffsets> {
+    pub fn upload_metadata(&mut self, input: &GpuBatchInput) -> Result<PackedMetaOffsets> {
         let num_tokens = total_tokens(input);
         let num_seqs = input.num_seqs;
         let max_blocks = self.graph_max_blocks;

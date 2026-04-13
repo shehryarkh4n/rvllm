@@ -83,8 +83,8 @@ const GRAPH_WARMUP_CALLS: usize = 3;
 
 struct PendingForward {
     num_seqs: usize,
-    #[allow(dead_code)]
-    sampling_params: Vec<SamplingParams>,
+    is_decode: bool,
+    stored_output: Option<ForwardOutput>,
 }
 
 // ===================================================================
@@ -243,6 +243,8 @@ impl Worker {
     // =================================================================
 
     /// Launch the forward pass asynchronously. Returns immediately.
+    /// For decode: enqueues all GPU work (no DtoH, no sync) for true overlap.
+    /// For mixed: runs synchronously and stores the result.
     /// Caller must call step_collect() to get the result.
     pub fn step_launch(&mut self, diff: &StepDiff) -> Result<()> {
         self.apply_diff(diff);
@@ -254,22 +256,42 @@ impl Worker {
         }
 
         let input = self.input_builder.build(&self.requests, self.block_size).clone();
-        let sampling_params: Vec<SamplingParams> = input.sampling_params.clone();
         let num_seqs = input.num_seqs;
 
-        // Launch forward (GPU work is async, returns when kernels are enqueued)
-        let _logits = self.execute_forward(&input)?;
-
-        self.pending = Some(PendingForward {
-            num_seqs,
-            sampling_params,
-        });
+        if input.is_all_decode {
+            // True async: enqueue GPU work only (no DtoH, no sync)
+            if self.graph_enabled {
+                if let Some(padded) = padded_batch_size(num_seqs) {
+                    if self.graph_pool.has_graph(num_seqs) {
+                        self.runner.upload_metadata_padded(&input, padded)?;
+                        let graph = self.graph_pool.get(num_seqs).unwrap();
+                        graph.replay_on(self.runner.cuda_stream())
+                            .map_err(|e| WorkerError::Runner(format!("graph replay: {e}")))?;
+                        self.forward_count += 1;
+                        self.pending = Some(PendingForward { num_seqs, is_decode: true, stored_output: None });
+                        return Ok(());
+                    }
+                }
+            }
+            // No graph available: launch forward async (GPU kernels only, no DtoH)
+            self.runner.forward_greedy_launch(&input, &self.kv_cache)
+                .map_err(|e| WorkerError::Runner(format!("{e}")))?;
+            self.forward_count += 1;
+            self.pending = Some(PendingForward { num_seqs, is_decode: true, stored_output: None });
+        } else {
+            // Mixed prefill+decode: run synchronously, store result
+            self.forward_count += 1;
+            let logits = self.execute_forward(&input)?;
+            let output = self.sample_greedy(&logits, &input);
+            self.pending = Some(PendingForward { num_seqs, is_decode: false, stored_output: Some(output) });
+        }
 
         Ok(())
     }
 
     /// Collect the result of a previously launched step.
-    /// Synchronizes the GPU stream and reads back results.
+    /// For decode: reads GPU argmax results (DtoH + sync).
+    /// For mixed: returns the pre-computed result from step_launch.
     pub fn step_collect(&mut self) -> Result<ForwardOutput> {
         let pending = self
             .pending
@@ -280,14 +302,17 @@ impl Worker {
             return Ok(ForwardOutput::default());
         }
 
-        // Synchronize stream to ensure all GPU work is complete
-        self.sync_stream()?;
-
-        // Rebuild input to sample
-        let input = self.input_builder.build(&self.requests, self.block_size).clone();
-        let logits = self.execute_forward(&input)?;
-        let output = self.sample_greedy(&logits, &input);
-        Ok(output)
+        if pending.is_decode {
+            // Just read the argmax token IDs (DtoH + sync)
+            let token_ids_i32 = self.runner.read_graph_output(pending.num_seqs)
+                .map_err(|e| WorkerError::Runner(format!("{e}")))?;
+            let token_ids: Vec<TokenId> =
+                token_ids_i32.iter().map(|&t| t as TokenId).collect();
+            Ok(ForwardOutput { token_ids, logprobs: Vec::new() })
+        } else {
+            // Mixed: result already computed in step_launch
+            Ok(pending.stored_output.unwrap_or_default())
+        }
     }
 
     pub fn requests(&self) -> &HashMap<RequestId, WorkerRequest> {
@@ -304,6 +329,32 @@ impl Worker {
 
     pub fn forward_count(&self) -> usize {
         self.forward_count
+    }
+
+    /// Apply diff only (for spec decode: separate diff from forward).
+    pub fn step_apply_diff(&mut self, diff: &StepDiff) -> Result<()> {
+        self.apply_diff(diff);
+        self.execute_block_ops(&diff.block_ops)
+    }
+
+    /// Run forward only on current request state (for spec decode fallback).
+    pub fn step_forward_only(&mut self) -> Result<ForwardOutput> {
+        if self.requests.is_empty() {
+            return Ok(ForwardOutput::default());
+        }
+        let input = self.input_builder.build(&self.requests, self.block_size).clone();
+        if input.is_all_decode {
+            let token_ids_i32 = self.runner
+                .forward_greedy(&input, &self.kv_cache)
+                .map_err(|e| WorkerError::Runner(format!("{e}")))?;
+            let token_ids: Vec<TokenId> = token_ids_i32.iter().map(|&t| t as TokenId).collect();
+            self.forward_count += 1;
+            Ok(ForwardOutput { token_ids, logprobs: Vec::new() })
+        } else {
+            self.forward_count += 1;
+            let logits = self.execute_forward(&input)?;
+            Ok(self.sample_greedy(&logits, &input))
+        }
     }
 
     // =================================================================
@@ -521,5 +572,101 @@ impl Worker {
     /// Synchronize the compute stream. Blocks until all enqueued GPU work completes.
     pub fn sync(&self) -> Result<()> {
         self.sync_stream()
+    }
+
+    /// Run forward_greedy with a custom input (e.g., spec decode verify batch).
+    pub fn forward_greedy_custom(&mut self, input: &GpuBatchInput) -> Result<Vec<i32>> {
+        self.runner
+            .forward_greedy(input, &self.kv_cache)
+            .map_err(|e| WorkerError::Runner(format!("{e}")))
+    }
+
+    /// Access the KV cache (e.g., for spec decode).
+    pub fn kv_cache(&self) -> &CudaKVCache {
+        &self.kv_cache
+    }
+
+    // =================================================================
+    // Pre-capture CUDA graph buckets
+    // =================================================================
+
+    /// Pre-capture decode graphs for all standard batch-size buckets.
+    /// Call once after model load, before serving requests.
+    pub fn pre_capture_decode_graphs(&mut self, max_batch: usize) -> Result<()> {
+        use rvllm_gpu::cuda_graph::GRAPH_BATCH_SIZES;
+
+        if !self.graph_enabled {
+            info!("graphs disabled, skipping pre-capture");
+            return Ok(());
+        }
+
+        let max_ctx = self.runner.max_seq_len().min(2048) as u32;
+
+        for &bucket in GRAPH_BATCH_SIZES {
+            if bucket > max_batch {
+                break;
+            }
+
+            // Build dummy decode input for this bucket size
+            let dummy = GpuBatchInput {
+                num_seqs: bucket,
+                num_prefill_seqs: 0,
+                num_decode_seqs: bucket,
+                seq_ids: (0..bucket as u64).collect(),
+                token_ids: vec![0; bucket],
+                position_ids: vec![0; bucket],
+                slot_mapping: vec![0; bucket],
+                context_lens: vec![1; bucket],
+                query_lens: vec![1; bucket],
+                sampling_params: vec![SamplingParams::default(); bucket],
+                block_tables_flat: vec![0; bucket * 8],
+                max_blocks_per_seq: 8,
+                is_all_decode: true,
+                is_all_prefill: false,
+                max_context_len: max_ctx,
+                prefill_tokens: Vec::new(),
+                prefill_positions: Vec::new(),
+                prefill_slot_mapping: Vec::new(),
+            };
+
+            // Warmup forward
+            self.runner.upload_metadata_padded(&dummy, bucket)?;
+            self.runner
+                .forward_gpu_only(bucket, bucket, max_ctx, &self.kv_cache)
+                .map_err(|e| WorkerError::Runner(format!("graph warmup: {e}")))?;
+            self.sync_stream()?;
+
+            // Capture
+            self.runner.upload_metadata_padded(&dummy, bucket)?;
+            self.graph_pool
+                .begin_capture_on(self.runner.cuda_stream())
+                .map_err(|e| WorkerError::Runner(format!("begin_capture: {e}")))?;
+
+            match self
+                .runner
+                .forward_gpu_only(bucket, bucket, max_ctx, &self.kv_cache)
+            {
+                Ok(()) => {
+                    let graph = self
+                        .graph_pool
+                        .end_capture_on(self.runner.cuda_stream(), bucket)
+                        .map_err(|e| WorkerError::Runner(format!("end_capture: {e}")))?;
+                    self.graph_pool.insert(graph);
+                    trace!(bucket, "pre-captured decode graph");
+                }
+                Err(e) => {
+                    let _ = self
+                        .graph_pool
+                        .end_capture_on(self.runner.cuda_stream(), bucket);
+                    warn!(bucket, "graph pre-capture failed: {e}");
+                }
+            }
+        }
+
+        info!(
+            count = self.graph_pool.len(),
+            "decode graph pre-capture complete"
+        );
+        Ok(())
     }
 }
