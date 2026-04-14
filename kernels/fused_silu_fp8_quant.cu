@@ -2,12 +2,17 @@
 // Input layout: [num_tokens, 2 * intermediate_size] as [gate | up] per row.
 // Output: [num_tokens, intermediate_size] in FP8 with per-row scales.
 // Compile: nvcc -ptx -arch=sm_90 -O3 --use_fast_math
+//
+// Vectorized: 128-bit loads (8 halves), register-cached intermediates
+// (eliminates second global memory pass), 64-bit FP8 stores.
 
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 
 #define FP8_E4M3_MAX 448.0f
 #define WARPS_MAX 32
+#define VEC_SIZE 8
+#define MAX_VECS_PER_THREAD 4  // supports intermediate_size up to 32768
 
 __device__ __forceinline__ float warp_reduce_max(float val) {
     #pragma unroll
@@ -31,6 +36,7 @@ __device__ __forceinline__ float block_reduce_max(float val, float* smem) {
 // SiLU(gate) * up + per-token FP8 quantization.
 // grid=(num_tokens), block=(min(intermediate_size, 1024))
 // shared mem: WARPS_MAX * sizeof(float)
+// Requires: intermediate_size % 8 == 0 (true for all transformer models)
 extern "C" __global__ void __launch_bounds__(1024)
 fused_silu_mul_fp8_quant_kernel(
     __nv_fp8_storage_t* __restrict__ output_fp8,
@@ -41,20 +47,39 @@ fused_silu_mul_fp8_quant_kernel(
     const int row = blockIdx.x;
     const int tid = threadIdx.x;
     const int stride = blockDim.x;
-    const int src_row_offset = row * 2 * intermediate_size;
-    const int dst_row_offset = row * intermediate_size;
+    const int n_vecs = intermediate_size / VEC_SIZE;
+
+    // 128-bit vectorized pointers for gate and up halves of this row
+    const uint4* gate_vec = reinterpret_cast<const uint4*>(
+        gate_up + row * 2 * intermediate_size);
+    const uint4* up_vec = reinterpret_cast<const uint4*>(
+        gate_up + row * 2 * intermediate_size + intermediate_size);
 
     __shared__ float smem[WARPS_MAX];
 
-    // Pass 1: compute silu(gate)*up, find absmax
+    // Register cache: store silu(g)*u to avoid reloading in pass 2
+    float cached[MAX_VECS_PER_THREAD * VEC_SIZE];
+
+    // Pass 1: vectorized 128-bit loads, compute SiLU(gate)*up, find absmax
     float local_max = 0.0f;
-    for (int i = tid; i < intermediate_size; i += stride) {
-        float g = __half2float(gate_up[src_row_offset + i]);
-        float u = __half2float(gate_up[src_row_offset + intermediate_size + i]);
-        float silu_g = g / (1.0f + expf(-g));
-        float v = silu_g * u;
-        local_max = fmaxf(local_max, fabsf(v));
+    int vec_idx = 0;
+    for (int i = tid; i < n_vecs; i += stride, vec_idx++) {
+        uint4 gv = gate_vec[i];
+        uint4 uv = up_vec[i];
+        const __half* g = reinterpret_cast<const __half*>(&gv);
+        const __half* u = reinterpret_cast<const __half*>(&uv);
+
+        #pragma unroll
+        for (int j = 0; j < VEC_SIZE; j++) {
+            float gf = __half2float(g[j]);
+            float uf = __half2float(u[j]);
+            float silu_g = gf / (1.0f + expf(-gf));
+            float v = silu_g * uf;
+            cached[vec_idx * VEC_SIZE + j] = v;
+            local_max = fmaxf(local_max, fabsf(v));
+        }
     }
+
     float absmax = block_reduce_max(local_max, smem);
     __syncthreads();
 
@@ -63,12 +88,17 @@ fused_silu_mul_fp8_quant_kernel(
     if (tid == 0) output_scales[row] = scale;
     float inv_scale = 1.0f / scale;
 
-    // Pass 2: recompute and quantize
-    for (int i = tid; i < intermediate_size; i += stride) {
-        float g = __half2float(gate_up[src_row_offset + i]);
-        float u = __half2float(gate_up[src_row_offset + intermediate_size + i]);
-        float silu_g = g / (1.0f + expf(-g));
-        float v = silu_g * u;
-        output_fp8[dst_row_offset + i] = __nv_cvt_float_to_fp8(v * inv_scale, __NV_SATFINITE, __NV_E4M3);
+    // Pass 2: quantize from register cache, 64-bit vectorized FP8 store
+    uint2* out_vec = reinterpret_cast<uint2*>(output_fp8 + row * intermediate_size);
+    vec_idx = 0;
+    for (int i = tid; i < n_vecs; i += stride, vec_idx++) {
+        __nv_fp8_storage_t fp8[VEC_SIZE];
+        #pragma unroll
+        for (int j = 0; j < VEC_SIZE; j++) {
+            fp8[j] = __nv_cvt_float_to_fp8(
+                cached[vec_idx * VEC_SIZE + j] * inv_scale,
+                __NV_SATFINITE, __NV_E4M3);
+        }
+        out_vec[i] = *reinterpret_cast<const uint2*>(fp8);
     }
 }

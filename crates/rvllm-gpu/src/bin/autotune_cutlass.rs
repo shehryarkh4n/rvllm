@@ -12,7 +12,7 @@ use cudarc::driver::sys as cu_sys;
 use cudarc::driver::{CudaContext, DevicePtr, DevicePtrMut};
 use half::f16;
 use rvllm_gpu::cutlass_autotune::CutlassAutotuneCache;
-use rvllm_gpu::cutlass_ffi::{CutlassKernels, HGEMM_VARIANTS, OPROJ_RESIDUAL_VARIANTS, GATEUP_SILU_VARIANTS};
+use rvllm_gpu::cutlass_ffi::{CutlassKernels, HGEMM_VARIANTS, OPROJ_RESIDUAL_VARIANTS, GATEUP_SILU_VARIANTS, FP8_GEMM_VARIANTS};
 use std::ffi::c_void;
 use std::path::PathBuf;
 
@@ -36,6 +36,15 @@ const OPROJ_SHAPES: &[(usize, usize, &str)] = &[
 // gateup+silu: C = SiLU(A @ W), shape (M, gate_up_dim, hidden) = (M, 37888, 3584)
 const GATEUP_SHAPES: &[(usize, usize, &str)] = &[
     (37888, 3584, "gate_up+SiLU"),
+];
+
+// FP8 GEMM shapes: same weight matrices, FP8 precision
+// Skip LM head (done in F16)
+const FP8_SHAPES: &[(usize, usize, &str)] = &[
+    (4608, 3584, "QKV"),
+    (3584, 3584, "O-proj"),
+    (37888, 3584, "gate_up"),
+    (3584, 18944, "down"),
 ];
 
 const M_VALUES: &[usize] = &[1, 2, 4, 8, 16, 32, 64, 128, 256];
@@ -375,6 +384,50 @@ fn bench_gateup_silu_variant(
     Some(median(&mut times))
 }
 
+/// Time a single FP8 GEMM variant. Returns median microseconds or None.
+fn bench_fp8_gemm_variant(
+    cutlass: &CutlassKernels,
+    variant: usize,
+    cu_stream: cu_sys::CUstream,
+    m: usize, n: usize, k: usize,
+    a_ptr: u64, b_ptr: u64, c_ptr: u64,
+    as_ptr: u64, bs_ptr: u64,
+    ws_ptr: u64, ws_size: usize, stream_ptr: u64,
+) -> Option<f32> {
+    let ws_needed = cutlass.fp8_gemm_variant_workspace_size(variant, m as i32, n as i32, k as i32)?;
+    if ws_needed > ws_size {
+        eprintln!("  fp8 v{variant} needs {} bytes workspace, have {} -- skip", ws_needed, ws_size);
+        return None;
+    }
+
+    if cutlass.fp8_gemm_variant(variant, c_ptr, a_ptr, b_ptr, as_ptr, bs_ptr,
+        m as i32, n as i32, k as i32, ws_ptr, ws_size, stream_ptr).is_err() {
+        return None;
+    }
+    let r = unsafe { cu_sys::cuStreamSynchronize(cu_stream) };
+    if r != cu_sys::CUresult::CUDA_SUCCESS { return None; }
+
+    for _ in 0..WARMUP_ITERS {
+        let _ = cutlass.fp8_gemm_variant(variant, c_ptr, a_ptr, b_ptr, as_ptr, bs_ptr,
+            m as i32, n as i32, k as i32, ws_ptr, ws_size, stream_ptr);
+    }
+    let r = unsafe { cu_sys::cuStreamSynchronize(cu_stream) };
+    if r != cu_sys::CUresult::CUDA_SUCCESS { return None; }
+
+    let mut times = Vec::with_capacity(BENCH_ITERS);
+    for _ in 0..BENCH_ITERS {
+        let start = CuEvent::new();
+        let stop = CuEvent::new();
+        start.record(cu_stream);
+        let _ = cutlass.fp8_gemm_variant(variant, c_ptr, a_ptr, b_ptr, as_ptr, bs_ptr,
+            m as i32, n as i32, k as i32, ws_ptr, ws_size, stream_ptr);
+        stop.record(cu_stream);
+        stop.sync();
+        times.push(stop.elapsed_ms(&start) * 1000.0);
+    }
+    Some(median(&mut times))
+}
+
 // -- Detailed results for the report JSON --
 
 #[derive(serde::Serialize)]
@@ -449,9 +502,11 @@ fn main() {
     let hgemm_loaded = cutlass.hgemm_variant_count();
     let oproj_loaded = cutlass.oproj_residual_variant_count();
     let gateup_loaded = cutlass.gateup_silu_variant_count();
+    let fp8_loaded = cutlass.fp8_gemm_variant_count();
     println!("Loaded {hgemm_loaded}/{HGEMM_VARIANTS} HGEMM variants");
     println!("Loaded {oproj_loaded}/{OPROJ_RESIDUAL_VARIANTS} oproj+residual variants");
     println!("Loaded {gateup_loaded}/{GATEUP_SILU_VARIANTS} gateup+SiLU variants");
+    println!("Loaded {fp8_loaded}/{FP8_GEMM_VARIANTS} FP8 GEMM variants");
     if hgemm_loaded == 0 {
         eprintln!("ERROR: No HGEMM autotune variants in .so -- build cutlass_hgemm_autotune.cu first");
         std::process::exit(1);
@@ -465,29 +520,57 @@ fn main() {
     let all_shapes: Vec<(usize, usize)> = SHAPES.iter().map(|&(n, k, _)| (n, k))
         .chain(OPROJ_SHAPES.iter().map(|&(n, k, _)| (n, k)))
         .chain(GATEUP_SHAPES.iter().map(|&(n, k, _)| (n, k)))
+        .chain(FP8_SHAPES.iter().map(|&(n, k, _)| (n, k)))
         .collect();
     let max_a = all_shapes.iter().map(|&(_, k)| max_m * k).max().unwrap();
     let max_b = all_shapes.iter().map(|&(n, k)| n * k).max().unwrap();
     let max_c = all_shapes.iter().map(|&(n, _)| max_m * n).max().unwrap();
 
+    // Compute max workspace needed (stream-K/split-K variants need more)
+    let mut dyn_ws_bytes = WORKSPACE_BYTES;
+    for &(n, k, _) in FP8_SHAPES {
+        for &m in M_VALUES {
+            for v in 0..FP8_GEMM_VARIANTS {
+                if let Some(ws) = cutlass.fp8_gemm_variant_workspace_size(v, m as i32, n as i32, k as i32) {
+                    dyn_ws_bytes = dyn_ws_bytes.max(ws);
+                }
+            }
+        }
+    }
+    let ws_bytes = dyn_ws_bytes;
+
     let a_buf = stream.alloc_zeros::<f16>(max_a).expect("alloc A");
     let b_buf = stream.alloc_zeros::<f16>(max_b).expect("alloc B");
     let mut c_buf = stream.alloc_zeros::<f16>(max_c).expect("alloc C");
-    let mut ws_buf = stream.alloc_zeros::<u8>(WORKSPACE_BYTES).expect("alloc workspace");
+    let mut ws_buf = stream.alloc_zeros::<u8>(ws_bytes).expect("alloc workspace");
     // Extra residual buffer for oproj+residual (same size as output)
     let r_buf = stream.alloc_zeros::<f16>(max_c).expect("alloc residual");
+
+    // FP8 buffers: u8 for FP8 data, f32 for scales
+    let fp8_a_buf = stream.alloc_zeros::<u8>(max_a).expect("alloc FP8 A");
+    let fp8_b_buf = stream.alloc_zeros::<u8>(max_b).expect("alloc FP8 B");
+    let fp8_as_buf = stream.alloc_zeros::<f32>(max_m).expect("alloc FP8 A scales");
+    let fp8_bs_buf = stream.alloc_zeros::<f32>(1).expect("alloc FP8 B scale");
 
     let (a_ptr, _ag) = DevicePtr::device_ptr(&a_buf, &stream);
     let (b_ptr, _bg) = DevicePtr::device_ptr(&b_buf, &stream);
     let (c_ptr, _cg) = DevicePtrMut::device_ptr_mut(&mut c_buf, &stream);
     let (ws_ptr, _wg) = DevicePtrMut::device_ptr_mut(&mut ws_buf, &stream);
     let (r_ptr, _rg) = DevicePtr::device_ptr(&r_buf, &stream);
+    let (fp8_a_ptr, _fp8ag) = DevicePtr::device_ptr(&fp8_a_buf, &stream);
+    let (fp8_b_ptr, _fp8bg) = DevicePtr::device_ptr(&fp8_b_buf, &stream);
+    let (fp8_as_ptr, _fp8asg) = DevicePtr::device_ptr(&fp8_as_buf, &stream);
+    let (fp8_bs_ptr, _fp8bsg) = DevicePtr::device_ptr(&fp8_bs_buf, &stream);
 
     let a_ptr = a_ptr as u64;
     let b_ptr = b_ptr as u64;
     let c_ptr = c_ptr as u64;
     let ws_ptr = ws_ptr as u64;
     let r_ptr = r_ptr as u64;
+    let fp8_a_ptr = fp8_a_ptr as u64;
+    let fp8_b_ptr = fp8_b_ptr as u64;
+    let fp8_as_ptr = fp8_as_ptr as u64;
+    let fp8_bs_ptr = fp8_bs_ptr as u64;
 
     // Benchmark all shapes
     let mut cache = CutlassAutotuneCache::default();
@@ -514,7 +597,7 @@ fn main() {
             for v in 0..HGEMM_VARIANTS {
                 match bench_cutlass_variant(
                     &cutlass, v, cu_stream, m, n, k,
-                    a_ptr, b_ptr, c_ptr, ws_ptr, WORKSPACE_BYTES, stream_ptr,
+                    a_ptr, b_ptr, c_ptr, ws_ptr, ws_bytes, stream_ptr,
                 ) {
                     Some(us) => {
                         println!("  v{v} ({name}): {us:8.1} us", name = VARIANT_NAMES[v]);
@@ -590,7 +673,7 @@ fn main() {
                 for v in 0..OPROJ_RESIDUAL_VARIANTS {
                     match bench_oproj_residual_variant(
                         &cutlass, v, cu_stream, m, n, k,
-                        a_ptr, b_ptr, c_ptr, r_ptr, ws_ptr, WORKSPACE_BYTES, stream_ptr,
+                        a_ptr, b_ptr, c_ptr, r_ptr, ws_ptr, ws_bytes, stream_ptr,
                     ) {
                         Some(us) => {
                             println!("  v{v}: {us:8.1} us");
@@ -649,7 +732,7 @@ fn main() {
                 for v in 0..GATEUP_SILU_VARIANTS {
                     match bench_gateup_silu_variant(
                         &cutlass, v, cu_stream, m, n, k,
-                        a_ptr, b_ptr, c_ptr, ws_ptr, WORKSPACE_BYTES, stream_ptr,
+                        a_ptr, b_ptr, c_ptr, ws_ptr, ws_bytes, stream_ptr,
                     ) {
                         Some(us) => {
                             println!("  v{v}: {us:8.1} us");
@@ -683,6 +766,58 @@ fn main() {
         }
     }
 
+    // ===================================================================
+    // FP8 GEMM variants (FP8 E4M3 with fused per-row/per-tensor scaling)
+    // ===================================================================
+    if fp8_loaded > 0 {
+        println!();
+        println!("Benchmarking FP8 GEMM ({fp8_loaded} variants)");
+        println!("{}", "=".repeat(72));
+
+        for &(n, k, proj) in FP8_SHAPES {
+            println!();
+            println!("--- FP8 {proj} (N={n}, K={k}) ---");
+
+            for &m in M_VALUES {
+                println!();
+                println!("FP8 Shape M={m} N={n} K={k}:");
+
+                let mut best: Option<(usize, f32)> = None;
+                for v in 0..FP8_GEMM_VARIANTS {
+                    match bench_fp8_gemm_variant(
+                        &cutlass, v, cu_stream, m, n, k,
+                        fp8_a_ptr, fp8_b_ptr, c_ptr,
+                        fp8_as_ptr, fp8_bs_ptr,
+                        ws_ptr, ws_bytes, stream_ptr,
+                    ) {
+                        Some(us) => {
+                            println!("  fp8_v{v}: {us:8.1} us");
+                            match best {
+                                None => best = Some((v, us)),
+                                Some((_, bt)) if us < bt => best = Some((v, us)),
+                                _ => {}
+                            }
+                        }
+                        None => {}
+                    }
+                }
+
+                total += 1;
+                match best {
+                    Some((v, us)) => {
+                        cache.insert_fp8_gemm(m, n, k, v);
+                        cutlass_wins += 1;
+                        println!("  BEST: fp8_v{v} ({us:.1} us)");
+                    }
+                    None => {
+                        cublas_wins += 1;
+                        println!("  NO FP8 VARIANT WORKED for M={m} N={n} K={k}");
+                    }
+                }
+            }
+        }
+    }
+
     // Summary
     println!();
     println!("{}", "=".repeat(72));
@@ -697,6 +832,7 @@ fn main() {
     println!("  hgemm entries: {}", cache.hgemm.len());
     println!("  oproj_residual entries: {}", cache.oproj_residual.len());
     println!("  gateup_silu entries: {}", cache.gateup_silu.len());
+    println!("  fp8_gemm entries: {}", cache.fp8_gemm.len());
 
     // Compact table
     println!();

@@ -11,7 +11,7 @@ use std::path::Path;
 pub const HGEMM_VARIANTS: usize = 67;
 pub const OPROJ_RESIDUAL_VARIANTS: usize = 31;
 pub const GATEUP_SILU_VARIANTS: usize = 32;
-pub const FP8_GEMM_VARIANTS: usize = 15;
+pub const FP8_GEMM_VARIANTS: usize = 32;
 
 /// Handle to the loaded CUTLASS shared library.
 /// Holds function pointers resolved at load time for zero-cost dispatch.
@@ -30,6 +30,8 @@ pub struct CutlassKernels {
     fn_hgemm_ws: WorkspaceSizeFn,
     fn_fp8_gemm: Fp8GemmFn,
     fn_fp8_gemm_ws: WorkspaceSizeFn,
+    fn_fp8_gemm_small: Option<Fp8GemmFn>,
+    fn_fp8_gemm_small_wksz: Option<WorkspaceSizeFn>,
     // Autotuned HGEMM variants
     fn_hgemm_variants: [Option<HgemmFn>; HGEMM_VARIANTS],
     fn_hgemm_ws_variants: [Option<WorkspaceSizeFn>; HGEMM_VARIANTS],
@@ -171,6 +173,12 @@ impl CutlassKernels {
                 .get(b"cutlass_fp8_gemm_workspace_size\0")
                 .map_err(|e| format!("cutlass_fp8_gemm_workspace_size: {e}"))?;
 
+            // Small-tile FP8 GEMM for decode (M<=64, tile 64x128x256)
+            let fn_fp8_gemm_small: Option<Fp8GemmFn> =
+                lib.get(b"cutlass_fp8_gemm_small\0").ok().map(|f| *f);
+            let fn_fp8_gemm_small_wksz: Option<WorkspaceSizeFn> =
+                lib.get(b"cutlass_fp8_gemm_small_workspace_size\0").ok().map(|f| *f);
+
             // Load autotuned HGEMM variants (optional -- don't fail if missing)
             let mut fn_hgemm_variants: [Option<HgemmFn>; HGEMM_VARIANTS] = [None; HGEMM_VARIANTS];
             let mut fn_hgemm_ws_variants: [Option<WorkspaceSizeFn>; HGEMM_VARIANTS] = [None; HGEMM_VARIANTS];
@@ -241,6 +249,8 @@ impl CutlassKernels {
                 fn_hgemm_ws,
                 fn_fp8_gemm,
                 fn_fp8_gemm_ws,
+                fn_fp8_gemm_small,
+                fn_fp8_gemm_small_wksz,
                 fn_hgemm_variants,
                 fn_hgemm_ws_variants,
                 fn_oproj_res_variants,
@@ -486,6 +496,34 @@ impl CutlassKernels {
     /// Query workspace size for FP8 GEMM.
     pub fn fp8_gemm_workspace_size(&self, m: i32, n: i32, k: i32) -> usize {
         unsafe { (self.fn_fp8_gemm_ws)(m, n, k) }
+    }
+
+    /// FP8 GEMM with small tile (64x128x256) for decode (M <= 64).
+    pub fn fp8_gemm_small(
+        &self,
+        output: u64, a: u64, b: u64,
+        a_scales: u64, b_scale: u64,
+        m: i32, n: i32, k: i32,
+        workspace: u64, workspace_size: usize, stream: u64,
+    ) -> Result<(), String> {
+        let f = self.fn_fp8_gemm_small
+            .ok_or("cutlass_fp8_gemm_small not loaded")?;
+        let status = unsafe {
+            f(
+                output as *mut c_void, a as *const c_void, b as *const c_void,
+                a_scales as *const c_void, b_scale as *const c_void,
+                m, n, k,
+                workspace as *mut c_void, workspace_size, stream as *mut c_void,
+            )
+        };
+        if status != 0 {
+            return Err(format!("cutlass_fp8_gemm_small failed: {status}"));
+        }
+        Ok(())
+    }
+
+    pub fn has_fp8_gemm_small(&self) -> bool {
+        self.fn_fp8_gemm_small.is_some()
     }
 
     // -- Autotuned variant dispatch --

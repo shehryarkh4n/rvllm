@@ -159,7 +159,18 @@ fn cutlass_fp8_gemm_dispatch(
         }
     }
 
-    // No autotuned variant for this shape -- use default CUTLASS FP8 kernel
+    // Small tile (64x128x128) for decode: better tile utilization when M <= 64
+    if m <= 64 && cutlass.has_fp8_gemm_small() {
+        return cutlass.fp8_gemm_small(
+            out_ptr as u64, act_ptr as u64, w_ptr as u64,
+            as_ptr as u64, ws_ptr as u64,
+            m as i32, n as i32, k as i32,
+            wk_ptr as u64, workspace.len(),
+            stream_ptr,
+        ).map_err(|e| LLMError::GpuError(e));
+    }
+
+    // Default CUTLASS FP8 kernel
     cutlass.fp8_gemm(
         out_ptr as u64, act_ptr as u64, w_ptr as u64,
         as_ptr as u64, ws_ptr as u64,
