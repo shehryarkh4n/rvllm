@@ -7,7 +7,7 @@
   \vspace{0.3em}
   {\normalsize\texttt{https://github.com/m0at/rvllm}\par}
   \vspace{0.3em}
-  {\normalsize San Francisco, April 12, 2026\par}
+  {\normalsize San Francisco, April 14, 2026\par}
 \end{center}
 \vspace{1em}
 
@@ -27,7 +27,9 @@ serving Qwen2.5-7B against vLLM~0.19.0 FP8 (April 2026), rvLLM~v2 FP8 reaches
 13{,}865~tok/s at $N\!=\!1$ (\textbf{79$\times$ vLLM}).
 The key changes in this revision are: CUTLASS~3x SM90 FP8 GEMMs with Hopper WGMMA
 and TMA replacing cuBLASLt, fused RMSNorm+FP8 quantization kernels, fused
-SiLU+FP8 quantization kernels, and a scheduler preemption fix eliminating the
+SiLU+FP8 quantization kernels, vectorized fused SiLU with 128-bit loads and
+64-bit FP8 stores, and stream-K/split-K CUTLASS autotune variants for SM load
+balancing, and a scheduler preemption fix eliminating the
 $N\!\ge\!96$ throughput cliff. These reduce per-layer kernel count from 15 to 8,
 cutting kernel launch overhead by 47\%.
 rvLLM is open-source under the Apache-2.0 license.
@@ -105,6 +107,12 @@ The primary contributions are:
         decode length.
   \item A development cost analysis: approximately \$1{,}780 in compute and AI
         assistance to build the system from scratch.
+  \item Stream-K and split-K FP8 GEMM autotune variants for CUTLASS~3x SM90,
+        with 32~FP8 GEMM variants and a standalone autotune binary. Split-K=4
+        on the Down projection (M=64, K=18{,}944) achieves 28.5\% speedup by
+        increasing SM utilization from 21\% to 85\%. Vectorized fused SiLU+FP8
+        quantize with 128-bit loads and 64-bit stores. Combined: +12--15\%
+        decode throughput across batch sizes.
 \end{enumerate}
 
 % ============================================================================
@@ -587,6 +595,16 @@ compound effect of several reinforcing mechanisms:
         batch, eliminating pipeline bubbles between prefill and decode.
   \item \textbf{Scheduler preemption fix}: early return when no admission pressure,
         eliminating the $N\!\ge\!96$ throughput cliff seen in earlier revisions.
+  \item \textbf{Vectorized fused SiLU+FP8}: 128-bit loads (\texttt{uint4})
+        and 64-bit FP8 stores (\texttt{uint2}) with register caching eliminate
+        second-pass global memory reads in the MLP activation kernel.
+  \item \textbf{Stream-K / split-K autotune}: CUTLASS \texttt{StreamKScheduler}
+        decomposes K-dimension work across SMs. Split-K=4 on the Down projection
+        gives 112 threadblocks on 132 SMs (85\% utilization) vs 28 without
+        splitting (21\%).
+  \item \textbf{FP8 GEMM autotune}: 32 variants (tile shapes, cluster shapes,
+        Cooperative/WarpSpecialized/Pingpong/FP8FastAccum schedules, stream-K,
+        split-K) benchmarked per shape by standalone autotune binary.
 \end{enumerate}
 
 \subsection{Limitations}
@@ -627,6 +645,18 @@ operation with FP8 conversion:
         kernel computes the gated activation and quantizes the result per-token.
   \item \textbf{CUTLASS~3x SM90 FP8 GEMM}: Hopper WGMMA + TMA with per-row
         activation scales, per-tensor weight scale, and f16 output accumulation.
+  \item \textbf{Vectorized fused SiLU+FP8 quantization}: 128-bit vectorized
+        loads (\texttt{uint4}, 8 halves per load) and 64-bit FP8 stores
+        (\texttt{uint2}, 8 FP8 values per store) with register caching to
+        eliminate second-pass global memory reads.
+  \item \textbf{Stream-K / split-K FP8 GEMM autotune}: 32~FP8 GEMM variants
+        including stream-K (CUTLASS \texttt{StreamKScheduler}) and split-K
+        (explicit K-decomposition with split factors 2 and 4). The standalone
+        autotune binary benchmarks all variants per shape. Split-K=4 on the
+        Down projection ($M\!=\!64$, $N\!=\!3584$, $K\!=\!18{,}944$) achieves
+        28.5\% speedup (65.4\,$\mu$s to 46.8\,$\mu$s) by increasing SM
+        utilization from 21\% (28 threadblocks on 132 SMs) to 85\% (112
+        threadblocks).
 \end{enumerate}
 
 This gives 2 kernels per GEMM site (fused quant + CUTLASS GEMM) for a total of

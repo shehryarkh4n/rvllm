@@ -2,6 +2,47 @@
 
 This file starts with the current public benchmark truth, then keeps older numbers only as historical context.
 
+## Latest Internal Benchmark (April 14, 2026)
+
+Model: Qwen2.5-7B FP8 E4M3
+GPU: H100 SXM 80GB
+Harness: rvllm-v2-bench (direct engine, no HTTP)
+Decode length: `output-len=512`
+
+### FP8 Optimization Gains
+
+Three kernel optimizations measured against the April 12 v2 FP8 baseline:
+
+| N | Before (tok/s) | After (tok/s) | Gain |
+|---:|---:|---:|---:|
+| 1 | 130.0 | 145.5 | +11.9% |
+| 32 | 3,917.0 | 4,356.3 | +11.2% |
+| 64 | 9,743.7 | 10,990.8 | +12.8% |
+| 128 | 16,641.4 | 19,137.3 | +15.0% |
+
+### What changed
+
+1. **Vectorized fused SiLU*mul + FP8 quantize** -- 128-bit loads (uint4, 8 halves per load) and 64-bit FP8 stores (uint2, 8 FP8 values per store). Register caching eliminates second-pass global memory reads.
+
+2. **Stream-K / split-K FP8 GEMM autotune variants (v25-v31)** -- CUTLASS StreamKScheduler decomposes K-dimension work across SMs. Split-K=4 on Down projection (M=64,N=3584,K=18944): 28.5% speedup (65.4us -> 46.8us) by going from 28 threadblocks on 132 SMs (21% utilization) to 112 threadblocks (85% utilization).
+
+3. **FP8FastAccum schedule aliases** -- CUTLASS KernelTmaWarpSpecializedFP8FastAccum, Cooperative, and Pingpong variants in autotune pool (v15-v24).
+
+### FP8 Autotune Cache
+
+32 FP8 GEMM variants total. Standalone autotune binary benchmarks all variants per shape. Cache results (36 entries):
+
+- Down projection (K=18944): split-K=4 (v29) wins for most M values, stream-K (v25) for some
+- Gate+Up (K=3584): v0/v5 wins (already high SM occupancy, splitting doesn't help)
+- O-proj (K=3584): v0 wins
+- QKV (K=3584): v0 wins
+
+### Note on methodology
+
+These numbers use `output-len=512` vs the April 12 public comparison which used `output-len=128`. The percentage gains carry over (they're per-decode-step improvements) but the absolute tok/s numbers are not directly comparable to the head-to-head vLLM table.
+
+---
+
 ## Current Public Comparison (April 7, 2026)
 
 Model: Qwen2.5-7B f16

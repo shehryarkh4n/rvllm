@@ -23,6 +23,9 @@ Four changes closed the gap and put rvLLM ahead:
 2. **Fused RMSNorm + FP8 quantize kernels** -- single kernel replaces 3 separate launches
 3. **Fused SiLU*mul + FP8 quantize kernels** -- single kernel replaces 3 separate launches
 4. **Scheduler preemption fix** -- early return when waiting+swapped queues empty, eliminating the N=96+ throughput cliff
+5. **Vectorized fused SiLU*mul + FP8 quantize** -- 128-bit loads (uint4) and 64-bit FP8 stores (uint2), register caching eliminates second-pass reads
+6. **FP8 stream-K / split-K CUTLASS autotune** -- 7 new GEMM variants (v25-v31) with StreamKScheduler and explicit K-decomposition for SM load balancing
+7. **CUTLASS FP8 autotune expansion** -- 32 FP8 GEMM variants total (up from 25), standalone autotune binary benchmarks all shapes
 
 What rvLLM does well:
 - **29,868 tok/s at N=64** (FP8), **30,674 tok/s at N=128** (F16) on a single H100
@@ -80,6 +83,8 @@ The `rvllm-v2` crate (`crates/rvllm-v2/`) implements a full FP8 inference pipeli
 - **Fused residual-add + RMSNorm + per-token FP8 quantize**: attention residual path in one launch
 - **Fused SiLU*mul + per-token FP8 quantize**: single kernel replaces separate SiLU, elementwise mul, and quantize kernels (3 -> 1)
 - **CUTLASS 3x SM90 FP8 GEMM**: per-row activation scaling and per-tensor weight scaling, replacing cuBLASLt
+- **CUTLASS FP8 autotune**: 32 GEMM variants (tile shapes, cluster shapes, Cooperative/WarpSpecialized/Pingpong/FP8FastAccum schedules, stream-K, split-K=2/4) benchmarked per shape; split-K=4 wins on Down projection (28.5% speedup from 65.4us to 46.8us at M=64)
+- **Vectorized fused SiLU+FP8**: uint4 128-bit loads (8 halves per load), register caching, uint2 64-bit FP8 stores (8 FP8 values per store)
 - **Per-layer kernel count**: 8 kernels (down from 15 with the cuBLASLt path)
 - **Scheduler preemption fix**: early return when waiting+swapped queues empty, eliminating the N=96+ throughput cliff that plagued earlier v2 benchmarks
 
@@ -271,6 +276,7 @@ Why rvLLM is faster:
 5. **Rust scheduler with no GIL serialization** -- scheduling decisions run in parallel via Rayon, no Python lock contention between GPU kernel launches.
 6. **Single pre-allocated memory slab** -- zero per-request allocation. All scratch, KV cache, and activation buffers allocated once at startup.
 7. **29,868 tok/s at N=64 FP8**, **30,674 tok/s at N=128 F16** -- concrete numbers on the same hardware vLLM was tested on.
+8. **Stream-K / split-K FP8 GEMMs** -- CUTLASS StreamKScheduler decomposes K-dimension across SMs for load balancing; split-K=4 on Down projection gives 112 threadblocks on 132 SMs (85% utilization) vs 28 threadblocks (21%) without splitting
 
 What vLLM still does better:
 

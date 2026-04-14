@@ -128,7 +128,7 @@ footer a:hover{color:#999}
 
 <header>
   <h1>rvLLM</h1>
-  <p class="sub">High-performance LLM inference in Rust. 31-crate workspace. 54 CUDA kernels. 13 model architectures. FA3 v3 cp.async + split-KV. FP8 E4M3 quantization. JIT PTX compiler.</p>
+  <p class="sub">High-performance LLM inference in Rust. 31-crate workspace. 54 CUDA kernels. 13 model architectures. FA3 v3 cp.async + split-KV. FP8 E4M3 quantization. JIT PTX compiler. Stream-K/split-K FP8 autotune.</p>
   <p class="links">
     <a href="https://github.com/m0at/rvllm">GitHub</a>
     <a href="paper/rvllm.pdf">Paper (color)</a>
@@ -139,10 +139,10 @@ footer a:hover{color:#999}
 
 <div class="hero">
   <div class="big">29,868 tok/s</div>
-  <div class="sub">Qwen2.5-7B on H100, v2 engine FP8 E4M3, N=64. 2.2x vLLM 0.19.0 FP8. CUTLASS SM90 FP8 GEMMs + fused RMSNorm/SiLU quantize kernels, 8 kernels per layer.</div>
+  <div class="sub">Qwen2.5-7B on H100, v2 engine FP8 E4M3, N=64. 2.2x vLLM 0.19.0 FP8. CUTLASS SM90 FP8 GEMMs + fused RMSNorm/SiLU quantize kernels + vectorized SiLU+FP8 + stream-K/split-K autotune, 8 kernels per layer.</div>
   <div class="hero-graphic">
     <div class="hero-graphic-title">Verified H100 Comparison</div>
-    <div class="hero-graphic-sub">April 12, 2026</div>
+    <div class="hero-graphic-sub">April 14, 2026</div>
     <div class="hero-chart-root" aria-label="rvLLM H100 comparison chart">
       <div class="hero-chart-legend">
         <span><i style="background:#78CFFF"></i>vLLM 0.19.0</span>
@@ -228,7 +228,7 @@ footer a:hover{color:#999}
 
 <section>
 <h2>Abstract</h2>
-<p class="section-sub">Andy Norris (m0at) -- San Francisco, April 12 2026</p>
+<p class="section-sub">Andy Norris (m0at) -- San Francisco, April 14, 2026</p>
 <p>
   rvLLM is a from-scratch Rust implementation of the vLLM inference engine for
   OpenAI-compatible API serving with CUDA GPU acceleration. 310 commits, 31 crates,
@@ -349,14 +349,17 @@ footer a:hover{color:#999}
 </section>
 
 <section>
-<h2>What Changed on April 12</h2>
-<p class="section-sub">CUTLASS FP8, fused kernels, and the scheduler fix</p>
+<h2>What Changed</h2>
+<p class="section-sub">CUTLASS FP8, fused kernels, scheduler fix, vectorized SiLU+FP8, stream-K/split-K autotune</p>
 <ol>
 <li><strong>CUTLASS SM90 FP8 GEMMs replaced cublasLt.</strong> Same kernel family vLLM uses (Hopper WGMMA + TMA), but driven directly from Rust via the CUTLASS 3x C++ API. Eliminates the cublasLt wrapper overhead and autotuning warmup.</li>
 <li><strong>Fused RMSNorm + per-token FP8 quantize.</strong> A single kernel reads the hidden state, normalizes, quantizes to FP8 E4M3 per-token, and writes the result. Replaces 3 separate kernels (norm, abs-max, quantize).</li>
 <li><strong>Fused SiLU*mul + per-token FP8 quantize.</strong> Same pattern for the MLP activation: gate activation, element-wise mul, quantize in one kernel. Replaces 3 separate kernels.</li>
 <li><strong>8 kernels per transformer layer.</strong> Down from 15 with the old cublasLt path. Fewer kernel launches, fewer global memory round-trips.</li>
 <li><strong>Scheduler preemption fix.</strong> The watermark-triggered eviction was firing with no admission pressure, causing a throughput cliff at N=96+. Fixing it let throughput scale smoothly to N=128.</li>
+<li><strong>Vectorized fused SiLU*mul + FP8 quantize (April 14).</strong> 128-bit loads (uint4) and 64-bit FP8 stores (uint2) with register caching. Eliminates second-pass global memory reads in the MLP activation kernel.</li>
+<li><strong>Stream-K / split-K FP8 GEMM autotune (April 14).</strong> 7 new CUTLASS variants (v25-v31) with StreamKScheduler and explicit K-decomposition. Split-K=4 on Down projection: 28.5% speedup by going from 21% to 85% SM utilization at M=64.</li>
+<li><strong>FP8 autotune expansion (April 14).</strong> 32 FP8 GEMM variants total with standalone autotune binary. FP8FastAccum schedule aliases. +12-15% decode throughput across batch sizes.</li>
 </ol>
 <div class="note">
   The result: rvLLM v2 FP8 and F16 both converge at ~30K tok/s, proving the engine is now memory-bandwidth-bound on H100 HBM3 (3.35 TB/s). The GEMM dtype no longer matters for decode throughput at these batch sizes.
@@ -396,6 +399,9 @@ footer a:hover{color:#999}
 <li><strong>Zig SIMD sampling</strong> -- NEON/AVX-512 softmax, argmax, weight conversion (1.4-6.3x)</li>
 <li><strong>Chunked prefill scheduler</strong> -- bounds prefill tokens per step, prevents decode starvation</li>
 <li><strong>Scheduler preemption fix</strong> -- eliminates watermark-triggered eviction cliff at N=96+</li>
+<li><strong>Vectorized fused SiLU+FP8</strong> -- uint4 128-bit loads, register caching, uint2 64-bit FP8 stores (8 FP8 values per store)</li>
+<li><strong>Stream-K / split-K autotune</strong> -- CUTLASS StreamKScheduler decomposes K across SMs; split-K=4 gives 85% SM utilization on memory-bound shapes</li>
+<li><strong>FP8 GEMM autotune</strong> -- 32 variants benchmarked per shape, standalone binary populates cache</li>
 </ol>
 </section>
 
@@ -419,7 +425,7 @@ footer a:hover{color:#999}
 
 <section>
 <h2>Architecture</h2>
-<p class="section-sub">31 crates, 54 CUDA kernels, 13 model architectures, CUTLASS SM90 FP8 as of April 12</p>
+<p class="section-sub">31 crates, 54 CUDA kernels, 13 model architectures, CUTLASS SM90 FP8 as of April 14</p>
 <pre>rvllm-server          CLI binary (serve, benchmark, info)
   +-- rvllm-api         axum HTTP server, 14 OpenAI-compatible routes, SSE streaming
   +-- rvllm-engine      async engine, continuous batching, dedicated GPU thread
