@@ -180,6 +180,45 @@ fn cutlass_fp8_gemm_dispatch(
     ).map_err(|e| LLMError::GpuError(e))
 }
 
+/// FP8 GEMM + residual add (fused in CUTLASS epilogue).
+/// D = cast<f16>(a_scales * b_scale * GEMM(act_fp8, weight_fp8) + residual)
+/// Eliminates the intermediate o_proj_out / down_out buffer.
+fn cutlass_fp8_gemm_residual_dispatch(
+    cutlass: &CutlassKernels,
+    stream: &CudaStream,
+    m: usize, n: usize, k: usize,
+    act_fp8: &CudaSlice<u8>,
+    act_scales: &CudaSlice<f32>,
+    weight_fp8: &CudaSlice<u8>,
+    weight_scale: &CudaSlice<f32>,
+    residual: &CudaSlice<f16>,
+    output_f16: &mut CudaSlice<f16>,
+    workspace: &mut CudaSlice<u8>,
+) -> Result<()> {
+    let stream_ptr = stream.cu_stream() as u64;
+    let (act_ptr, _) = act_fp8.device_ptr(stream);
+    let (as_ptr, _) = act_scales.device_ptr(stream);
+    let (w_ptr, _) = weight_fp8.device_ptr(stream);
+    let (ws_ptr, _) = weight_scale.device_ptr(stream);
+    let (res_ptr, _) = residual.device_ptr(stream);
+    let (out_ptr, _) = output_f16.device_ptr_mut(stream);
+    let (wk_ptr, _) = workspace.device_ptr_mut(stream);
+
+    // Variant 0 (64x128x128 WS) is verified neutral for O-proj [M, 3584, 3584].
+    // FP8FastAccum variants (v4+) regress with the residual EVT epilogue.
+    let variant = if m <= 64 { 0 } else { 1 };
+
+    cutlass.fp8_gemm_residual(
+        variant,
+        out_ptr as u64, act_ptr as u64, w_ptr as u64,
+        as_ptr as u64, ws_ptr as u64,
+        res_ptr as u64,
+        m as i32, n as i32, k as i32,
+        wk_ptr as u64, workspace.len(),
+        stream_ptr,
+    ).map_err(|e| LLMError::GpuError(e))
+}
+
 // ===================================================================
 // Autotuned CUTLASS SM90 WGMMA dispatch for F16
 // On SM90: always use CUTLASS WGMMA (cuBLAS may pick SM80 mma.sync).
@@ -890,12 +929,24 @@ impl GpuTransformerLayer {
                 &scratch.attn_out, num_tokens, q_dim,
                 &mut scratch.fp8_act_scratch, &mut scratch.fp8_act_scale,
             )?;
-            cutlass_fp8_gemm_dispatch(
-                ck, autotune, &self.stream, num_tokens, hidden_size, q_dim,
-                &scratch.fp8_act_scratch, &scratch.fp8_act_scale,
-                fp8w.o_proj_fp8, fp8w.o_proj_scale,
-                &mut scratch.o_proj_out, &mut scratch.cutlass_workspace,
-            )?;
+            // Try fused FP8 GEMM + residual add (eliminates o_proj_out buffer)
+            if ck.fp8_gemm_residual_variant_count() > 0 {
+                cutlass_fp8_gemm_residual_dispatch(
+                    ck, &self.stream, num_tokens, hidden_size, q_dim,
+                    &scratch.fp8_act_scratch, &scratch.fp8_act_scale,
+                    fp8w.o_proj_fp8, fp8w.o_proj_scale,
+                    residual_src, residual_write,
+                    &mut scratch.cutlass_workspace,
+                )?;
+                used_fused_oproj = true;
+            } else {
+                cutlass_fp8_gemm_dispatch(
+                    ck, autotune, &self.stream, num_tokens, hidden_size, q_dim,
+                    &scratch.fp8_act_scratch, &scratch.fp8_act_scale,
+                    fp8w.o_proj_fp8, fp8w.o_proj_scale,
+                    &mut scratch.o_proj_out, &mut scratch.cutlass_workspace,
+                )?;
+            }
         } else if let (Some(lt), Some(fp8w)) = (lt_ops, &weights.fp8) {
             fp8_gemm_dispatch(
                 lt, &self.loader, &self.stream,
@@ -929,14 +980,24 @@ impl GpuTransformerLayer {
         // Residual add + post-attention layernorm + GateUp GEMM
         let gate_up_dim = intermediate * 2;
         if let (Some(ck), Some(fp8w)) = (cutlass, &weights.fp8) {
-            // CUTLASS FP8: fused residual+norm+quant -> CUTLASS GEMM
-            self.fused_add_rmsnorm_fp8_quant(
-                residual_src, &scratch.o_proj_out,
-                weights.post_attention_layernorm_weight,
-                num_tokens, hidden_size,
-                &mut scratch.fp8_act_scratch, &mut scratch.fp8_act_scale,
-                residual_write,
-            )?;
+            if used_fused_oproj {
+                // Fused O-proj already wrote GEMM+residual to residual_write; just norm+quant
+                self.fused_rmsnorm_fp8_quant(
+                    &*residual_write,
+                    weights.post_attention_layernorm_weight,
+                    num_tokens, hidden_size,
+                    &mut scratch.fp8_act_scratch, &mut scratch.fp8_act_scale,
+                )?;
+            } else {
+                // Separate O-proj: need residual add + norm + quant
+                self.fused_add_rmsnorm_fp8_quant(
+                    residual_src, &scratch.o_proj_out,
+                    weights.post_attention_layernorm_weight,
+                    num_tokens, hidden_size,
+                    &mut scratch.fp8_act_scratch, &mut scratch.fp8_act_scale,
+                    residual_write,
+                )?;
+            }
             cutlass_fp8_gemm_dispatch(
                 ck, autotune, &self.stream, num_tokens, gate_up_dim, hidden_size,
                 &scratch.fp8_act_scratch, &scratch.fp8_act_scale,
@@ -1003,6 +1064,8 @@ impl GpuTransformerLayer {
                 &scratch.gate_up_out, num_tokens, intermediate,
                 &mut scratch.fp8_act_scratch, &mut scratch.fp8_act_scale,
             )?;
+            // Down-proj uses autotuned non-residual FP8 GEMM (residual kernel lacks
+            // autotune for K=intermediate shapes and regresses ~24% vs autotuned path)
             cutlass_fp8_gemm_dispatch(
                 ck, autotune, &self.stream, num_tokens, hidden_size, intermediate,
                 &scratch.fp8_act_scratch, &scratch.fp8_act_scale,

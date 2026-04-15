@@ -11,7 +11,8 @@ use std::path::Path;
 pub const HGEMM_VARIANTS: usize = 67;
 pub const OPROJ_RESIDUAL_VARIANTS: usize = 31;
 pub const GATEUP_SILU_VARIANTS: usize = 32;
-pub const FP8_GEMM_VARIANTS: usize = 32;
+pub const FP8_GEMM_VARIANTS: usize = 40;
+pub const FP8_GEMM_RESIDUAL_VARIANTS: usize = 10;
 
 /// Handle to the loaded CUTLASS shared library.
 /// Holds function pointers resolved at load time for zero-cost dispatch.
@@ -44,6 +45,9 @@ pub struct CutlassKernels {
     // Autotuned FP8 GEMM variants
     fn_fp8_gemm_variants: [Option<Fp8GemmFn>; FP8_GEMM_VARIANTS],
     fn_fp8_gemm_ws_variants: [Option<WorkspaceSizeFn>; FP8_GEMM_VARIANTS],
+    // FP8 GEMM + residual add variants (fused epilogue)
+    fn_fp8_gemm_res_variants: [Option<Fp8GemmResidualFn>; FP8_GEMM_RESIDUAL_VARIANTS],
+    fn_fp8_gemm_res_ws_variants: [Option<WorkspaceSizeFn>; FP8_GEMM_RESIDUAL_VARIANTS],
 }
 
 // Function pointer types matching the extern "C" signatures in the .cu files.
@@ -116,6 +120,21 @@ type Fp8GemmFn = unsafe extern "C" fn(
     b: *const c_void,
     a_scales: *const c_void,
     b_scale: *const c_void,
+    m: i32,
+    n: i32,
+    k: i32,
+    workspace: *mut c_void,
+    workspace_size: usize,
+    stream: *mut c_void,
+) -> i32;
+
+type Fp8GemmResidualFn = unsafe extern "C" fn(
+    output: *mut c_void,
+    a: *const c_void,
+    b: *const c_void,
+    a_scales: *const c_void,
+    b_scale: *const c_void,
+    residual: *const c_void,
     m: i32,
     n: i32,
     k: i32,
@@ -235,6 +254,20 @@ impl CutlassKernels {
                 }
             }
 
+            // Load FP8 GEMM + residual variants (optional)
+            let mut fn_fp8_gemm_res_variants: [Option<Fp8GemmResidualFn>; FP8_GEMM_RESIDUAL_VARIANTS] = [None; FP8_GEMM_RESIDUAL_VARIANTS];
+            let mut fn_fp8_gemm_res_ws_variants: [Option<WorkspaceSizeFn>; FP8_GEMM_RESIDUAL_VARIANTS] = [None; FP8_GEMM_RESIDUAL_VARIANTS];
+            for i in 0..FP8_GEMM_RESIDUAL_VARIANTS {
+                let name = format!("cutlass_fp8_gemm_residual_v{i}\0");
+                let ws_name = format!("cutlass_fp8_gemm_residual_v{i}_workspace_size\0");
+                if let Ok(f) = lib.get::<Fp8GemmResidualFn>(name.as_bytes()) {
+                    fn_fp8_gemm_res_variants[i] = Some(*f);
+                }
+                if let Ok(f) = lib.get::<WorkspaceSizeFn>(ws_name.as_bytes()) {
+                    fn_fp8_gemm_res_ws_variants[i] = Some(*f);
+                }
+            }
+
             Ok(Self {
                 _lib: lib,
                 fn_qkv_bias,
@@ -259,6 +292,8 @@ impl CutlassKernels {
                 fn_gateup_silu_ws_variants,
                 fn_fp8_gemm_variants,
                 fn_fp8_gemm_ws_variants,
+                fn_fp8_gemm_res_variants,
+                fn_fp8_gemm_res_ws_variants,
             })
         }
     }
@@ -675,5 +710,46 @@ impl CutlassKernels {
     /// Count how many FP8 GEMM variants are loaded.
     pub fn fp8_gemm_variant_count(&self) -> usize {
         self.fn_fp8_gemm_variants.iter().filter(|o| o.is_some()).count()
+    }
+
+    /// FP8 GEMM + residual add (fused in epilogue).
+    /// D[m,n] = cast<f16>(a_scales[m] * b_scale * GEMM(a,b) + residual[m,n])
+    pub fn fp8_gemm_residual(
+        &self,
+        variant: usize,
+        output: u64,
+        a: u64,
+        b: u64,
+        a_scales: u64,
+        b_scale: u64,
+        residual: u64,
+        m: i32,
+        n: i32,
+        k: i32,
+        workspace: u64,
+        workspace_size: usize,
+        stream: u64,
+    ) -> Result<(), String> {
+        let f = self.fn_fp8_gemm_res_variants.get(variant)
+            .and_then(|o| *o)
+            .ok_or_else(|| format!("FP8 GEMM residual variant {variant} not loaded"))?;
+        let status = unsafe {
+            f(output as *mut c_void, a as *const c_void, b as *const c_void,
+              a_scales as *const c_void, b_scale as *const c_void,
+              residual as *const c_void,
+              m, n, k, workspace as *mut c_void, workspace_size, stream as *mut c_void)
+        };
+        if status != 0 {
+            return Err(format!("cutlass_fp8_gemm_residual_v{variant} failed: {status}"));
+        }
+        Ok(())
+    }
+
+    pub fn fp8_gemm_residual_workspace_size(&self, variant: usize, m: i32, n: i32, k: i32) -> Option<usize> {
+        self.fn_fp8_gemm_res_ws_variants.get(variant).and_then(|o| *o).map(|f| unsafe { f(m, n, k) })
+    }
+
+    pub fn fp8_gemm_residual_variant_count(&self) -> usize {
+        self.fn_fp8_gemm_res_variants.iter().filter(|o| o.is_some()).count()
     }
 }

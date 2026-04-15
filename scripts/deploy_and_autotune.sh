@@ -18,7 +18,12 @@ echo "Run dir: ${RUN_DIR}"
 
 # 1. Package
 echo "Packaging..."
-tar czf "${TARBALL}" --exclude=target --exclude=.git --exclude='.codex-tmp' --exclude='v2' --exclude='libtypes.rlib' .
+tar czf "${TARBALL}" \
+    --exclude=target --exclude=.git --exclude='.codex-tmp' \
+    --exclude='v2' --exclude='libtypes.rlib' \
+    --exclude='kernels/sm_*/*.so' --exclude='kernels/sm_*/*.dylib' \
+    --exclude='*.pdf' \
+    .
 echo "  $(du -h "${TARBALL}" | cut -f1)"
 
 # 2. Upload
@@ -28,6 +33,9 @@ ${SCP} "${TARBALL}" "root@${SSH_HOST}:/tmp/rvllm-autotune.tar.gz"
 # 3. Extract
 echo "Extracting to ${RUN_DIR}..."
 ${SSH} "mkdir -p ${RUN_DIR}/rvllm && cd ${RUN_DIR}/rvllm && tar xzf /tmp/rvllm-autotune.tar.gz"
+
+# 3b. Nuke any .so that leaked from local (Mac stubs etc)
+${SSH} "rm -f ${RUN_DIR}/rvllm/kernels/sm_*/*.so ${RUN_DIR}/rvllm/kernels/sm_*/*.dylib"
 
 # 4. Copy PTX from previous run
 if [ -n "${PREV_RUN}" ]; then
@@ -40,6 +48,13 @@ fi
 echo "Building CUTLASS kernels..."
 ${SSH} "cd ${RUN_DIR}/rvllm && bash kernels/build_cutlass_so.sh sm_90 /root/cutlass"
 
+# 5b. Verify .so is GPU-compiled (not a Mac stub)
+${SSH} "SO=${RUN_DIR}/rvllm/kernels/sm_90/libcutlass_kernels.so; \
+    if [ ! -f \$SO ]; then echo 'FATAL: .so not found after build'; exit 1; fi; \
+    SZ=\$(stat -c%s \$SO 2>/dev/null || stat -f%z \$SO); \
+    echo \"CUTLASS .so size: \${SZ} bytes\"; \
+    if [ \$SZ -lt 1000000 ]; then echo 'FATAL: .so too small (<1MB) -- likely a Mac stub, not GPU-compiled'; exit 1; fi"
+
 # 6. Build Rust
 echo "Building rvllm-v2..."
 ${SSH} "source \$HOME/.cargo/env && cd ${RUN_DIR}/rvllm && cargo build --release -p rvllm-v2 --features cuda-graphs -p rvllm-gpu 2>&1 | tail -5"
@@ -49,8 +64,10 @@ echo "Running CUTLASS autotune..."
 ${SSH} "source \$HOME/.cargo/env && cd ${RUN_DIR}/rvllm && cargo run --release -p rvllm-gpu --bin autotune-cutlass --features cuda 2>&1"
 
 # 8. Run benchmark
-MODEL="/root/.cache/huggingface/hub/models--Qwen--Qwen2.5-7B/snapshots/d149729398750b98c0af14eb82c78cfe92750796"
 echo "Running benchmark..."
-${SSH} "cd ${RUN_DIR}/rvllm && target/release/rvllm-v2-bench --model ${MODEL} --output-len 512 --n 1,32,64,128 --iters 3 2>&1"
+${SSH} "MODEL=\$(find /workspace/hf_cache /root/.cache/huggingface -path '*/Qwen2.5-7B/snapshots/*' -name 'config.json' 2>/dev/null | head -1 | xargs dirname); \
+    if [ -z \"\$MODEL\" ]; then echo 'FATAL: Qwen2.5-7B model not found'; exit 1; fi; \
+    echo \"Model: \$MODEL\"; \
+    cd ${RUN_DIR}/rvllm && target/release/rvllm-v2-bench --fp8 --model \$MODEL --output-len 512 --n 1,32,64,128 --iters 3 2>&1"
 
 echo "=== Done ==="

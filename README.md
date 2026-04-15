@@ -364,7 +364,7 @@ NSYS=/opt/nvidia/nsight-compute/2025.1.0/host/target-linux-x64/nsys
 
 $NSYS profile --stats=true -o profile_output \
   ./target/release/rvllm benchmark \
-  --model /root/models/Qwen2.5-7B --dtype half --n 32 --output-len 32
+  --model /root/models/Qwen2.5-7B --dtype half --fp8 --n 32 --output-len 32
 ```
 
 This prints a kernel ranking table showing exactly where GPU time goes:
@@ -547,12 +547,13 @@ cargo build --release --features cuda
 rvllm serve --model Qwen/Qwen2.5-7B --dtype half --gpu-memory-utilization 1.0 --gpu-memory-reserve-gb 2.0
 
 # Benchmark (direct engine, no HTTP)
-rvllm benchmark --model Qwen/Qwen2.5-7B --dtype half --n "1,4,8,16,32" --output-len 256
+# IMPORTANT: --fp8 enables CUTLASS FP8 GEMMs. Without it, all projections run f16 cuBLAS.
+rvllm benchmark --model Qwen/Qwen2.5-7B --dtype half --fp8 --n "1,4,8,16,32" --output-len 256
 ```
 
 ### Optional Features
 
-**FP8 Weights** (`RVLLM_FP8_WEIGHTS=1`): Quantizes all projection weights to FP8 E4M3 at startup. Halves weight memory bandwidth for single-stream decode (M=1 GEMV). Does NOT improve batched throughput -- at M>=8, f16 tensor cores already saturate compute and the f16->fp8 cast adds overhead. Use for latency-sensitive single-user workloads, not high-concurrency serving.
+**FP8 Weights** (`--fp8` flag or `RVLLM_FP8_WEIGHTS=1`): Quantizes all projection weights (QKV, O-proj, gate-up, down-proj) to FP8 E4M3 at startup and routes all GEMMs through CUTLASS FP8 kernels with per-tensor scaling. This is the primary performance path on H100/B200 -- without it, all projections run f16 cuBLAS and you leave significant throughput on the table. Always pass `--fp8` when benchmarking on SM90+.
 
 **FP8 KV Cache** (`RVLLM_FP8_KV=1`): Stores KV cache in FP8, doubling the number of concurrent sequences at the cost of minor precision loss.
 
