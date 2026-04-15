@@ -15,6 +15,8 @@ pub mod cutlass_autotune;
 #[cfg(feature = "cuda")]
 pub mod cutlass_ffi;
 #[cfg(feature = "cuda")]
+pub mod fa3_ffi;
+#[cfg(feature = "cuda")]
 pub mod cublas_ops;
 #[cfg(feature = "cublaslt")]
 pub mod cublas_autotune;

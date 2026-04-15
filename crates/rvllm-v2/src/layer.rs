@@ -12,6 +12,7 @@ use rvllm_gpu::cublas::CublasHandle;
 use rvllm_gpu::cublaslt_ops::CublasLtOps;
 use rvllm_gpu::cutlass_autotune::CutlassAutotuneCache;
 use rvllm_gpu::cutlass_ffi::CutlassKernels;
+use rvllm_gpu::fa3_ffi::Fa3Kernels;
 use rvllm_gpu::kernel_loader::KernelLoader;
 
 // ===================================================================
@@ -806,6 +807,7 @@ impl GpuTransformerLayer {
         down_write: &mut CudaSlice<f16>,
         gemm_strategy: GemmStrategy,
         cutlass: Option<&CutlassKernels>,
+        fa3: Option<&Fa3Kernels>,
         autotune: Option<&CutlassAutotuneCache>,
         cublas: &CublasHandle,
         lt_ops: Option<&CublasLtOps>,
@@ -911,6 +913,7 @@ impl GpuTransformerLayer {
             &mut scratch.attn_split_out,
             &mut scratch.attn_split_max,
             &mut scratch.attn_split_sum,
+            fa3,
         )?;
 
         // Compute residual source for post-attention residual connection
@@ -1441,13 +1444,14 @@ impl GpuTransformerLayer {
         split_out: &mut CudaSlice<f32>,
         split_max: &mut CudaSlice<f32>,
         split_sum: &mut CudaSlice<f32>,
+        fa3: Option<&Fa3Kernels>,
     ) -> Result<()> {
         let q_view = qkv.slice(..q_end);
         if attn.is_prefill {
             self.prefill_attention(&q_view, attn, num_tokens, attn_out)
         } else {
             self.decode_attention(
-                &q_view, attn, num_tokens, attn_out, split_out, split_max, split_sum,
+                &q_view, attn, num_tokens, attn_out, split_out, split_max, split_sum, fa3,
             )
         }
     }
@@ -1537,6 +1541,7 @@ impl GpuTransformerLayer {
         split_out: &mut CudaSlice<f32>,
         split_max: &mut CudaSlice<f32>,
         split_sum: &mut CudaSlice<f32>,
+        fa3: Option<&Fa3Kernels>,
     ) -> Result<()> {
         let cfg = &self.config;
         let num_heads = cfg.num_heads;
@@ -1551,6 +1556,15 @@ impl GpuTransformerLayer {
                 output.len(),
                 out_len
             )));
+        }
+
+        // FA3 SM90 path: WGMMA/TMA-accelerated paged KV decode
+        if let Some(fa3k) = fa3 {
+            if head_dim == 128 {
+                return self.decode_attention_fa3_sm90(
+                    q, attn, num_seqs, output, split_out, fa3k,
+                );
+            }
         }
 
         let scale = 1.0f32 / (head_dim as f32).sqrt();
@@ -1579,6 +1593,53 @@ impl GpuTransformerLayer {
             q, attn, num_tokens, num_seqs, output, split_out, split_max, split_sum, scale,
             max_blocks, num_splits,
         )
+    }
+
+    fn decode_attention_fa3_sm90(
+        &self,
+        q: &CudaView<'_, f16>,
+        attn: &AttentionMeta<'_>,
+        num_seqs: usize,
+        output: &mut CudaSlice<f16>,
+        workspace: &mut CudaSlice<f32>,  // reuse split_out as workspace
+        fa3: &Fa3Kernels,
+    ) -> Result<()> {
+        let cfg = &self.config;
+        let scale = 1.0f32 / (cfg.head_dim as f32).sqrt();
+        let max_blocks_per_seq = (attn.block_tables.len() / num_seqs.max(1)) as i32;
+        // num_blocks_total = total physical blocks in KV cache
+        let kv_stride = cfg.block_size * cfg.num_kv_heads * cfg.head_dim;
+        let num_blocks_total = (attn.key_cache.len() / kv_stride.max(1)) as i32;
+
+        // Get raw device pointers
+        let stream = &self.stream;
+        let (q_ptr, _gq) = q.device_ptr(stream);
+        let (kc_ptr, _gkc) = attn.key_cache.device_ptr(stream);
+        let (vc_ptr, _gvc) = attn.value_cache.device_ptr(stream);
+        let (o_ptr, _go) = output.device_ptr_mut(stream);
+        let (bt_ptr, _gbt) = attn.block_tables.device_ptr(stream);
+        let (cl_ptr, _gcl) = attn.context_lens.device_ptr(stream);
+        let (ws_ptr, _gws) = workspace.device_ptr_mut(stream);
+        let stream_ptr = stream.cu_stream() as u64;
+
+        fa3.paged_decode(
+            q_ptr as u64,
+            kc_ptr as u64,
+            vc_ptr as u64,
+            o_ptr as u64,
+            bt_ptr as u64,
+            cl_ptr as u64,
+            ws_ptr as u64,
+            scale,
+            num_seqs as i32,
+            cfg.num_heads as i32,
+            cfg.num_kv_heads as i32,
+            cfg.head_dim as i32,
+            cfg.block_size as i32,
+            max_blocks_per_seq,
+            num_blocks_total,
+            stream_ptr,
+        ).map_err(|e| LLMError::GpuError(e))
     }
 
     fn decode_attention_gqa_v3(

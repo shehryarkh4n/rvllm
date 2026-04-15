@@ -625,6 +625,26 @@ fn load_model_and_build_runner(
         loaded
     };
 
+    // 6a. Try loading FA3 SM90 attention kernels
+    let fa3 = {
+        use rvllm_gpu::fa3_ffi::Fa3Kernels;
+        let path = std::path::Path::new("kernels/sm_90/libfa3_kernels.so");
+        if path.exists() {
+            match Fa3Kernels::load(path) {
+                Ok(k) => {
+                    info!(?path, "FA3 SM90 loaded");
+                    Some(Arc::new(k))
+                }
+                Err(e) => {
+                    info!(?path, error = %e, "FA3 SM90 load failed, using PTX FA3");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    };
+
     // 6b. Load CUTLASS autotune cache (required when CUTLASS is loaded)
     let autotune = if cutlass.is_some() {
         let cache_path = CutlassAutotuneCache::cache_path();
@@ -675,6 +695,7 @@ fn load_model_and_build_runner(
         config.clone(),
         layers,
         cutlass,
+        fa3,
         autotune,
         cublas,
         lt_ops,

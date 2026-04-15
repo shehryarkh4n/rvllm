@@ -8,6 +8,7 @@ use rvllm_gpu::cublas::CublasHandle;
 use rvllm_gpu::cublaslt_ops::CublasLtOps;
 use rvllm_gpu::cutlass_autotune::{CutlassAutotuneCache, max_workspace_size};
 use rvllm_gpu::cutlass_ffi::CutlassKernels;
+use rvllm_gpu::fa3_ffi::Fa3Kernels;
 use rvllm_gpu::kernel_loader::KernelLoader;
 use rvllm_gpu::pinned_memory::PinnedBuffer;
 
@@ -78,6 +79,7 @@ pub struct GpuModelRunner {
     layers: Vec<GpuTransformerLayer>,
     gemm_strategy: GemmStrategy,
     cutlass: Option<Arc<CutlassKernels>>,
+    fa3: Option<Arc<Fa3Kernels>>,
     autotune: Option<CutlassAutotuneCache>,
     cublas: CublasHandle,
     lt_ops: Option<CublasLtOps>,
@@ -119,6 +121,7 @@ impl GpuModelRunner {
         config: RunnerConfig,
         layers: Vec<GpuTransformerLayer>,
         cutlass: Option<Arc<CutlassKernels>>,
+        fa3: Option<Arc<Fa3Kernels>>,
         autotune: Option<CutlassAutotuneCache>,
         cublas: CublasHandle,
         lt_ops: Option<CublasLtOps>,
@@ -194,6 +197,7 @@ impl GpuModelRunner {
             layers,
             gemm_strategy,
             cutlass,
+            fa3,
             autotune,
             cublas,
             lt_ops,
@@ -339,6 +343,7 @@ impl GpuModelRunner {
         let Self {
             ref layers,
             ref cutlass,
+            ref fa3,
             ref autotune,
             ref cublas,
             ref lt_ops,
@@ -362,6 +367,7 @@ impl GpuModelRunner {
         } = *self;
 
         let cutlass_ref: Option<&CutlassKernels> = cutlass.as_deref();
+        let fa3_ref: Option<&Fa3Kernels> = fa3.as_deref();
         let autotune_ref: Option<&CutlassAutotuneCache> = autotune.as_ref();
 
         // 4. Layer loop -- layers write directly to double-buffer targets (zero copies)
@@ -419,20 +425,20 @@ impl GpuModelRunner {
                 layers[layer_idx].forward_batched_v2(
                     embed_output, &attn, &layer_weights, scratch, None,
                     residual_a, down_a,
-                    gemm_strategy, cutlass_ref, autotune_ref, cublas, lt_ops.as_ref(),
+                    gemm_strategy, cutlass_ref, fa3_ref, autotune_ref, cublas, lt_ops.as_ref(),
                 )?
             } else if layer_idx % 2 == 1 {
                 if prev_fused {
                     layers[layer_idx].forward_batched_v2(
                         &*down_a, &attn, &layer_weights, scratch, None,
                         residual_b, down_b,
-                        gemm_strategy, cutlass_ref, autotune_ref, cublas, lt_ops.as_ref(),
+                        gemm_strategy, cutlass_ref, fa3_ref, autotune_ref, cublas, lt_ops.as_ref(),
                     )?
                 } else {
                     layers[layer_idx].forward_batched_v2(
                         &*residual_a, &attn, &layer_weights, scratch, Some(&*down_a),
                         residual_b, down_b,
-                        gemm_strategy, cutlass_ref, autotune_ref, cublas, lt_ops.as_ref(),
+                        gemm_strategy, cutlass_ref, fa3_ref, autotune_ref, cublas, lt_ops.as_ref(),
                     )?
                 }
             } else {
@@ -440,13 +446,13 @@ impl GpuModelRunner {
                     layers[layer_idx].forward_batched_v2(
                         &*down_b, &attn, &layer_weights, scratch, None,
                         residual_a, down_a,
-                        gemm_strategy, cutlass_ref, autotune_ref, cublas, lt_ops.as_ref(),
+                        gemm_strategy, cutlass_ref, fa3_ref, autotune_ref, cublas, lt_ops.as_ref(),
                     )?
                 } else {
                     layers[layer_idx].forward_batched_v2(
                         &*residual_b, &attn, &layer_weights, scratch, Some(&*down_b),
                         residual_a, down_a,
-                        gemm_strategy, cutlass_ref, autotune_ref, cublas, lt_ops.as_ref(),
+                        gemm_strategy, cutlass_ref, fa3_ref, autotune_ref, cublas, lt_ops.as_ref(),
                     )?
                 }
             };
@@ -510,6 +516,7 @@ impl GpuModelRunner {
         let Self {
             ref layers,
             ref cutlass,
+            ref fa3,
             ref autotune,
             ref cublas,
             ref lt_ops,
@@ -535,6 +542,7 @@ impl GpuModelRunner {
         } = *self;
 
         let cutlass_ref: Option<&CutlassKernels> = cutlass.as_deref();
+        let fa3_ref: Option<&Fa3Kernels> = fa3.as_deref();
         let autotune_ref: Option<&CutlassAutotuneCache> = autotune.as_ref();
 
         let mut prev_fused = false;
@@ -587,20 +595,20 @@ impl GpuModelRunner {
                 layers[layer_idx].forward_batched_v2(
                     embed_output, &attn, &layer_weights, scratch, None,
                     residual_a, down_a,
-                    gemm_strategy, cutlass_ref, autotune_ref, cublas, lt_ops.as_ref(),
+                    gemm_strategy, cutlass_ref, fa3_ref, autotune_ref, cublas, lt_ops.as_ref(),
                 )?
             } else if layer_idx % 2 == 1 {
                 if prev_fused {
                     layers[layer_idx].forward_batched_v2(
                         &*down_a, &attn, &layer_weights, scratch, None,
                         residual_b, down_b,
-                        gemm_strategy, cutlass_ref, autotune_ref, cublas, lt_ops.as_ref(),
+                        gemm_strategy, cutlass_ref, fa3_ref, autotune_ref, cublas, lt_ops.as_ref(),
                     )?
                 } else {
                     layers[layer_idx].forward_batched_v2(
                         &*residual_a, &attn, &layer_weights, scratch, Some(&*down_a),
                         residual_b, down_b,
-                        gemm_strategy, cutlass_ref, autotune_ref, cublas, lt_ops.as_ref(),
+                        gemm_strategy, cutlass_ref, fa3_ref, autotune_ref, cublas, lt_ops.as_ref(),
                     )?
                 }
             } else {
@@ -608,13 +616,13 @@ impl GpuModelRunner {
                     layers[layer_idx].forward_batched_v2(
                         &*down_b, &attn, &layer_weights, scratch, None,
                         residual_a, down_a,
-                        gemm_strategy, cutlass_ref, autotune_ref, cublas, lt_ops.as_ref(),
+                        gemm_strategy, cutlass_ref, fa3_ref, autotune_ref, cublas, lt_ops.as_ref(),
                     )?
                 } else {
                     layers[layer_idx].forward_batched_v2(
                         &*residual_b, &attn, &layer_weights, scratch, Some(&*down_b),
                         residual_a, down_a,
-                        gemm_strategy, cutlass_ref, autotune_ref, cublas, lt_ops.as_ref(),
+                        gemm_strategy, cutlass_ref, fa3_ref, autotune_ref, cublas, lt_ops.as_ref(),
                     )?
                 }
             };
@@ -1018,6 +1026,7 @@ impl GpuModelRunner {
         let Self {
             ref layers,
             ref cutlass,
+            ref fa3,
             ref autotune,
             ref cublas,
             ref lt_ops,
@@ -1043,6 +1052,7 @@ impl GpuModelRunner {
         } = *self;
 
         let cutlass_ref: Option<&CutlassKernels> = cutlass.as_deref();
+        let fa3_ref: Option<&Fa3Kernels> = fa3.as_deref();
         let autotune_ref: Option<&CutlassAutotuneCache> = autotune.as_ref();
 
         let mut prev_fused = false;
@@ -1095,20 +1105,20 @@ impl GpuModelRunner {
                 layers[layer_idx].forward_batched_v2(
                     embed_output, &attn, &layer_weights, scratch, None,
                     residual_a, down_a,
-                    gemm_strategy, cutlass_ref, autotune_ref, cublas, lt_ops.as_ref(),
+                    gemm_strategy, cutlass_ref, fa3_ref, autotune_ref, cublas, lt_ops.as_ref(),
                 )?
             } else if layer_idx % 2 == 1 {
                 if prev_fused {
                     layers[layer_idx].forward_batched_v2(
                         &*down_a, &attn, &layer_weights, scratch, None,
                         residual_b, down_b,
-                        gemm_strategy, cutlass_ref, autotune_ref, cublas, lt_ops.as_ref(),
+                        gemm_strategy, cutlass_ref, fa3_ref, autotune_ref, cublas, lt_ops.as_ref(),
                     )?
                 } else {
                     layers[layer_idx].forward_batched_v2(
                         &*residual_a, &attn, &layer_weights, scratch, Some(&*down_a),
                         residual_b, down_b,
-                        gemm_strategy, cutlass_ref, autotune_ref, cublas, lt_ops.as_ref(),
+                        gemm_strategy, cutlass_ref, fa3_ref, autotune_ref, cublas, lt_ops.as_ref(),
                     )?
                 }
             } else {
@@ -1116,13 +1126,13 @@ impl GpuModelRunner {
                     layers[layer_idx].forward_batched_v2(
                         &*down_b, &attn, &layer_weights, scratch, None,
                         residual_a, down_a,
-                        gemm_strategy, cutlass_ref, autotune_ref, cublas, lt_ops.as_ref(),
+                        gemm_strategy, cutlass_ref, fa3_ref, autotune_ref, cublas, lt_ops.as_ref(),
                     )?
                 } else {
                     layers[layer_idx].forward_batched_v2(
                         &*residual_b, &attn, &layer_weights, scratch, Some(&*down_b),
                         residual_a, down_a,
-                        gemm_strategy, cutlass_ref, autotune_ref, cublas, lt_ops.as_ref(),
+                        gemm_strategy, cutlass_ref, fa3_ref, autotune_ref, cublas, lt_ops.as_ref(),
                     )?
                 }
             };

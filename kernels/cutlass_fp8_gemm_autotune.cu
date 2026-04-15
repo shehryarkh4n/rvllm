@@ -572,12 +572,24 @@ FP8_GEMM_STREAMK_VARIANT(26, 128, 256, 128, 1,1,1, Coop)     // wide N
 FP8_GEMM_STREAMK_VARIANT(27, 128, 128, 128, 1,1,1, FP8Coop)  // FP8FastAccum
 
 // ---------------------------------------------------------------------------
-// Split-K variants (v28-v31): explicit K-decomposition
-// For O-proj/Down at M=64: 28 TBs on 132 SMs with 128-tile.
-// split-K=2 -> 56 TBs (42%), split-K=4 -> 112 TBs (85%)
+// Split-K variants (v28-v39): explicit K-decomposition
+// Down proj: M<=128, N=3584, K=18944 -> 28 output tiles on 132 SMs
+//   split-K=2 -> 56 (42%), split-K=3 -> 84 (64%), split-K=4 -> 112 (85%)
+//   split-K=5 -> 140 (106%), split-K=6 -> 168 (127%), split-K=8 -> 224 (170%)
 // ---------------------------------------------------------------------------
 
+// Cooperative (full-precision accumulation)
 FP8_GEMM_SPLITK_VARIANT(28, 128, 128, 128, 1,1,1, Coop, 2)
 FP8_GEMM_SPLITK_VARIANT(29, 128, 128, 128, 1,1,1, Coop, 4)
 FP8_GEMM_SPLITK_VARIANT(30, 128, 256, 128, 1,1,1, Coop, 2)
 FP8_GEMM_SPLITK_VARIANT(31, 128, 256, 128, 1,1,1, Coop, 4)
+FP8_GEMM_SPLITK_VARIANT(32, 128, 128, 128, 1,1,1, Coop, 3)
+FP8_GEMM_SPLITK_VARIANT(33, 128, 128, 128, 1,1,1, Coop, 5)
+FP8_GEMM_SPLITK_VARIANT(34, 128, 128, 128, 1,1,1, Coop, 6)
+FP8_GEMM_SPLITK_VARIANT(35, 128, 128, 128, 1,1,1, Coop, 8)
+
+// FP8FastAccum split-K (higher throughput, reduced precision)
+FP8_GEMM_SPLITK_VARIANT(36, 128, 128, 128, 1,1,1, FP8Coop, 4)
+FP8_GEMM_SPLITK_VARIANT(37, 128, 128, 128, 1,1,1, FP8Coop, 5)
+FP8_GEMM_SPLITK_VARIANT(38, 128, 256, 128, 1,1,1, Coop, 5)
+FP8_GEMM_SPLITK_VARIANT(39, 128, 256, 128, 1,1,1, Coop, 6)

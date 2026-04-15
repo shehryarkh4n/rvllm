@@ -72,7 +72,7 @@ FAIL=0
 OBJS=""
 GATE_ONLY=${RVLLM_CUTLASS_GATE_ONLY:-0}
 
-for f in cutlass_qkv_bias.cu cutlass_oproj_residual.cu cutlass_gateup_silu.cu cutlass_gemm.cu cutlass_fp8_gemm.cu cutlass_hgemm_autotune.cu cutlass_oproj_residual_autotune.cu cutlass_gateup_silu_autotune.cu cutlass_fp8_gemm_autotune.cu; do
+for f in cutlass_qkv_bias.cu cutlass_oproj_residual.cu cutlass_gateup_silu.cu cutlass_gemm.cu cutlass_fp8_gemm.cu cutlass_hgemm_autotune.cu cutlass_oproj_residual_autotune.cu cutlass_gateup_silu_autotune.cu cutlass_fp8_gemm_autotune.cu cutlass_fp8_gemm_residual.cu; do
     [ -f "$f" ] || continue
     stem=${f%.cu}
     obj="$OBJ_DIR/${stem}.o"
