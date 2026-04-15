@@ -211,7 +211,7 @@ if [[ "$SKIP_BUILD" -eq 0 ]]; then
     step "Step 2: Build rvllm-v2"
     BUILD_START=$(date +%s)
 
-    cargo build --release -p rvllm-v2 --bin rvllm-v2-bench \
+    cargo build --release -p rvllm-v2 --features cuda-graphs --bin rvllm-v2-bench \
         --manifest-path "$REPO_DIR/Cargo.toml" 2>&1 | tail -5
 
     BUILD_END=$(date +%s)
