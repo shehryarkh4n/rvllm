@@ -1,10 +1,11 @@
 #!/bin/bash
 # rsync_and_run.sh -- Push to GitHub, pull on GPU box, build + bench.
 #
+# Kernels come from HF by default. Pass --compile-kernels when .cu files changed.
+#
 # Usage:
-#   bash deploy/rsync_and_run.sh                          # defaults
-#   bash deploy/rsync_and_run.sh ssh8.vast.ai 20236       # explicit host/port
-#   bash deploy/rsync_and_run.sh myhost 22 --skip-compile # pass flags through
+#   bash deploy/rsync_and_run.sh ssh8.vast.ai 13302 --model Qwen/Qwen2.5-32B --fp8 --n 1,128 --iters 3
+#   bash deploy/rsync_and_run.sh ssh8.vast.ai 13302 --compile-kernels --with-cutlass  # recompile + upload to HF
 #
 # All arguments after host and port are forwarded to deploy_and_bench.sh.
 
@@ -38,10 +39,11 @@ echo ""
 echo "Pushing to GitHub..."
 git -C "${REPO_DIR}" push origin main
 
-# --- Pull on remote (clone if needed) ---
-echo "Pulling on remote..."
+# --- Pull on remote, verify SHA, run ---
+echo "Deploying on remote..."
 ssh ${SSH_OPTS} "root@${HOST}" "
     export PATH=/root/.cargo/bin:\$PATH
+
     if [ -d ${REMOTE_DIR}/.git ]; then
         cd ${REMOTE_DIR}
         git fetch origin
@@ -59,7 +61,7 @@ ssh ${SSH_OPTS} "root@${HOST}" "
         exit 1
     fi
 
-    # Write REVISION for binary to read
+    # Write REVISION for binary and kernel scripts to read
     echo \"${LOCAL_SHA}\" > REVISION
 
     # Nuke stale binary

@@ -1,23 +1,30 @@
 #!/bin/bash
-# deploy_and_bench.sh -- Compile kernels, build rvllm-v2 bench binary, benchmark.
+# deploy_and_bench.sh -- Pull kernels from HF, build rvllm-v2 bench binary, benchmark.
 # Runs directly on the GPU box (no HTTP server, no deadlocks).
 #
+# Kernel flow:
+#   Default:              Download pre-compiled kernels from HF for this SHA
+#   --compile-kernels:    Compile fresh on box + upload to HF (when .cu files changed)
+#
+# Old kernels on HF are never deleted -- each SHA gets its own directory.
+# Kernels on the box are always nuked and re-downloaded/re-compiled.
+#
 # Usage:
-#   bash deploy/deploy_and_bench.sh
-#   bash deploy/deploy_and_bench.sh --arch sm_90
-#   bash deploy/deploy_and_bench.sh --model Qwen/Qwen2.5-7B --fp8
-#   bash deploy/deploy_and_bench.sh --skip-build --skip-compile
+#   bash deploy/deploy_and_bench.sh --model Qwen/Qwen2.5-32B --fp8
+#   bash deploy/deploy_and_bench.sh --compile-kernels --with-cutlass
+#   bash deploy/deploy_and_bench.sh --skip-build
 #
 # Flags:
-#   --model <name>       model name or HF path (default: Qwen/Qwen2.5-7B)
-#   --arch <sm_XX>       override GPU arch (default: auto-detect)
-#   --skip-build         skip Rust binary compilation
-#   --skip-compile       skip kernel PTX compilation
-#   --output-len <N>     tokens per request (default: 512)
-#   --with-cutlass [dir] compile CUTLASS .so (default dir: /root/cutlass)
-#   --fp8                enable FP8 weights
-#   --n <list>           batch sizes (default: 1,4,8,16,32,64,128)
-#   --iters <N>          iterations per batch size (default: 3)
+#   --model <name>         model name or HF path (default: Qwen/Qwen2.5-7B)
+#   --arch <sm_XX>         override GPU arch (default: auto-detect)
+#   --compile-kernels      compile kernels on box + upload to HF (use when .cu changed)
+#   --with-cutlass [dir]   compile CUTLASS .so (only with --compile-kernels)
+#   --skip-build           skip Rust binary compilation
+#   --output-len <N>       tokens per request (default: 512)
+#   --fp8                  enable FP8 weights
+#   --n <list>             batch sizes (default: 1,4,8,16,32,64,128)
+#   --iters <N>            iterations per batch size (default: 3)
+#   --profile              enable CUPTI profiling
 
 set -euo pipefail
 
@@ -28,31 +35,35 @@ REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 MODEL="Qwen/Qwen2.5-7B"
 ARCH=""
 SKIP_BUILD=0
-SKIP_COMPILE=0
+COMPILE_KERNELS=0
 OUTPUT_LEN=512
 WITH_CUTLASS=0
 CUTLASS_DIR="/root/cutlass"
 FP8=0
 BATCH_SIZES="1,4,8,16,32,64,128"
 ITERS=3
+PROFILE=""
 
 # --- Parse flags ---
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --model)        MODEL="$2"; shift 2 ;;
-        --arch)         ARCH="$2"; shift 2 ;;
-        --skip-build)   SKIP_BUILD=1; shift ;;
-        --skip-compile) SKIP_COMPILE=1; shift ;;
-        --output-len)   OUTPUT_LEN="$2"; shift 2 ;;
-        --fp8)          FP8=1; shift ;;
-        --n)            BATCH_SIZES="$2"; shift 2 ;;
-        --iters)        ITERS="$2"; shift 2 ;;
+        --model)            MODEL="$2"; shift 2 ;;
+        --arch)             ARCH="$2"; shift 2 ;;
+        --compile-kernels)  COMPILE_KERNELS=1; shift ;;
+        --skip-build)       SKIP_BUILD=1; shift ;;
+        --output-len)       OUTPUT_LEN="$2"; shift 2 ;;
+        --fp8)              FP8=1; shift ;;
+        --n)                BATCH_SIZES="$2"; shift 2 ;;
+        --iters)            ITERS="$2"; shift 2 ;;
+        --profile)          PROFILE="--profile"; shift ;;
         --with-cutlass)
             WITH_CUTLASS=1
             if [[ $# -ge 2 && ! "$2" == --* ]]; then
                 CUTLASS_DIR="$2"; shift
             fi
             shift ;;
+        # Legacy flags -- warn and map
+        --skip-compile)     echo "WARN: --skip-compile is deprecated, kernels come from HF by default"; shift ;;
         *) echo "Unknown flag: $1"; exit 1 ;;
     esac
 done
@@ -84,7 +95,7 @@ detect_gpu_arch() {
 ARCH=$(detect_gpu_arch)
 
 # ============================================================
-# Step 0: Environment
+# Step 0: Environment + SHA verification
 # ============================================================
 step "Step 0: Environment"
 
@@ -120,27 +131,32 @@ fi
 GPU_MEM_USED=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | head -1 || echo "?")
 echo "GPU memory used: ${GPU_MEM_USED} MiB"
 
-# --- SHA verification ---
+# SHA verification
 REVISION_FILE="${REPO_DIR}/REVISION"
 if [[ -f "$REVISION_FILE" ]]; then
     EXPECTED_SHA=$(cat "$REVISION_FILE")
     echo "Expected SHA: ${EXPECTED_SHA}"
     pass "REVISION file present"
 else
-    fail "No REVISION file -- cannot verify source integrity. Deploy via rsync_and_run.sh."
+    fail "No REVISION file -- deploy via rsync_and_run.sh"
     exit 1
 fi
 echo ""
 
 # ============================================================
-# Step 1: Compile kernels to PTX
+# Step 1: Kernels -- download from HF or compile + upload
 # ============================================================
-if [[ "$SKIP_COMPILE" -eq 0 ]]; then
-    step "Step 1: Compile kernels (${ARCH})"
+KERNEL_DIR="$REPO_DIR/kernels"
+OUTDIR="$KERNEL_DIR/$ARCH"
+HF_KERNEL_REPO="and-y/rvllm-kernels"
 
-    KERNEL_DIR="$REPO_DIR/kernels"
-    OUTDIR="$KERNEL_DIR/$ARCH"
-    mkdir -p "$OUTDIR"
+# Always nuke what's on the box
+rm -rf "$OUTDIR"
+mkdir -p "$OUTDIR"
+
+if [[ "$COMPILE_KERNELS" -eq 1 ]]; then
+    # --- Compile fresh + upload to HF ---
+    step "Step 1: Compile kernels (${ARCH}) [--compile-kernels]"
 
     CU_COUNT=0
     PTX_OK=0
@@ -161,7 +177,6 @@ if [[ "$SKIP_COMPILE" -eq 0 ]]; then
                 tail -3 /tmp/nvcc_${stem}.log 2>/dev/null
             fi
         elif [[ "$stem" == cutlass_* ]]; then
-            # CUTLASS kernels compiled in Step 1b as .so
             CU_COUNT=$((CU_COUNT - 1))
             continue
         else
@@ -177,43 +192,49 @@ if [[ "$SKIP_COMPILE" -eq 0 ]]; then
     done
 
     if [[ "$PTX_FAIL" -eq 0 ]]; then
-        pass "Compiled ${PTX_OK}/${CU_COUNT} kernels to ${OUTDIR}/"
+        pass "Compiled ${PTX_OK}/${CU_COUNT} kernels"
     else
         warn "Compiled ${PTX_OK}/${CU_COUNT} kernels (${PTX_FAIL} failed)"
     fi
 
-    export RVLLM_PTX_DIR="${RVLLM_PTX_DIR:-$OUTDIR}"
-    echo "RVLLM_PTX_DIR=${RVLLM_PTX_DIR}"
-    echo ""
-else
-    step "Step 1: Skipping kernel compilation (--skip-compile)"
-    export RVLLM_PTX_DIR="${RVLLM_PTX_DIR:-$REPO_DIR/kernels/$ARCH}"
-    echo ""
-fi
+    # Compile CUTLASS .so if requested
+    if [[ "$WITH_CUTLASS" -eq 1 ]]; then
+        step "Step 1b: Compile CUTLASS shared library (${ARCH})"
 
-# ============================================================
-# Step 1b: Compile CUTLASS shared library
-# ============================================================
-if [[ "$SKIP_COMPILE" -eq 0 && "$WITH_CUTLASS" -eq 1 ]]; then
-    step "Step 1b: Compile CUTLASS shared library (${ARCH})"
-
-    if [ ! -d "$CUTLASS_DIR/include/cutlass" ]; then
-        echo "CUTLASS not found at $CUTLASS_DIR, cloning..."
-        git clone --depth 1 https://github.com/NVIDIA/cutlass "$CUTLASS_DIR"
-    fi
-
-    CUTLASS_SO_BUILD="$REPO_DIR/kernels/build_cutlass_so.sh"
-    if [[ -f "$CUTLASS_SO_BUILD" ]]; then
-        if bash "$CUTLASS_SO_BUILD" "$ARCH" "$CUTLASS_DIR"; then
-            pass "CUTLASS shared library built"
-        else
-            warn "CUTLASS .so build failed"
+        if [ ! -d "$CUTLASS_DIR/include/cutlass" ]; then
+            echo "CUTLASS not found at $CUTLASS_DIR, cloning..."
+            git clone --depth 1 https://github.com/NVIDIA/cutlass "$CUTLASS_DIR"
         fi
-    else
-        warn "build_cutlass_so.sh not found"
+
+        CUTLASS_SO_BUILD="$REPO_DIR/kernels/build_cutlass_so.sh"
+        if [[ -f "$CUTLASS_SO_BUILD" ]]; then
+            if bash "$CUTLASS_SO_BUILD" "$ARCH" "$CUTLASS_DIR"; then
+                pass "CUTLASS shared library built"
+            else
+                fail "CUTLASS .so build failed"
+                exit 1
+            fi
+        else
+            fail "build_cutlass_so.sh not found"
+            exit 1
+        fi
     fi
+
+    # Upload to HF under <sha>/<arch>/
+    step "Step 1c: Upload kernels to HF (${EXPECTED_SHA})"
+    bash "$REPO_DIR/deploy/upload_kernels_hf.sh" "$ARCH" "$EXPECTED_SHA"
+    echo ""
+
+else
+    # --- Download from HF ---
+    step "Step 1: Download kernels from HF (${EXPECTED_SHA}/${ARCH})"
+    bash "$REPO_DIR/deploy/download_kernels_hf.sh" "$ARCH" "$EXPECTED_SHA"
     echo ""
 fi
+
+export RVLLM_PTX_DIR="${RVLLM_PTX_DIR:-$OUTDIR}"
+echo "RVLLM_PTX_DIR=${RVLLM_PTX_DIR}"
+echo ""
 
 # ============================================================
 # Step 2: Build rvllm-v2 bench binary
@@ -230,15 +251,14 @@ if [[ "$SKIP_BUILD" -eq 0 ]]; then
 
     BINARY="$REPO_DIR/target/release/rvllm-v2-bench"
     if [[ -x "$BINARY" ]]; then
-        # Verify binary was built in this run (not stale)
         BINARY_AGE=$(( $(date +%s) - $(stat -c %Y "$BINARY" 2>/dev/null || stat -f %m "$BINARY") ))
         if [[ "$BINARY_AGE" -gt "$((BUILD_SECS + 10))" ]]; then
-            fail "Binary is ${BINARY_AGE}s old but build took ${BUILD_SECS}s -- stale binary survived!"
+            fail "Binary is ${BINARY_AGE}s old but build took ${BUILD_SECS}s -- stale binary!"
             exit 1
         fi
-        pass "Build complete in ${BUILD_SECS}s -> ${BINARY}"
+        pass "Build complete in ${BUILD_SECS}s"
     else
-        fail "Binary not found at ${BINARY}"
+        fail "Binary not found"
         exit 1
     fi
     echo ""
@@ -263,27 +283,24 @@ pass "Model ready: ${MODEL}"
 echo ""
 
 # ============================================================
-# Step 4: Benchmark
+# Step 4: Verify binary SHA
 # ============================================================
 step "Step 4: Verify binary SHA"
 
-# Quick check: run binary with --help, capture revision line, verify SHA matches
-BINARY_REV=$("$BINARY" --help 2>&1 | head -1 || true)
-echo "Binary reports: ${BINARY_REV}"
-if [[ -n "$EXPECTED_SHA" ]]; then
-    # The binary prints SHA at startup to stderr -- run a minimal invocation to capture it
-    BINARY_SHA=$("$BINARY" --model dummy --n 0 2>&1 | grep "rvLLM revision:" | awk '{print $NF}' || true)
-    if [[ -n "$BINARY_SHA" && "$BINARY_SHA" != "$EXPECTED_SHA" ]]; then
-        fail "Binary SHA (${BINARY_SHA}) != expected (${EXPECTED_SHA}) -- STALE BINARY!"
-        exit 1
-    elif [[ -n "$BINARY_SHA" ]]; then
-        pass "Binary SHA verified: ${BINARY_SHA}"
-    else
-        warn "Could not extract SHA from binary output (will verify from bench log)"
-    fi
+BINARY_SHA=$("$BINARY" --model dummy --n 0 2>&1 | grep "rvLLM revision:" | awk '{print $NF}' || true)
+if [[ -n "$BINARY_SHA" && "$BINARY_SHA" != "$EXPECTED_SHA" ]]; then
+    fail "Binary SHA (${BINARY_SHA}) != expected (${EXPECTED_SHA}) -- STALE BINARY!"
+    exit 1
+elif [[ -n "$BINARY_SHA" ]]; then
+    pass "Binary SHA verified: ${BINARY_SHA}"
+else
+    warn "Could not extract SHA from binary output (will verify from bench log)"
 fi
 echo ""
 
+# ============================================================
+# Step 5: Benchmark
+# ============================================================
 step "Step 5: Benchmark (direct engine, no HTTP)"
 
 FP8_FLAG=""
@@ -294,6 +311,7 @@ echo "## rvllm-v2 Benchmark Results"
 echo ""
 echo "- Model: ${MODEL}"
 echo "- GPU: ${GPU_NAME} (${GPU_MEM_TOTAL} MiB)"
+echo "- SHA: ${EXPECTED_SHA}"
 echo "- Output tokens: ${OUTPUT_LEN}"
 echo "- Arch: ${ARCH}"
 echo "- FP8: ${FP8}"
@@ -309,6 +327,7 @@ RVLLM_PTX_DIR="${RVLLM_PTX_DIR}" "$BINARY" \
     --iters "$ITERS" \
     --gpu-memory-utilization 0.95 \
     $FP8_FLAG \
+    $PROFILE \
     --json 2>&1
 
 BENCH_EXIT=$?
@@ -328,6 +347,7 @@ echo ""
 echo "========================================"
 echo "  Deploy + Benchmark Summary"
 echo "========================================"
+echo "  SHA:   ${EXPECTED_SHA}"
 echo "  GPU:   ${GPU_NAME}"
 echo "  Arch:  ${ARCH}"
 echo "  Model: ${MODEL}"
