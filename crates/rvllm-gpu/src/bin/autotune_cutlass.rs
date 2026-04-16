@@ -45,6 +45,7 @@ const FP8_SHAPES: &[(usize, usize, &str)] = &[
     (3584, 3584, "O-proj"),
     (37888, 3584, "gate_up"),
     (3584, 18944, "down"),
+    (152064, 3584, "lm_head"),
 ];
 
 const M_VALUES: &[usize] = &[1, 2, 4, 8, 16, 32, 64, 128, 256];
@@ -802,16 +803,22 @@ fn main() {
                     }
                 }
 
+                // cuBLAS F16 baseline for comparison
+                let cublas_us = Some(bench_cublas(&cublas, cu_stream, m, n, k, a_ptr, b_ptr, c_ptr));
+
                 total += 1;
                 match best {
                     Some((v, us)) => {
+                        let speedup = cublas_us.map(|c| c / us).unwrap_or(0.0);
                         cache.insert_fp8_gemm(m, n, k, v);
                         cutlass_wins += 1;
-                        println!("  BEST: fp8_v{v} ({us:.1} us)");
+                        println!("  BEST: fp8_v{v} ({us:.1} us) vs cuBLAS F16 ({:.1} us) = {speedup:.2}x",
+                                 cublas_us.unwrap_or(0.0));
                     }
                     None => {
                         cublas_wins += 1;
-                        println!("  NO FP8 VARIANT WORKED for M={m} N={n} K={k}");
+                        println!("  NO FP8 VARIANT WORKED for M={m} N={n} K={k} (cuBLAS F16: {:.1} us)",
+                                 cublas_us.unwrap_or(0.0));
                     }
                 }
             }

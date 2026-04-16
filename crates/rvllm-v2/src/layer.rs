@@ -42,7 +42,7 @@ fn hgemm_dispatch(
 // FP8 GEMM dispatch: quantize activation on GPU, then cuBLASLt FP8
 // ===================================================================
 
-fn fp8_gemm_dispatch(
+pub(crate) fn fp8_gemm_dispatch(
     lt_ops: &CublasLtOps,
     loader: &KernelLoader,
     stream: &CudaStream,
