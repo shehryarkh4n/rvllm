@@ -115,8 +115,6 @@ pub struct GpuModelRunner {
     final_normed: CudaSlice<f16>,
     residual_tmp: CudaSlice<f16>,
     logits_gpu: CudaSlice<f32>,
-    #[allow(dead_code)] // Pre-allocated for FP8 LM head path (pending autotune)
-    lm_head_out_f16: CudaSlice<f16>,
     embed_output: CudaSlice<f16>,
     argmax_output: CudaSlice<i32>,
     // Pinned host buffers for truly async DtoH/HtoD (pageable memory degrades to sync)
@@ -203,7 +201,6 @@ impl GpuModelRunner {
         let residual_tmp = alloc_f16("residual_tmp", max_n)?;
         let logits_gpu = stream.alloc_zeros::<f32>(max_t * vocab_size)
             .map_err(|e| LLMError::GpuError(format!("logits alloc: {e}")))?;
-        let lm_head_out_f16 = alloc_f16("lm_head_out_f16", max_t * vocab_size)?;
         let embed_output = alloc_f16("embed_output", max_n)?;
         let argmax_output = stream.alloc_zeros::<i32>(max_t)
             .map_err(|e| LLMError::GpuError(format!("argmax_output alloc: {e}")))?;
@@ -267,7 +264,6 @@ impl GpuModelRunner {
             final_normed,
             residual_tmp,
             logits_gpu,
-            lm_head_out_f16,
             embed_output,
             argmax_output,
             pinned_argmax: [pinned_argmax_0, pinned_argmax_1],
