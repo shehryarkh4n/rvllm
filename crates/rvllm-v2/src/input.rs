@@ -10,6 +10,9 @@ pub struct InputBuilder {
     prefill_keys: Vec<RequestId>,
     decode_keys: Vec<RequestId>,
     is_all_greedy: bool,
+    // Cached decode key order: reuse when sequence set hasn't changed
+    cached_decode_keys: Vec<RequestId>,
+    cached_decode_valid: bool,
 }
 
 impl InputBuilder {
@@ -39,7 +42,63 @@ impl InputBuilder {
             prefill_keys: Vec::with_capacity(64),
             decode_keys: Vec::with_capacity(64),
             is_all_greedy: true,
+            cached_decode_keys: Vec::with_capacity(128),
+            cached_decode_valid: false,
         }
+    }
+
+    /// Optimized build for decode-only steps where the sequence set hasn't changed.
+    /// Skips the HashMap iteration classify + sort when reusing cached key order.
+    pub fn build_decode_only(
+        &mut self,
+        requests: &HashMap<RequestId, WorkerRequest>,
+        block_size: usize,
+        set_changed: bool,
+    ) -> &GpuBatchInput {
+        self.clear();
+
+        if !set_changed && self.cached_decode_valid
+           && self.cached_decode_keys.len() == requests.len()
+        {
+            // Reuse cached key order -- just refresh per-sequence values
+            for &id in &self.cached_decode_keys {
+                let req = &requests[&id];
+                self.add_decode_request(req, block_size);
+            }
+        } else {
+            // Full rebuild with sort
+            for (id, _) in requests {
+                self.decode_keys.push(*id);
+            }
+            self.decode_keys.sort_unstable_by_key(|id| id.0);
+            self.cached_decode_keys.clear();
+            self.cached_decode_keys.extend_from_slice(&self.decode_keys);
+            self.cached_decode_valid = true;
+
+            for i in 0..self.decode_keys.len() {
+                let id = self.decode_keys[i];
+                let req = &requests[&id];
+                self.add_decode_request(req, block_size);
+            }
+        }
+
+        let num_decode = if self.cached_decode_valid {
+            self.cached_decode_keys.len()
+        } else {
+            self.decode_keys.len()
+        };
+
+        self.flatten_block_tables();
+
+        self.input.num_seqs = num_decode;
+        self.input.num_prefill_seqs = 0;
+        self.input.num_decode_seqs = num_decode;
+        self.input.is_all_decode = true;
+        self.input.is_all_prefill = false;
+        self.input.max_context_len = self.input.context_lens.iter().copied().max().unwrap_or(0);
+        self.input.is_all_greedy = self.is_all_greedy;
+
+        &self.input
     }
 
     pub fn build(
@@ -96,6 +155,13 @@ impl InputBuilder {
         self.prefill_keys.clear();
         self.decode_keys.clear();
         self.is_all_greedy = true;
+        // Don't clear cached_decode_keys here -- they persist across builds.
+        // Invalidation happens via set_changed flag in build_decode_only.
+    }
+
+    /// Invalidate the cached decode key order (call when sequences are added/removed).
+    pub fn invalidate_cache(&mut self) {
+        self.cached_decode_valid = false;
     }
 
     fn track_greedy(&mut self, p: &SamplingParams) {

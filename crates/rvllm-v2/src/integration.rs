@@ -412,6 +412,14 @@ impl AsyncEngine {
         self.engine.step()
     }
 
+    pub fn step_pipelined(&mut self) -> Result<Vec<V2RequestOutput>, EngineError> {
+        self.engine.step_pipelined()
+    }
+
+    pub fn step_pipelined_flush(&mut self) -> Result<Vec<V2RequestOutput>, EngineError> {
+        self.engine.step_pipelined_flush()
+    }
+
     pub fn route_outputs(&mut self, outputs: &[V2RequestOutput]) {
         for output in outputs {
             if output.finished {

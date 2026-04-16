@@ -394,3 +394,23 @@ N=128: 18,922.8 tok/s  (baseline: 19,259)
 
 O-proj residual fusion active (2-6% GEMM overhead, saves one norm kernel).
 Down-proj residual fusion disabled (38-46% overhead at K=18944).
+
+---
+
+## 9. Competitive Position vs vLLM
+
+The dead f16 weight fix (28.8 GB) brings us to parity with vLLM, not
+ahead of it. vLLM loads FP8 weights directly from the checkpoint --
+it never has f16 copies on GPU. We load f16, quantize at runtime,
+and forget to free. Fixing this is a correctness bug, not a
+competitive advantage.
+
+What actually differentiates rvLLM from vLLM:
+- Kernel-level speed: CUTLASS FP8 GEMMs are 2-6x faster individually
+- Fused kernels: add+rmsnorm+fp8quant, silu+mul+fp8quant, oproj+residual
+- Lower kernel count per layer (10 vs 12-15)
+- FA3 integration
+
+The throughput gap we're chasing is CPU overhead and scheduling, not
+memory layout or kernel speed. The GPU is fast; the CPU is the
+bottleneck between steps.

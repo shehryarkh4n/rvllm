@@ -178,10 +178,12 @@ fn main() -> anyhow::Result<()> {
             let mut total_tokens = 0usize;
 
             while engine.has_pending_work() {
-                let pending = engine.step_launch().map_err(|e| anyhow::anyhow!("{e}"))?;
-                let outputs = engine.step_collect(pending).map_err(|e| anyhow::anyhow!("{e}"))?;
+                let outputs = engine.step_pipelined().map_err(|e| anyhow::anyhow!("{e}"))?;
                 total_tokens += outputs.len();
             }
+            // Flush the last pipelined step
+            let final_outputs = engine.step_pipelined_flush().map_err(|e| anyhow::anyhow!("{e}"))?;
+            total_tokens += final_outputs.len();
 
             engine.sync().map_err(|e| anyhow::anyhow!("{e}"))?;
             let elapsed = t0.elapsed();

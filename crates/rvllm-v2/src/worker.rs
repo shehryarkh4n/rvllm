@@ -261,32 +261,51 @@ impl Worker {
             return Ok(());
         }
 
-        let input = self.input_builder.build(&self.requests, self.block_size).clone();
+        // Decode-only with no adds/removes: use cached key order (skip sort)
+        let set_changed = !diff.added.is_empty() || !diff.removed.is_empty();
+        let is_decode_only = diff.added.is_empty();
+        let input = if is_decode_only {
+            self.input_builder.build_decode_only(&self.requests, self.block_size, set_changed).clone()
+        } else {
+            self.input_builder.build(&self.requests, self.block_size).clone()
+        };
         let num_seqs = input.num_seqs;
 
         if input.is_all_decode {
-            // True async: enqueue GPU work only (no DtoH, no sync)
             if self.graph_enabled {
                 if let Some(padded) = padded_batch_size(num_seqs) {
                     if self.graph_pool.has_graph(num_seqs) {
-                        self.runner.upload_metadata_padded(&input, padded)?;
+                        // Incremental patch when no sequences added/removed and prior offsets exist
+                        let has_block_changes = !diff.block_ops.copies.is_empty();
+                        if !set_changed && self.runner.has_metadata_offsets() {
+                            self.runner.patch_metadata_decode(&input, padded, has_block_changes)?;
+                        } else {
+                            self.runner.upload_metadata_padded(&input, padded)?;
+                        }
                         let graph = self.graph_pool.get(num_seqs).unwrap();
                         graph.replay_on(self.runner.cuda_stream())
                             .map_err(|e| WorkerError::Runner(format!("graph replay: {e}")))?;
+                        // Enqueue DtoH + record event immediately (GPU still running)
+                        self.runner.launch_dtoh(num_seqs)
+                            .map_err(|e| WorkerError::Runner(format!("{e}")))?;
                         self.forward_count += 1;
                         self.pending = Some(PendingForward { num_seqs, is_decode: true, stored_output: None });
                         return Ok(());
                     }
                 }
             }
-            // No graph available: launch forward async (GPU kernels only, no DtoH)
+            // No graph: launch forward async then enqueue DtoH
             self.runner.forward_greedy_launch(&input, &self.kv_cache)
+                .map_err(|e| WorkerError::Runner(format!("{e}")))?;
+            self.runner.launch_dtoh(num_seqs)
                 .map_err(|e| WorkerError::Runner(format!("{e}")))?;
             self.forward_count += 1;
             self.pending = Some(PendingForward { num_seqs, is_decode: true, stored_output: None });
         } else {
-            // Mixed prefill+decode: GPU argmax (no full logits DtoH)
+            // Mixed prefill+decode: launch forward + enqueue DtoH
             self.runner.forward_greedy_launch(&input, &self.kv_cache)
+                .map_err(|e| WorkerError::Runner(format!("{e}")))?;
+            self.runner.launch_dtoh(num_seqs)
                 .map_err(|e| WorkerError::Runner(format!("{e}")))?;
             self.forward_count += 1;
             self.pending = Some(PendingForward { num_seqs, is_decode: true, stored_output: None });
@@ -296,8 +315,7 @@ impl Worker {
     }
 
     /// Collect the result of a previously launched step.
-    /// For decode: reads GPU argmax results (DtoH + sync).
-    /// For mixed: returns the pre-computed result from step_launch.
+    /// Uses event-based sync (waits on cuEvent instead of stream.synchronize).
     pub fn step_collect(&mut self) -> Result<ForwardOutput> {
         let pending = self
             .pending
@@ -308,17 +326,53 @@ impl Worker {
             return Ok(ForwardOutput::default());
         }
 
-        if pending.is_decode {
-            // Just read the argmax token IDs (DtoH + sync)
-            let token_ids_i32 = self.runner.read_graph_output(pending.num_seqs)
-                .map_err(|e| WorkerError::Runner(format!("{e}")))?;
-            let token_ids: Vec<TokenId> =
-                token_ids_i32.iter().map(|&t| t as TokenId).collect();
-            Ok(ForwardOutput { token_ids, logprobs: Vec::new() })
-        } else {
-            // Mixed: result already computed in step_launch
-            Ok(pending.stored_output.unwrap_or_default())
+        if let Some(output) = pending.stored_output {
+            return Ok(output);
         }
+
+        // Wait for the DtoH event (enqueued during step_launch)
+        self.runner.wait_dtoh()
+            .map_err(|e| WorkerError::Runner(format!("{e}")))?;
+        let token_ids_i32 = self.runner.read_completed_output();
+        let token_ids: Vec<TokenId> =
+            token_ids_i32.iter().map(|&t| t as TokenId).collect();
+        Ok(ForwardOutput { token_ids, logprobs: Vec::new() })
+    }
+
+    /// Non-blocking check: is the GPU forward + DtoH from step_launch complete?
+    pub fn is_step_ready(&self) -> bool {
+        self.runner.is_dtoh_ready()
+    }
+
+    /// Block until the DtoH from step_launch is complete, then return the output.
+    /// Separate from step_collect so the engine can do CPU work between wait and collect.
+    pub fn wait_for_output(&mut self) -> Result<()> {
+        if self.pending.as_ref().map_or(true, |p| p.num_seqs == 0) {
+            return Ok(());
+        }
+        self.runner.wait_dtoh()
+            .map_err(|e| WorkerError::Runner(format!("{e}")))
+    }
+
+    /// Read the completed output after wait_for_output(). Does NOT block.
+    pub fn read_output(&mut self) -> Result<ForwardOutput> {
+        let pending = self
+            .pending
+            .take()
+            .ok_or(WorkerError::NoPending)?;
+
+        if pending.num_seqs == 0 {
+            return Ok(ForwardOutput::default());
+        }
+
+        if let Some(output) = pending.stored_output {
+            return Ok(output);
+        }
+
+        let token_ids_i32 = self.runner.read_completed_output();
+        let token_ids: Vec<TokenId> =
+            token_ids_i32.iter().map(|&t| t as TokenId).collect();
+        Ok(ForwardOutput { token_ids, logprobs: Vec::new() })
     }
 
     pub fn requests(&self) -> &HashMap<RequestId, WorkerRequest> {

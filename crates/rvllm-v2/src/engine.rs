@@ -30,6 +30,12 @@ pub struct StepPending {
     sched_out: SchedulerOutput,
 }
 
+/// State for the double-buffered pipeline: holds the previous step's
+/// scheduler output while GPU runs the current step.
+struct PipelinedPending {
+    sched_out: SchedulerOutput,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct StepTimings {
     pub scheduler_us: u64,
@@ -53,6 +59,10 @@ pub struct Engine<B: BlockManagerOps> {
     drafter: NgramDrafter,
     block_size: usize,
     decode_steps_since_admission: usize,
+    // Double-buffered pipeline: previous step waiting for output processing
+    prev_pending: Option<PipelinedPending>,
+    // Pre-allocated output buffers (reused across steps)
+    reusable_step_results: Vec<(SequenceId, TokenId, bool)>,
 }
 
 impl<B: BlockManagerOps> Engine<B> {
@@ -72,6 +82,8 @@ impl<B: BlockManagerOps> Engine<B> {
             drafter,
             block_size,
             decode_steps_since_admission: 0,
+            prev_pending: None,
+            reusable_step_results: Vec::with_capacity(256),
         }
     }
 
@@ -134,7 +146,9 @@ impl<B: BlockManagerOps> Engine<B> {
     }
 
     pub fn has_pending_work(&self) -> bool {
-        self.scheduler.has_pending_work() || self.requests.values().any(|r| !r.finished)
+        self.scheduler.has_pending_work()
+            || self.requests.values().any(|r| !r.finished)
+            || self.prev_pending.is_some()
     }
 
     pub fn step(&mut self) -> Result<Vec<V2RequestOutput>, EngineError> {
@@ -258,6 +272,78 @@ impl<B: BlockManagerOps> Engine<B> {
         let result = self.process_forward_output(&pending.sched_out, &fwd_output);
         self.scheduler.recycle_diff(pending.sched_out.diff);
         Ok(result)
+    }
+
+    /// Pipelined step: overlaps output processing of step N-1 with GPU work for step N.
+    /// Returns outputs from the PREVIOUS step (one step latency).
+    ///
+    /// Timeline:
+    ///   GPU: [forward N][forward N+1][forward N+2]
+    ///   CPU: [prep N]  [out N-1 + prep N+1]  [out N + prep N+2]
+    ///
+    /// Call step_pipelined_flush() at end to drain the last pending step.
+    pub fn step_pipelined(&mut self) -> Result<Vec<V2RequestOutput>, EngineError> {
+        // 1. Schedule + launch step N on GPU
+        let sched_out = if self.should_use_decode_lane() {
+            self.decode_steps_since_admission += 1;
+            self.scheduler.schedule_decode_only()
+        } else {
+            self.decode_steps_since_admission = 0;
+            self.scheduler.schedule()
+        };
+
+        let launched = if !sched_out.diff.is_empty() {
+            self.worker
+                .step_launch(&sched_out.diff)
+                .map_err(|e| EngineError::Worker(e.to_string()))?;
+            true
+        } else {
+            false
+        };
+
+        // 2. While GPU runs step N, process output from step N-1
+        let prev_outputs = if let Some(prev) = self.prev_pending.take() {
+            // Wait for step N-1's DtoH (should already be done -- GPU ran during our prep)
+            self.worker
+                .wait_for_output()
+                .map_err(|e| EngineError::Worker(e.to_string()))?;
+            let fwd_output = self
+                .worker
+                .read_output()
+                .map_err(|e| EngineError::Worker(e.to_string()))?;
+            let result = self.process_forward_output(&prev.sched_out, &fwd_output);
+            self.scheduler.recycle_diff(prev.sched_out.diff);
+            result
+        } else {
+            Vec::new()
+        };
+
+        // 3. Store step N as prev_pending for next iteration
+        if launched {
+            self.prev_pending = Some(PipelinedPending { sched_out });
+        } else {
+            self.scheduler.recycle_diff(sched_out.diff);
+        }
+
+        Ok(prev_outputs)
+    }
+
+    /// Flush the last pending pipelined step. Call once after generation loop ends.
+    pub fn step_pipelined_flush(&mut self) -> Result<Vec<V2RequestOutput>, EngineError> {
+        if let Some(prev) = self.prev_pending.take() {
+            self.worker
+                .wait_for_output()
+                .map_err(|e| EngineError::Worker(e.to_string()))?;
+            let fwd_output = self
+                .worker
+                .read_output()
+                .map_err(|e| EngineError::Worker(e.to_string()))?;
+            let result = self.process_forward_output(&prev.sched_out, &fwd_output);
+            self.scheduler.recycle_diff(prev.sched_out.diff);
+            Ok(result)
+        } else {
+            Ok(Vec::new())
+        }
     }
 
     /// Speculative decode step: draft K tokens per sequence, verify in one forward pass,
@@ -422,8 +508,7 @@ impl<B: BlockManagerOps> Engine<B> {
         fwd_output: &ForwardOutput,
     ) -> Vec<V2RequestOutput> {
         let diff = &sched_out.diff;
-        let mut step_results: Vec<(SequenceId, TokenId, bool)> =
-            Vec::with_capacity(diff.added.len() + diff.continued.len());
+        self.reusable_step_results.clear();
         let mut request_outputs: Vec<V2RequestOutput> = Vec::new();
         let mut token_idx = 0;
 
@@ -439,7 +524,7 @@ impl<B: BlockManagerOps> Engine<B> {
                     } else {
                         None
                     };
-                    step_results.push((added.seq_id, token_id, finished));
+                    self.reusable_step_results.push((added.seq_id, token_id, finished));
                     if let Some(req) = self.requests.get_mut(&added.request_id) {
                         req.output_token_ids.push(token_id);
                         if finished {
@@ -448,7 +533,7 @@ impl<B: BlockManagerOps> Engine<B> {
                         }
                     }
                 } else {
-                    step_results.push((added.seq_id, 0, false));
+                    self.reusable_step_results.push((added.seq_id, 0, false));
                 }
             }
             token_idx += 1;
@@ -464,7 +549,7 @@ impl<B: BlockManagerOps> Engine<B> {
                 } else {
                     None
                 };
-                step_results.push((cont.seq_id, token_id, finished));
+                self.reusable_step_results.push((cont.seq_id, token_id, finished));
                 if let Some(req) = self.requests.get_mut(&cont.request_id) {
                     req.output_token_ids.push(token_id);
                     if finished {
@@ -476,7 +561,7 @@ impl<B: BlockManagerOps> Engine<B> {
             token_idx += 1;
         }
 
-        self.scheduler.process_step_result(&step_results);
+        self.scheduler.process_step_result(&self.reusable_step_results);
         self.build_request_outputs(diff, fwd_output, &mut request_outputs);
         self.cleanup_finished();
 

@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
 use cudarc::driver::{CudaSlice, CudaStream, CudaView, DevicePtr, LaunchConfig, PushKernelArg};
+use cudarc::driver::result::event as cu_event;
+use cudarc::driver::sys::{CUevent, CUevent_flags};
 use half::f16;
 
 use rvllm_core::prelude::{LLMError, Result};
@@ -122,6 +124,10 @@ pub struct GpuModelRunner {
     pinned_meta: PinnedBuffer<i32>,
     // Stored metadata offsets from the last upload (for forward_gpu_only)
     last_meta_offsets: Option<PackedMetaOffsets>,
+    // Event for non-blocking DtoH completion polling (CU_EVENT_DISABLE_TIMING for zero overhead)
+    dtoh_event: CUevent,
+    // Number of tokens in the pending DtoH transfer (set by launch_dtoh)
+    pending_dtoh_tokens: usize,
 }
 
 impl GpuModelRunner {
@@ -203,6 +209,10 @@ impl GpuModelRunner {
         let pinned_argmax = PinnedBuffer::<i32>::new(max_t)?;
         let pinned_meta = PinnedBuffer::<i32>::new(max_meta_elems.max(4096))?;
 
+        // CU_EVENT_DISABLE_TIMING: zero overhead event for DtoH completion polling
+        let dtoh_event = cu_event::create(CUevent_flags::CU_EVENT_DISABLE_TIMING)
+            .map_err(|e| LLMError::GpuError(format!("dtoh event create: {e}")))?;
+
         Ok(Self {
             config,
             layers,
@@ -259,6 +269,8 @@ impl GpuModelRunner {
             pinned_argmax,
             pinned_meta,
             last_meta_offsets: None,
+            dtoh_event,
+            pending_dtoh_tokens: 0,
         })
     }
 
@@ -370,8 +382,29 @@ impl GpuModelRunner {
 
         self.weights.fp8_enabled = true;
 
-        tracing::info!(num_layers, "FP8 weight quantization complete");
+        // Free dead f16 weights -- never used again after FP8 quantization.
+        // Replace with 1-element stubs (LayerWeights construction still indexes these vecs).
+        let freed = Self::shrink_weight_vecs(&mut self.weights.fused_qkv, &self.stream)
+            + Self::shrink_weight_vecs(&mut self.weights.fused_gate_up, &self.stream)
+            + Self::shrink_weight_vecs(&mut self.weights.o_proj, &self.stream)
+            + Self::shrink_weight_vecs(&mut self.weights.down_proj, &self.stream);
+        // Also free lm_head f16 (FP8 lm_head is used instead)
+        let lm_head_elems = self.lm_head_weight.len();
+        self.lm_head_weight = self.stream.alloc_zeros::<f16>(1)
+            .map_err(|e| LLMError::GpuError(format!("lm_head shrink: {e}")))?;
+        let freed = freed + lm_head_elems * 2;
+
+        tracing::info!(num_layers, freed_bytes = freed, freed_gb = freed as f64 / (1024.0 * 1024.0 * 1024.0), "FP8 weight quantization complete, freed dead f16 weights");
         Ok(())
+    }
+
+    fn shrink_weight_vecs(weights: &mut Vec<CudaSlice<f16>>, stream: &Arc<CudaStream>) -> usize {
+        let mut freed = 0;
+        for w in weights.iter_mut() {
+            freed += w.len() * std::mem::size_of::<f16>();
+            *w = stream.alloc_zeros::<f16>(1).expect("1-element stub alloc");
+        }
+        freed
     }
 
     pub fn forward(&mut self, input: &GpuBatchInput, kv_cache: &CudaKVCache) -> Result<Vec<f32>> {
@@ -1039,6 +1072,73 @@ impl GpuModelRunner {
         Ok(())
     }
 
+    /// Patch metadata in-place for decode-only continuation.
+    /// Only updates token_ids, position_ids, context_lens, slot_mapping
+    /// in the existing pinned buffer. Skips full cpu_scratch rebuild.
+    pub fn patch_metadata_decode(
+        &mut self,
+        input: &GpuBatchInput,
+        padded_batch: usize,
+        block_table_changed: bool,
+    ) -> Result<()> {
+        let offsets = self.last_meta_offsets
+            .ok_or_else(|| LLMError::GpuError("no prior metadata for patching".into()))?;
+        let actual = input.num_seqs;
+        let pinned = self.pinned_meta.as_mut_slice();
+
+        // Patch token_ids
+        for i in 0..actual {
+            pinned[offsets.token_ids + i] = input.token_ids[i] as i32;
+        }
+        // Patch positions
+        for i in 0..actual {
+            pinned[offsets.positions + i] = input.position_ids[i] as i32;
+        }
+        // Patch context_lens
+        for i in 0..actual {
+            pinned[offsets.context_lens + i] = input.context_lens[i] as i32;
+        }
+        // Patch slot_mapping
+        for i in 0..actual {
+            pinned[offsets.slot_mapping + i] = input.slot_mapping[i] as i32;
+        }
+
+        // Block tables: only patch if a sequence crossed a block boundary
+        if block_table_changed {
+            let max_blocks = self.graph_max_blocks;
+            let max_blocks_input = input.max_blocks_per_seq;
+            let copy_len = max_blocks_input.min(max_blocks);
+            for s in 0..actual {
+                let src_start = s * max_blocks_input;
+                let dst_start = offsets.block_tables + s * max_blocks;
+                let src_end = (src_start + copy_len).min(input.block_tables_flat.len());
+                for (i, &v) in input.block_tables_flat[src_start..src_end].iter().enumerate() {
+                    pinned[dst_start + i] = v as i32;
+                }
+            }
+        }
+
+        // Async HtoD of the full pinned buffer
+        let total = offsets.seq_start_pos + offsets.num_seq_start_pos;
+        let dst_dev_ptr = {
+            let (ptr, _) = self.meta_packed.device_ptr(&self.stream);
+            ptr
+        };
+        let bytes = total * std::mem::size_of::<i32>();
+        unsafe {
+            cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
+                dst_dev_ptr,
+                self.pinned_meta.as_ptr() as *const std::ffi::c_void,
+                bytes,
+                self.stream.cu_stream(),
+            )
+            .result()
+            .map_err(|e| LLMError::GpuError(format!("patch meta HtoD: {e}")))?;
+        }
+
+        Ok(())
+    }
+
     /// GPU-only forward pass for CUDA graph capture/replay.
     ///
     /// Runs embedding -> layer loop -> final RMSNorm -> LM head -> argmax.
@@ -1256,9 +1356,64 @@ impl GpuModelRunner {
         Ok(&self.pinned_argmax.as_slice()[..num_tokens])
     }
 
+    /// Launch async DtoH copy for argmax token IDs and record completion event.
+    /// Returns immediately -- call is_dtoh_ready() or wait_dtoh() to check/wait.
+    pub fn launch_dtoh(&mut self, num_tokens: usize) -> Result<()> {
+        self.pending_dtoh_tokens = num_tokens;
+        let bytes = num_tokens * std::mem::size_of::<i32>();
+        let src_dev_ptr = {
+            let (ptr, _) = self.argmax_output.device_ptr(&self.stream);
+            ptr
+        };
+        unsafe {
+            cudarc::driver::sys::cuMemcpyDtoHAsync_v2(
+                self.pinned_argmax.as_mut_ptr() as *mut std::ffi::c_void,
+                src_dev_ptr,
+                bytes,
+                self.stream.cu_stream(),
+            )
+            .result()
+            .map_err(|e| LLMError::GpuError(format!("launch_dtoh: {e}")))?;
+            cu_event::record(self.dtoh_event, self.stream.cu_stream())
+                .map_err(|e| LLMError::GpuError(format!("dtoh event record: {e}")))?;
+        }
+        Ok(())
+    }
+
+    /// Non-blocking check: is the DtoH copy from launch_dtoh() complete?
+    pub fn is_dtoh_ready(&self) -> bool {
+        unsafe {
+            cudarc::driver::sys::cuEventQuery(self.dtoh_event)
+                == cudarc::driver::sys::CUresult::CUDA_SUCCESS
+        }
+    }
+
+    /// Block until the DtoH copy from launch_dtoh() is complete.
+    pub fn wait_dtoh(&self) -> Result<()> {
+        cu_event::synchronize(self.dtoh_event)
+            .map_err(|e| LLMError::GpuError(format!("dtoh event sync: {e}")))?;
+        Ok(())
+    }
+
+    /// Read the completed DtoH output. Only valid after wait_dtoh() or is_dtoh_ready() == true.
+    pub fn read_completed_output(&self) -> &[i32] {
+        &self.pinned_argmax.as_slice()[..self.pending_dtoh_tokens]
+    }
+
     /// Returns the max_seq_len from config (for graph capture max_context_len).
     pub fn max_seq_len(&self) -> usize {
         self.config.max_seq_len
+    }
+
+    /// Whether prior metadata offsets exist (for incremental patching).
+    pub fn has_metadata_offsets(&self) -> bool {
+        self.last_meta_offsets.is_some()
+    }
+}
+
+impl Drop for GpuModelRunner {
+    fn drop(&mut self) {
+        cu_event::destroy(self.dtoh_event).ok();
     }
 }
 
