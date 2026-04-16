@@ -788,6 +788,8 @@ pub fn max_workspace_size(
 
     for &(m, n, k) in hgemm_shapes {
         let (mi, ni, ki) = (m as i32, n as i32, k as i32);
+        // Default (non-variant) hgemm fallback
+        max_ws = max_ws.max(cutlass.hgemm_workspace_size(mi, ni, ki));
         for v in 0..HGEMM_VARIANTS {
             if let Some(ws) = cutlass.hgemm_variant_workspace_size(v, mi, ni, ki) {
                 max_ws = max_ws.max(ws);
@@ -815,6 +817,11 @@ pub fn max_workspace_size(
 
     for &(m, n, k) in fp8_gemm_shapes {
         let (mi, ni, ki) = (m as i32, n as i32, k as i32);
+        // Default (non-variant) fp8_gemm and small-tile fallbacks
+        max_ws = max_ws.max(cutlass.fp8_gemm_workspace_size(mi, ni, ki));
+        if let Some(ws) = cutlass.fp8_gemm_small_workspace_size(mi, ni, ki) {
+            max_ws = max_ws.max(ws);
+        }
         for v in 0..FP8_GEMM_VARIANTS {
             if let Some(ws) = cutlass.fp8_gemm_variant_workspace_size(v, mi, ni, ki) {
                 max_ws = max_ws.max(ws);

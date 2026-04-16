@@ -561,6 +561,10 @@ impl CutlassKernels {
         self.fn_fp8_gemm_small.is_some()
     }
 
+    pub fn fp8_gemm_small_workspace_size(&self, m: i32, n: i32, k: i32) -> Option<usize> {
+        self.fn_fp8_gemm_small_wksz.map(|f| unsafe { f(m, n, k) })
+    }
+
     // -- Autotuned variant dispatch --
 
     /// Run HGEMM variant by index. Returns Err if variant not loaded.
