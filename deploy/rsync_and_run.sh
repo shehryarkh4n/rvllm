@@ -16,7 +16,7 @@ PORT=${2:-20236}
 shift 2 2>/dev/null || true
 EXTRA_ARGS="$*"
 
-SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=10 -p ${PORT}"
+SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=10 -p ${PORT} -A"
 REMOTE_DIR="/root/rvllm"
 REPO_URL="git@github.com:m0at/rvllm.git"
 
