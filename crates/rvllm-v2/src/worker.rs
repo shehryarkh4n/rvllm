@@ -279,19 +279,13 @@ impl Worker {
             if self.graph_enabled {
                 if let Some(padded) = padded_batch_size(num_seqs) {
                     if self.graph_pool.has_graph(num_seqs) {
-                        // Incremental patch only when last upload was padded for the SAME bucket.
-                        // Captured graph reads at padded offsets; a non-padded upload (e.g. from a
-                        // preceding prefill via forward_greedy_launch) leaves stale offsets and the
-                        // patch writes at the wrong indices -> graph reads garbage block_tables ->
-                        // CUDA_ERROR_ILLEGAL_ADDRESS in fa3_v3_decode_gqa_kernel.
-                        let has_block_changes = !diff.block_ops.copies.is_empty();
-                        let can_patch = !set_changed
-                            && self.runner.last_padded_batch() == Some(padded);
-                        if can_patch {
-                            self.runner.patch_metadata_decode(input_ref, padded, has_block_changes)?;
-                        } else {
-                            self.runner.upload_metadata_padded(input_ref, padded)?;
-                        }
+                        // Always do full upload for now: patch_metadata_decode skips
+                        // block_tables unless diff.block_ops.copies is non-empty, which
+                        // misses normal block-boundary growth (sequence reaches a new
+                        // page) -> captured graph reads stale block_tables -> garbage
+                        // attention. Re-introduce patch optimization with correct
+                        // block_table_changed detection.
+                        self.runner.upload_metadata_padded(input_ref, padded)?;
                         let graph = self.graph_pool.get(num_seqs).unwrap();
                         graph.replay_on(self.runner.cuda_stream())
                             .map_err(|e| WorkerError::Runner(format!("graph replay: {e}")))?;
