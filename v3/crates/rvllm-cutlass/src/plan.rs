@@ -38,6 +38,27 @@ impl Fp8GemmPlan {
         })
     }
 
+    /// Plan for a residual-epilogue GEMM. Uses `Policy::lookup_residual`
+    /// so (M, N, K)-collisions between a base and residual GEMM don't
+    /// overwrite each other.
+    pub fn from_policy_residual(
+        policy: &Policy,
+        m: u32,
+        n: u32,
+        k: u32,
+        dtype: DType,
+    ) -> Result<Self> {
+        let entry = policy.lookup_residual(m as usize, n as usize, k as usize, dtype)?;
+        Ok(Self {
+            variant: entry.variant,
+            m,
+            n,
+            k,
+            dtype,
+            workspace_bytes: entry.workspace_bytes,
+        })
+    }
+
     /// Raise an error if `available` workspace is insufficient for the
     /// plan. Called by `Cutlass::run` before the launch.
     pub fn check_workspace(&self, available: usize) -> Result<()> {

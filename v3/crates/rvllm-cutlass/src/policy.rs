@@ -81,7 +81,30 @@ impl Policy {
     /// Look up the variant for a shape. Missing entry → typed Err; the
     /// engine's init path refuses to continue.
     pub fn lookup(&self, m: usize, n: usize, k: usize, dtype: DType) -> Result<&PolicyEntry> {
-        let key = format!("{m}_{n}_{k}_{dtype:?}");
+        self.lookup_with_suffix(m, n, k, dtype, "")
+    }
+
+    /// Residual-epilogue variant lookup. Distinguishes shapes that
+    /// share (m,n,k) between a base GEMM and its residual-fused sibling.
+    pub fn lookup_residual(
+        &self,
+        m: usize,
+        n: usize,
+        k: usize,
+        dtype: DType,
+    ) -> Result<&PolicyEntry> {
+        self.lookup_with_suffix(m, n, k, dtype, "_res")
+    }
+
+    fn lookup_with_suffix(
+        &self,
+        m: usize,
+        n: usize,
+        k: usize,
+        dtype: DType,
+        suffix: &str,
+    ) -> Result<&PolicyEntry> {
+        let key = format!("{m}_{n}_{k}_{dtype:?}{suffix}");
         self.entries.get(&key).ok_or_else(|| RvllmError::cutlass(
             CutlassError::AutotuneCacheMiss { m, n, k, dtype },
             CutlassCtx {

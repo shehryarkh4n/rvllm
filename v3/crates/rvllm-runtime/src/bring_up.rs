@@ -231,7 +231,7 @@ impl Bringup {
             hidden,
             rvllm_core::DType::Fp8E4M3,
         )?;
-        let plan_o = Fp8GemmPlan::from_policy(
+        let plan_o = Fp8GemmPlan::from_policy_residual(
             &self.policy,
             num_seqs,
             hidden,
@@ -245,7 +245,7 @@ impl Bringup {
             hidden,
             rvllm_core::DType::Fp8E4M3,
         )?;
-        let plan_down = Fp8GemmPlan::from_policy(
+        let plan_down = Fp8GemmPlan::from_policy_residual(
             &self.policy,
             num_seqs,
             hidden,

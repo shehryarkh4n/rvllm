@@ -43,12 +43,14 @@ def main():
         ]:
             key = f"{m}_{n}_{k}_Fp8E4M3"
             entries[key] = {"variant": 0, "workspace_bytes": ws}
-        # Residual: O, down
+        # Residual: O, down — keyed with _res suffix so they don't
+        # collide with a same-shape non-residual entry (e.g. Q vs O
+        # both = hidden x hidden for Qwen).
         for n, k in [
             (hidden, q_dim),        # O
             (hidden, inter),        # down
         ]:
-            key = f"{m}_{n}_{k}_Fp8E4M3"
+            key = f"{m}_{n}_{k}_Fp8E4M3_res"
             entries[key] = {"variant": 100, "workspace_bytes": ws}
 
     # Two variants in the catalog: non-residual id=0, residual id=100.
