@@ -49,7 +49,7 @@ where
     }
 }
 
-#[derive(Copy, Clone, Debug, Serialize, Deserialize, Eq, PartialEq, Hash)]
+#[derive(Copy, Clone, Debug, Serialize, Deserialize, Eq, PartialEq, Hash, Ord, PartialOrd)]
 #[repr(transparent)]
 pub struct VariantId(pub u32);
 
