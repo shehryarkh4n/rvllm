@@ -160,6 +160,41 @@ impl<'a> Region<'a> {
     pub fn device_ptr(&self) -> u64 {
         self.arena.base + self.offset as u64
     }
+
+    /// Synchronous H2D upload into this region. Fails if `src.len()`
+    /// exceeds `self.len()`.
+    ///
+    /// # Safety
+    /// Caller must ensure no concurrent kernel is reading the region.
+    /// This function issues a synchronous cuMemcpyHtoD_v2 which
+    /// serializes on the default stream; it's for load-time population,
+    /// not the graph-captured fast path.
+    pub unsafe fn copy_from_host(&self, src: &[u8]) -> Result<()> {
+        if src.len() > self.len {
+            return Err(RvllmError::cuda(
+                "Region::copy_from_host (len)",
+                CudaErrorKind::AllocFailed,
+                CudaCtx::setup(),
+            ));
+        }
+        #[cfg(feature = "cuda")]
+        {
+            use cudarc::driver::sys::*;
+            let r = cuMemcpyHtoD_v2(self.device_ptr(), src.as_ptr() as *const _, src.len());
+            if r != CUresult::CUDA_SUCCESS {
+                return Err(RvllmError::cuda(
+                    "cuMemcpyHtoD_v2",
+                    CudaErrorKind::AllocFailed,
+                    CudaCtx::setup(),
+                ));
+            }
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = src;
+        }
+        Ok(())
+    }
 }
 
 // A `Region` is GraphSafe: it borrows the arena, the arena is fixed-size
