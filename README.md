@@ -1,587 +1,218 @@
-# rvLLM: High-performance LLM inference in Rust
+# rvLLM
 
-A from-scratch Rust rewrite of [vLLM](https://github.com/vllm-project/vllm) focused on single-card, high-throughput serving with explicit control over kernels, memory, and startup behavior.
+A single-GPU, FP8, graph-captured LLM inference engine in Rust. Qwen2.5-7B on a single H100 SXM at **19,287 tok/s** at N=128, 512 output tokens, greedy, CUDA graphs on.
 
-310 commits, 31 crates, ~76K lines of Rust, 253 source files. Zero Python in the serving hot path.
+No Python in the hot path. No fallbacks. Missing artifacts (autotune policy, FA3 `.so`, kernel SHA) refuse to start.
 
-## Reproduce the Benchmark
+Measured April 16, 2026 on commit `eb9e247fd`, rvllm-v2-bench direct engine, FP8 E4M3, CUDA 12.4. Reproducible from source — see *Reproduce* below.
 
-One command spins up a fresh vast.ai H100, builds rvLLM from source, pulls the model from HuggingFace, runs the lifecycle race against stock vLLM, and drops the results locally:
+## Current throughput
 
-```bash
-VASTAI_API_KEY=<your_key> ./race.sh
-```
-
-Results land in `bench/combined_results_h100_lifecycle.json`. The instance stays up after the run so you can inspect logs; destroy it with the printed `vastai destroy instance <id>` command when done.
-
-## Current Status
-
-**rvLLM v2 reaches ~66-85% of vLLM 0.19.0 FP8 throughput** on the same H100 SXM 80GB, Qwen2.5-7B, greedy decode. Gap narrows at higher batch sizes. Measured April 15, 2026 with rvllm-v2-bench (direct engine, no HTTP). vLLM numbers from vllm_direct_bench.py on the same GPU.
-
-What's been built:
-1. **CUTLASS 3x SM90 FP8 GEMMs** -- 32 autotuned variants including stream-K/split-K, FP8FastAccum Pingpong schedule
-2. **FlashAttention-3 SM90 paged-KV decode** -- WGMMA/TMA-accelerated via shared library, 7.5us/layer
-3. **Fused RMSNorm + FP8 quantize** and **fused SiLU*mul + FP8 quantize** -- 10 kernels/layer (down from 15)
-4. **Vectorized fused SiLU+FP8** -- 128-bit loads, 64-bit FP8 stores, register caching
-5. **GPU-resident argmax** -- greedy token selection stays on-device
-6. **CPU hot-path elimination** -- O(1) scheduler lookup, zero per-step Vec allocations, pinned-slice graph output
-
-What rvLLM does well:
-- **19,259 tok/s at N=128** (FP8, 512 output tokens) on a single H100
-- **10 kernels per layer** (down from 15 with the cuBLASLt path, comparable to vLLM's 9-11)
-- **~50 MB container image** vs ~15 GB for Python vLLM
-- **35-second build from source**, no pip, no PyTorch, no `torch.compile`
-- **54 CUDA kernels** with no-fallback validation -- silent degradation is treated as a bug
-- **JIT fused kernels** 2-7.5x faster than our hand-written CUDA on M=1 decode microbenchmarks
-- **Safe-max VRAM control**: `--gpu-memory-reserve-gb` + explicit `--num-gpu-blocks` + `--num-cpu-blocks`
-
-The remaining gap is structural, not kernel-level. Both engines use the same CUTLASS FP8 GEMM family, and rvLLM's individual fused kernels are 2-6x faster per-call. The gap comes from F16 LM head GEMM, extra FP8 quantization passes, per-step metadata HtoD, and stream synchronization between steps.
-
-## Current H100 Comparison
-
-Qwen/Qwen2.5-7B on H100 SXM 80GB, FP8 E4M3, 512 output tokens, greedy decode (temperature=0), CUDA graphs enabled. rvllm-v2-bench direct engine. April 15, 2026.
-
-### rvLLM v2 FP8 (verified, deploy6.log commit 2678aaef2)
+H100 SXM 80GB, Qwen2.5-7B, FP8 E4M3, 512 output tokens, greedy, graphs captured, FA3 `.so` loaded:
 
 | N | tok/s | stdev |
 |---:|---:|---:|
-| 1 | 149.1 | 0.0 |
-| 4 | 582.7 | 0.2 |
-| 8 | 1,163.6 | 1.8 |
-| 16 | 2,345.0 | 3.6 |
-| 32 | 4,434.3 | 3.0 |
-| 64 | 11,240.0 | 7.1 |
-| 128 | 19,259.3 | 33.1 |
+| 1 | 195.2 | 0.0 |
+| 4 | 770.2 | 0.7 |
+| 8 | 1,529.6 | 0.8 |
+| 16 | 3,011.8 | 0.6 |
+| 32 | 5,935.0 | 0.4 |
+| 64 | 11,064.3 | 1.6 |
+| **128** | **19,287.5** | **38.5** |
 
-vLLM 0.19.0 FP8 baseline from direct engine benchmark (vllm_direct_bench.py, same GPU, same day): see docs/benchmark-history.md for the full comparison table.
-
-### Per-Kernel Comparison (nsys, N=32 decode)
-
-nsys profiling revealed that both engines use the same CUTLASS `cutlass_3x_gemm_sm90_fp8` kernel family for FP8 GEMMs. rvLLM's individual kernels are faster per-call:
-
-| Kernel | rvLLM | vLLM | rvLLM advantage |
-|---|---:|---:|---:|
-| SiLU+FP8 fused | 14.3us | 44.5us (Triton) | **3.1x faster** |
-| RMSNorm+FP8 fused | 6.0-7.3us | 13.6us (Triton) | **2.3x faster** |
-| FA3 SM90 attention | 8.2us | 51.1us | **6.2x faster** |
-| CUTLASS FP8 GEMM | 15.9-65.6us | 113us avg (mixed) | comparable |
-
-The throughput gap is **structural**, not kernel-level. Root cause analysis identified:
-
-1. **CUTLASS schedule selection** (est. 5-10%): small-tile kernel now uses `KernelTmaWarpSpecializedPingpongFP8FastAccum`. Fixed in 072d6dffc.
-2. **CPU hot-path allocations** (est. 1.6-5%): O(N^2) scheduler lookup, 14 Vec reallocations/step, SamplingParams clones. Fixed in 072d6dffc.
-3. **LM head F16 cuBLAS** (est. 3.7-4.4%): 483us/step on a [32, 152064, 3584] GEMM where vLLM uses FP8 CUTLASS. Pending.
-4. **Extra quantize_fp8_per_token kernel** (est. 2-4%): 28 extra HBM round-trips/step because FA3 outputs F16. Pending.
-5. **Per-step metadata HtoD** (est. 1-2%): positions, seq_lens, block_tables uploaded to GPU every decode step. Pending.
-6. **stream.synchronize()** blocks CPU after every step instead of async overlap. Pending.
-
-### v2 FP8 Inference Stack
-
-The `rvllm-v2` crate (`crates/rvllm-v2/`) implements a full FP8 inference pipeline with CUTLASS SM90 GEMMs and fused quantization kernels:
-
-- **Per-tensor FP8 E4M3 weight quantization at startup**: `scale = max(|W|) / 448.0`, applied once on CPU
-- **Fused RMSNorm + per-token FP8 quantize**: single kernel replaces separate RMSNorm, absmax, and quantize kernels (3 -> 1)
-- **Fused residual-add + RMSNorm + per-token FP8 quantize**: attention residual path in one launch
-- **Fused SiLU*mul + per-token FP8 quantize**: single kernel replaces separate SiLU, elementwise mul, and quantize kernels (3 -> 1)
-- **CUTLASS 3x SM90 FP8 GEMM**: per-row activation scaling and per-tensor weight scaling, replacing cuBLASLt
-- **CUTLASS FP8 autotune**: 32 GEMM variants (tile shapes, cluster shapes, Cooperative/WarpSpecialized/Pingpong/FP8FastAccum schedules, stream-K, split-K=2/4) benchmarked per shape
-- **Vectorized fused SiLU+FP8**: uint4 128-bit loads (8 halves per load), register caching, uint2 64-bit FP8 stores (8 FP8 values per store)
-- **FA3 SM90 paged-KV decode**: FlashAttention-3 with WGMMA/TMA via shared library, 7.5us/layer
-- **Per-layer kernel count**: 10 kernels (down from 15 with the cuBLASLt path). Comparable to vLLM's 9-11.
-
-## Supported Model Architectures
-
-13 architectures with full GPU forward pass support:
-
-| Architecture | Models | Notes |
-|---|---|---|
-| `LlamaForCausalLM` | Llama 2/3/3.1, CodeLlama, Vicuna | Auto context expansion to 8K |
-| `MistralForCausalLM` | Mistral 7B | Sliding window attention |
-| `Qwen2ForCausalLM` | Qwen2, Qwen2.5 | Verified benchmark model |
-| `CohereForCausalLM` | Command-R | |
-| `GPTNeoXForCausalLM` | Pythia, GPT-NeoX, StableLM | |
-| `StableLMForCausalLM` | StableLM-2 | |
-| `GemmaForCausalLM` | Gemma 1.0 | |
-| `Gemma2ForCausalLM` | Gemma 2 | |
-| `DeepseekV2ForCausalLM` | DeepSeek-V2, DeepSeek-Coder-V2 | MoE with shared experts |
-| `MixtralForCausalLM` | Mixtral 8x7B, 8x22B | Sparse MoE |
-| `NemotronHMoE` | Nemotron-H | Hybrid MoE (latest merge) |
-| `Phi3SmallForCausalLM` | Phi-3-small | |
-| `SentenceTransformer` | BERT, E5, BGE embedding models | Embedding-only forward pass |
-
-Weight formats: SafeTensors (single file and sharded index), GGUF (Q4_0, Q4_K_M, Q5_0, Q5_K_M, Q8_0).
-
-## Decode Paths
-
-Five runtime-selectable decode strategies, each with different performance trade-offs. No fallbacks -- if the selected path's kernels are missing, it fails loud.
-
-| Decode Path | N=1 tok/s | Selection | Notes |
-|---|---:|---|---|
-| Batched (default) | 149.1 | `T=1` unless `RVLLM_BATCHED_DECODE_1=0` | Reusable batched scratch path, current normal batch-1 decode path |
-| MegakernelDecode | ~50 | Internal | All 28 layers in 1 kernel launch (instruction tape interpreter) |
-| PersistentDecode | ~51 | Internal | SM-DAG cooperative kernel per layer |
-| CutlassFp8Decode (v2) | auto | v2 engine | CUTLASS 3x SM90 FP8 GEMMs + fused norm/silu quantize kernels, 10 kernels/layer |
-| Batched (`Hybrid`) | auto | `T>=2` | QKV/O/down on cuBLAS or cublasLt, Gate activation on CUTLASS SM90 aux epilogue |
-
-For batched decode and prefill, the current default policy is:
-- `RVLLM_BATCHED_GEMM_STRATEGY=hybrid` when CUTLASS is available
-- `RVLLM_BATCHED_GEMM_STRATEGY=cublas` otherwise
-
-The megakernel packs all 28 transformer layers and the LM head into a single CUDA kernel launch, driven by an instruction tape that sequences GEMV, RMSNorm, RoPE, attention, and activation operations with double-buffered residuals and per-layer KV cache. See [crates/rvllm-model-runner/README.md](crates/rvllm-model-runner/README.md) for the full decode path architecture.
-
-## API Endpoints
-
-Full OpenAI-compatible HTTP API via axum:
-
-| Endpoint | Method | Description |
-|---|---|---|
-| `/v1/completions` | POST | Text completion (streaming + non-streaming) |
-| `/v1/chat/completions` | POST | Chat completion with tool/function calling |
-| `/v1/chat/completions/tools` | POST | Dedicated tool calling endpoint |
-| `/v1/responses` | POST | Unified Responses API (stored turns, background, streaming) |
-| `/v1/responses/:id` | GET | Retrieve a stored response |
-| `/v1/responses/:id/input_items` | GET | List response input items |
-| `/v1/embeddings` | POST | Compute embeddings |
-| `/v1/models` | GET | List available models |
-| `/v1/batches` | POST | Submit batch inference (JSONL) |
-| `/v1/batches/:id` | GET | Check batch status |
-| `/v1/batches/:id/output` | GET | Retrieve batch results (JSONL) |
-| `/v1/batches/:id/cancel` | POST | Cancel a running batch |
-| `/health` | GET | Liveness check |
-| `/metrics` | GET | Prometheus exposition |
-
-The Responses API (`/v1/responses`) supports multi-turn conversations via `previous_response_id` and `conversation` references, background execution, stored response retrieval, function tool calling with streaming argument deltas, reasoning configuration, and the `include` parameter for controlling output payloads like logprobs.
-
-## Architecture
-
-### Inference Pipeline
+## The stack, every layer
 
 ```
-Request -> Tokenizer -> Scheduler -> GPU Forward -> Sampler -> Detokenizer -> Response
-                            |              |
-                     Continuous      CUDA Graph Replay
-                     Batching       (35 pre-captured sizes)
-                            |              |
-                     Block Manager    JIT Fused Kernels
-                     (paged KV)      (generated at model load)
+┌───────────────────────────────────────────────────────────────────┐
+│  HTTP / OpenAI API             rvllm-api (axum)                   │
+├───────────────────────────────────────────────────────────────────┤
+│  Engine                        rvllm-v2 Engine                    │
+│                                step_pipelined() = launch + collect│
+│                                double-buffered pinned argmax DtoH │
+├───────────────────────────────────────────────────────────────────┤
+│  Scheduler                     continuous batching                │
+│                                paged KV (block_size=64)           │
+│                                page-boundary growth signal        │
+├───────────────────────────────────────────────────────────────────┤
+│  Worker                        CUDA graph pool                    │
+│                                35 pre-captured batch buckets      │
+│                                1 compute stream per worker        │
+├───────────────────────────────────────────────────────────────────┤
+│  Runner                        1 HBM arena, pre-allocated slab    │
+│                                packed metadata (1 HtoD / step)    │
+├───────────────────────────────────────────────────────────────────┤
+│  Layer                         11 launches per layer (decode)     │
+├───────────────────────────────────────────────────────────────────┤
+│  Kernels                       CUTLASS 3.x SM90 FP8 GEMM          │
+│                                FlashAttention-3 SM90 paged decode │
+│                                custom fused PTX (norm/silu/rope)  │
+│                                cuBLAS HGEMM for LM head           │
+└───────────────────────────────────────────────────────────────────┘
 ```
 
-### Kernel Compiler Stack
+## Kernels
 
-Three-tier kernel system, with rTriton as the unified kernel layer:
+Every kernel has a known purpose, a pinned variant, and a workspace contract. No dispatch fallback chains.
 
-**rTriton: Triton-style JIT compiler + cuBLAS integration (`crates/rtriton/`)**
+### CUTLASS SM90 FP8 GEMM (`kernels/cutlass_fp8_gemm.cu`, `cutlass_fp8_gemm_residual.cu`)
 
-A standalone Rust reimplementation of OpenAI's Triton GPU kernel compiler, combined with our battle-tested cuBLAS tricks. One crate, one CUDA graph, zero Python:
+40 non-residual variants + 10 residual-fused variants, all templated on `(TileShape, ClusterShape, KernelSchedule)`. Autotuned per shape at build time into `policy.json`.
 
-- **Triton-style builder DSL**: SSA IR with 30+ ops, 7 optimization passes (DCE, constant fold, fusion, coalescing, shared memory planning, software pipelining), PTX codegen targeting sm_80+
-- **8 pre-built LLM kernels**: RMSNorm, fused residual+RMSNorm, RoPE, SiLU*mul, tiled GEMM, GEMV, persistent GEMM (stream-K), flash attention decode (online softmax, paged KV, GQA)
-- **cuBLAS integration**: FP8 cublasLt plan cache, autotuned algorithm selection (32 candidates/shape), graph workspace pre-allocation, M-threshold routing (cublasLt for M<=32, cuBLAS for M>32)
-- **Mixed execution graph**: Triton JIT kernels and cuBLAS GEMMs captured in a single CUDA graph -- zero launch overhead for the full decode layer
-- **Decode layer plan**: 9 operations per layer (5 Triton + 4 cuBLAS), buffer allocation with liveness-based interval coloring for memory reuse
-- **50 tests passing**, compiles on Mac without CUDA (all GPU code behind `cfg(feature = "cuda")`)
+- Non-residual: QKV, gate_up, down_proj
+- Residual-fused: o_proj (fused GEMM + residual add in one launch; eliminates one HBM round-trip per layer)
+- Per-row activation scale, per-tensor weight scale
+- **Compatibility rule enforced**: mainloop schedule must match epilogue schedule. `KernelTmaWarpSpecialized` (WS) mainloop + `TmaWarpSpecializedCooperative` (Coop) epilogue is the canonical class of SM90 illegal-memory bug. v3 makes this a compile-time `static_assert`; v2 uses variant `v1` (128×128×128 Coop/Coop matched) for o_proj residual.
 
-See [crates/rtriton/README.md](crates/rtriton/README.md) for the full rTriton compiler documentation.
+### FlashAttention-3 SM90 paged decode (`kernels/fa3_sm90_wrapper.cu` → `libfa3_kernels.so`)
 
-A single decode step at c=128 concurrency:
-```
-[rTriton] fused_residual_rmsnorm     -- 1 kernel, eliminates 2 GMEM round-trips
-[cuBLAS]  QKV GEMM (M=128)          -- autotuned cublasLt, FP8 optional
-[rTriton] RoPE + KV cache write     -- fused, no intermediate alloc
-[rTriton] Flash Attention Decode     -- online softmax, paged KV
-[cuBLAS]  O-proj GEMM               -- autotuned
-[rTriton] fused_residual_rmsnorm
-[cuBLAS]  gate_up GEMM              -- autotuned
-[rTriton] SiLU * mul                -- fused activation
-[cuBLAS]  down GEMM                 -- autotuned
-```
+WGMMA + TMA, built from FlashAttention-3 Hopper source. Paged KV layout `[2, num_blocks, block_size, num_kv_heads, head_dim]`, GQA via `num_heads / num_kv_heads` ratio. `head_dim = 128` hard gate.
 
-**Tier 1: JIT-compiled fused kernels (current production)**
-- Rust PTX emitter generates shape-specialized fused kernels at model load
-- 2-7.5x faster than hand-written CUDA for M=1 decode
-- Patterns: RMSNorm+GEMV, Add+RMSNorm+GEMV, SiLU*Mul+GEMV
-- No nvcc dependency -- pure Rust string-based PTX generation
+- **No PTX fallback.** If `libfa3_kernels.so` is not present at startup, the engine refuses to load.
+- Build: `bash kernels/build_fa3.sh` on the H100 box (needs CUTLASS headers + flash-attention/hopper source), ~10 min.
 
-| Fused Kernel | JIT (us) | Hand-written (us) | Speedup |
-|---|---:|---:|---|
-| Add+RMSNorm+QKV GEMV [1,4608,3584] | 5.5 | 10.6 | **1.92x** |
-| Add+RMSNorm+GateUp GEMV [1,37888,3584] | 19.3 | 98.6 | **5.12x** |
-| SiLU*Mul+Down GEMV [1,3584,18944] | 9.5 | 70.7 | **7.48x** |
-| RMSNorm+QKV GEMV [1,4608,3584] | 5.3 | 10.8 | **2.03x** |
+### Fused pre/post kernels (PTX, `kernels/fused_*.cu`)
 
-Per-step savings at N=1 (28 layers): **4.2ms** = estimated **1.8x** single-sequence speedup.
-
-See [crates/rvllm-fusion/README.md](crates/rvllm-fusion/README.md) for the full JIT compiler documentation.
-
-**Tier 2: Hand-written CUDA kernels (54 kernels)**
-- Fused decode: add+norm+QKV+bias, RoPE+cache, GQA attention, O-proj+gateup, silu+down
-- FP8 E4M3 variants for all projections
-- TMA async-prefetch GEMV, WGMMA tensor core GEMV
-- Split-KV paged attention for long context
-- Megakernel: 28-layer single-launch decode with instruction tape interpreter
-
-**Tier 3: cuBLAS/cublasLt (batched decode M>1)**
-- Autotuned algorithm selection (32 candidates benchmarked per shape at startup)
-- Vendored cublaslt type shim for cudarc 0.19 compatibility
-- cublasLt for M<=32, cuBLAS for M>32
-
-**LLVM NVPTX backend (experimental)**
-- Full compiler: Fusion IR -> LLVM IR -> NVPTX -> PTX via inkwell
-- Same backend as Triton (LLVM NVPTX)
-- Gated behind `--features llvm` (requires LLVM 20.1)
-
-### Crate Map
-
-31 crates organized by layer:
-
-| Layer | Crate | Purpose |
-|---|---|---|
-| **Binary** | `rvllm-server` | CLI binary (`rvllm serve`, `rvllm benchmark`, `rvllm info`) |
-| **API** | `rvllm-api` | axum HTTP server, all OpenAI-compatible routes, SSE streaming, telemetry |
-| **Engine** | `rvllm-engine` | Sync `LLMEngine` + async `AsyncLLMEngine` + dedicated GPU thread `AsyncGpuLLMEngine` |
-| **Scheduling** | `rvllm-scheduler` | Continuous batching, chunked prefill, FCFS/priority/SJF policies, preemption |
-| | `rvllm-sequence` | Sequence, SequenceGroup, status FSM (Waiting/Running/Swapped/Finished) |
-| **Execution** | `rvllm-executor` | Executor trait, single-GPU and multi-GPU executors, tensor parallel config |
-| | `rvllm-worker` | GPU worker, CUDA graph capture/replay (35 pre-captured batch sizes) |
-| **Model** | `rvllm-model-loader` | SafeTensors + GGUF loading, GPU upload, tensor-parallel sharding |
-| | `rvllm-model-runner` | Forward pass, 13 architectures, 6 decode paths, megakernel |
-| **GPU** | `rvllm-gpu` | CUDA abstractions, cuBLAS/cublasLt, kernel loader (~60 kernel modules), allocator, NCCL |
-| | `rvllm-fusion` | JIT PTX compiler (2-7.5x faster than hand-written CUDA) |
-| | `rtriton` | Triton-style GPU kernel compiler + cuBLAS integration (research crate) |
-| **Attention** | `rvllm-attention` | Flash Attention, paged attention, sliding window, split-KV, GQA |
-| **Cache** | `rvllm-kv-cache` | Paged KV cache (f16 + FP8), reshape/cache operations |
-| | `rvllm-block-manager` | Ref-counted blocks, copy-on-write, prefix caching, swap management |
-| | `rvllm-memory` | GPU/CPU memory pools with free-list allocation |
-| **Sampling** | `rvllm-sampling` | Temperature, top-k/p, min-p, repetition/frequency/presence penalties, guided decoding (JSON schema, regex) |
-| **Tokenizer** | `rvllm-tokenizer` | HuggingFace tokenizer wrapper, ChatML/Harmony templates, tool call parsing, incremental streaming decode |
-| **Quantization** | `rvllm-quant` | GPTQ, AWQ, FP8, GGUF Q4/Q5/Q8 detection and config |
-| **Speculative** | `rvllm-speculative` | Self-draft speculative decoding (draft from first N layers of target) |
-| **Parallelism** | `rvllm-tp` | Tensor parallelism via NCCL (Megatron-LM column/row sharding) |
-| **Observability** | `rvllm-telemetry` | Prometheus metrics (15+ counters/gauges/histograms), structured logging, OTLP traces |
-| **Acceleration** | `rvllm-zig` | Zig SIMD backend (softmax, argmax, weight conversion -- NEON + AVX-512) |
-| **Multimodal** | `rvllm-core` | Shared types, errors, multimodal data types (PixelValues, ImageFeatures, RawImage) |
-| **Config** | `rvllm-config` | Engine/model/cache/scheduler/parallel/device/telemetry/vision config, TOML + CLI loading |
-| **Bench** | `rvllm-bench` | Criterion benchmarks for sampling hot paths |
-| **Bindings** | `rvllm-python` | PyO3 module (`import rvllm`) -- sampler, tokenizer, config |
-
-### What Differs from vLLM
-
-Against vLLM 0.19.0 (April 2026), rvLLM v2 reaches ~66-85% of vLLM FP8 throughput on the same hardware. The gap narrows at higher batch sizes.
-
-Where rvLLM is competitive or ahead:
-
-1. **Direct engine with zero Python overhead** -- Rust server, worker, scheduler, and kernels. No interpreter, no GIL, no garbage collector in the serving hot path.
-2. **FA3 SM90 paged-KV decode attention** -- WGMMA/TMA-accelerated, 7.5us/layer, competitive with vLLM's attention kernels.
-3. **Fused norm+quantize kernels** -- RMSNorm + FP8 quantize and SiLU*mul + FP8 quantize each run as a single kernel. 10 kernels/layer, comparable to vLLM's 9-11.
-4. **GPU-resident argmax** -- greedy token selection stays on-device, eliminating 74 MB DtoH transfer per decode step.
-5. **Rust scheduler with no GIL serialization** -- scheduling decisions run in parallel via Rayon.
-6. **Single pre-allocated memory slab** -- zero per-request allocation.
-7. **19,259 tok/s at N=128 FP8** (512 output tokens) -- verified, still improving.
-
-Where vLLM is currently faster:
-
-1. **Structural throughput** -- both engines use CUTLASS FP8 GEMMs, but vLLM's end-to-end pipeline has less overhead per step. Key differences: FP8 LM head GEMM (vs our F16 cuBLAS), per-step metadata HtoD, stream synchronization, and extra FP8 quantization passes.
-
-What vLLM still does better:
-
-1. **Broader model support** -- hundreds of architectures vs our 13
-2. **Production hardening** -- years of deployment at scale, battle-tested error handling
-3. **LoRA serving** -- dynamic adapter loading and merging
-4. **Speculative decoding maturity** -- multiple draft strategies, tree verification
-5. **Multi-GPU pipeline parallelism** -- rvLLM has tensor parallelism but not pipeline parallelism
-6. **Quantization breadth** -- GPTQ, AWQ, Marlin, FP8, MXFP8, NVFP4 vs our FP8, MXFP8, INT4/W4A16, GGUF
-
-What rvLLM does better:
-
-1. **Deployment footprint** -- ~50 MB container image vs ~15 GB; 35 sec build from source
-3. **JIT fused kernels** -- `rvllm-fusion` PTX emission beats hand-written CUDA by 2-7.5x on M=1 decode microbenchmarks
-4. **Kernel discipline** -- no-fallback validation and 7 decode paths (FusedDecode, cuBLAS GEMV, megakernel, persistent, FP8 cublasLt, CUTLASS FP8, batched hybrid)
-5. **Safe-max memory control** -- reserve-based startup sizing plus explicit GPU/CPU block overrides
-6. **Deterministic execution** -- no GIL, no GC, no torch.compile nondeterminism
-
-## Zig SIMD Acceleration
-
-Hot-path sampling primitives and weight conversion use a Zig SIMD backend (`rvllm-zig`). `@Vector(16, f32)` maps to NEON on aarch64, AVX-512 on x86_64 servers (`-mcpu=x86_64_v4`). Benchmarked on Apple M5 (128K vocab = LLaMA-3 scale):
-
-| Operation | Zig SIMD | Rust (scalar) | Speedup |
-|---|---:|---:|---|
-| softmax (128K) | 134 us | 192 us | **1.44x** |
-| argmax (128K) | 9.2 us | 58 us | **6.31x** |
-| argmax+logprob fused (128K) | 131 us | 213 us | **1.62x** |
-| scale (128K) | 6.9 us | 6.8 us | 1.0x (memory-bound) |
-| bf16->f16 (16M) | 637 us | -- | -- |
-| f32->f16 (16M) | 1.07 ms | -- | -- |
-
-The fused `argmax_logprob` kernel computes greedy token selection + log-probability in 2 SIMD passes (argmax+exp-sum) instead of 4 separate scalar passes. `apply_min_p` uses a logit-space threshold (`max + ln(min_p)`) to avoid softmax allocation entirely.
-
-End-to-end sampling improvement (criterion, 128K vocab, vs pure Rust):
-
-| Sampler | Change |
-|---|---|
-| greedy (128K) | **-17%** (141 us) |
-| greedy (32K) | **-10%** (35 us) |
-| repetition penalty | **-7%** (143 us) |
-| top-p | no change (1.20 ms, sort-dominated) |
-| top-k | no change (358 us, quickselect-dominated) |
-
-Weight conversion throughput (16M elements = one 4096x4096 weight matrix):
-
-| Conversion | Throughput |
-|---|---|
-| bf16 -> f16 | 48.9 GB/s |
-| f32 -> f16 | 58.3 GB/s |
-
-Zig is a hard build dependency -- no fallbacks.
-
-## CPU-Side Operations
-
-Operations between GPU forward passes, measured on Apple M5 and Xeon:
-
-| Operation | Rust | Python (numpy) | Speedup |
+| Kernel | Inputs | Output | Launches saved |
 |---|---|---|---|
-| Combined penalties (rep+freq+pres) | 2.6 us | 63 us | **24x** |
-| Repetition penalty (2K tokens) | 3.1 us | 34 us | **11x** |
-| Multinomial sampling (32K vocab) | 12 us | 66 us | **5.5x** |
-| Top-P nucleus (128K vocab) | 1.6 ms | 6.9 ms | **4.3x** |
-| Batch sampling (64 seqs, Rayon) | 4.3 ms | 36.4 ms | **8.5x** |
+| `embedding_gather` | token_ids, weight | f16 hidden | 1 |
+| `fused_add_rmsnorm_fp8_quant` | hidden, residual, gamma | residual', fp8_act, scale | 3 → 1 |
+| `fused_rmsnorm_fp8_quant` | hidden, gamma | fp8_act, scale | 2 → 1 |
+| `quantize_fp8_per_token` | f16 act | fp8 + scale | 1 |
+| `fused_rope_kv_write` | qkv, cos, sin, slot_mapping | q_out, writes K/V into cache | 3 → 1 |
+| `fused_silu_mul_fp8_quant` | gate_up f16 | fp8_act + scale | 3 → 1 |
+| `argmax` | f32 logits | i32 token | 1 |
+| `residual_add_f16` | x, y | x + y | 1 |
 
-## Guided Decoding
+Rule: each kernel fuses at most one recognizable composite. No megakernels. Every kernel has a pure-Rust f32 reference implementation in tests; PTX output must match within cosine 0.999.
 
-The sampling layer includes a constrained decoding engine (`rvllm-sampling/src/guided.rs`) that enforces output format at the token level:
+## One decode step, in order
 
-- **JSON mode**: Forces syntactically valid JSON output
-- **JSON Schema**: Compiles JSON schemas (max depth 64) into a `SchemaNode` tree, then computes valid next characters at each generation step
-- **Regex**: Pattern-constrained generation
-- **VocabTable**: Maps token IDs to their text representations for constraint checking
-
-Request-level control via the `response_format` field in SamplingParams.
-
-## Profile-Guided Autotuning
-
-rvLLM includes a two-stage tuning system: **nsys profiling** identifies which kernels to optimize, then **cublasLt autotuning** finds the fastest algorithm for each GEMM shape.
-
-### Stage 1: Profile with nsys
-
-```bash
-NSYS=/opt/nvidia/nsight-compute/2025.1.0/host/target-linux-x64/nsys
-
-$NSYS profile --stats=true -o profile_output \
-  ./target/release/rvllm benchmark \
-  --model /root/models/Qwen2.5-7B --dtype half --fp8 --n 32 --output-len 32
-```
-
-This prints a kernel ranking table showing exactly where GPU time goes:
+For decode batch of N sequences:
 
 ```
- Time(%)  Total(ms)  Calls   Avg(us)   Name
-    5.3     27.9      980    28.5      fa3_v3_decode_gqa_kernel
-    4.4     23.2     4089     5.7      fused_residual_rmsnorm_f16_kernel
-    2.8     14.8     2044     7.2      silu_mul_interleaved_f16_kernel
-    2.6     14.0     6132     2.3      add_bias_f16_kernel        <-- 6132 launches!
-    ...
+step_launch(diff):
+  1. schedule(diff)                          — CPU, O(N), no allocs
+  2. metadata pack + 1× HtoD                 — positions, context_lens,
+                                               block_tables, slot_mapping
+                                               into one packed i32 buffer
+  3. graph_pool.replay(bucket = pad_up(N))   — one cuGraphLaunch
+       ├─ embedding_gather                    — 1 kernel
+       ├─ for layer in 0..28:                 — 11 kernels × 28 layers
+       │    fused_add_rmsnorm_fp8_quant
+       │    CUTLASS FP8 GEMM (QKV)
+       │    fused_rope_kv_write
+       │    FA3 paged_decode
+       │    quantize_fp8_per_token (post-attn)
+       │    CUTLASS FP8 GEMM + residual (o_proj, v1)
+       │    fused_rmsnorm_fp8_quant
+       │    CUTLASS FP8 GEMM (gate_up)
+       │    fused_silu_mul_fp8_quant
+       │    CUTLASS FP8 GEMM (down_proj)
+       │    residual_add_f16
+       ├─ fused_residual_rmsnorm (final)      — 1 kernel
+       ├─ cuBLAS HGEMM f32→lm_head            — 1 kernel
+       └─ argmax                              — 1 kernel
+  4. cuMemcpyDtoHAsync argmax → pinned[w_idx] — 512 B at N=128
+     cuEventRecord event[w_idx]
+  5. return; w_idx ^= 1                       — double buffer flip
+
+step_collect():
+  1. cuEventSynchronize event[r_idx]          — waits for step-1 DtoH
+  2. read pinned[r_idx][0..N]                 — CPU reads new tokens
+  3. scheduler.commit()                        — mark tokens, free finished
 ```
 
-The kernel with the most total time and the most launches is your optimization target. In the example above, `add_bias_f16_kernel` has 6,132 separate launches that should be fused into the GEMM epilogue.
+Total GPU kernels per decode step: embed (1) + layer ops (28 × 11 = 308) + final norm (1) + LM head (1) + argmax (1) = **311 launches**, all captured into **1 `cuGraphLaunch`**.
 
-See [docs/profiling.md](docs/profiling.md) for the full profiling guide.
+Total DtoH per step: **one** 4·N byte copy for the argmax'd token IDs. Nothing else.
+Total HtoD per step: **one** packed metadata buffer (<100 KB at N=128, max_blocks=129).
 
-### Stage 2: cublasLt Algorithm Autotuning
+## Correctness discipline
 
-When built with `--features cuda,cublaslt`, rvLLM benchmarks 32 cublasLt algorithm candidates for each GEMM shape at startup. Results are cached to `~/.cache/rvllm/autotune.json` so subsequent runs skip the benchmarking phase.
+Explicit rules. Violations fail the build or startup, never degrade silently.
 
-```bash
-# First run: autotuning takes 1-2 minutes (benchmarks ~24 shapes x 32 algorithms)
-cargo build --release --features cuda,cublaslt
-./target/release/rvllm serve --model Qwen/Qwen2.5-7B --dtype half
+1. **No fallbacks.** Missing autotune entry = engine panic with shape. Missing FA3 `.so` = refuse start. Missing CUTLASS .so = refuse start. Stale autotune cache from a prior deploy is not consulted — policy lives in the build artifact.
+2. **Graph-capture invariant.** Metadata buffer layout is frozen per `(bucket, max_blocks_per_seq)`. Captured graphs bind those exact offsets. There is no "non-padded" upload path. Prefill and decode have separate APIs; they do not share metadata offsets.
+3. **Real block-change detection.** Scheduler emits `ContinuedRequest::block_table_update: Option<Vec<BlockId>>` whenever a sequence's physical block list has grown since the last send. Worker combines this with CoW-copy events. Missing either signal leaves stale block_ids in the captured graph (wrong KV reads, not a crash — silent correctness bug).
+4. **CUTLASS schedule/epilogue pairing.** Mainloop and epilogue schedules must match. Mismatched variants cause `CUDA_ERROR_ILLEGAL_ADDRESS` only inside graph replay. Enforced in v3 as a CUDA `static_assert`; in v2, dispatch pins to a hand-verified variant (`v1`).
+5. **No `unwrap()` in libraries.** `Result<T, RvllmError>` end-to-end. Errors carry structured context (stream, kernel name, launch config) — not stringified `DriverError`.
 
-# Second run: instant (reads from cache)
-./target/release/rvllm serve --model Qwen/Qwen2.5-7B --dtype half
-```
+## Measured recovery
 
-The cache is keyed by `(gpu_name, m, n, k, dtype)` so different GPUs and models get separate tuning results. Override the cache path with `RVLLM_AUTOTUNE_CACHE=/path/to/cache.json`.
+One-day root-cause pass on April 16, 2026 took v2 from 9,531 → 19,287 tok/s at N=128 (+102%). Three commits, all structural, none were stopgaps:
 
-The cublasLt path also enables **bias epilogue fusion**: bias-add is folded into the GEMM output instead of launching a separate kernel. This eliminates thousands of kernel launches per benchmark (6,132 `add_bias_f16_kernel` calls become zero).
-
-### Stage 3: CUPTI-Based Full-Pipeline Tuning (rvllm-autotune)
-
-The `rvllm-autotune` crate (`crates/rvllm-autotune/`) goes beyond GEMM algorithm selection to profile and tune every kernel in the inference pipeline:
-
-1. **Profile** (`CuptiProfiler`): captures per-kernel GPU timing via CUPTI activity API with nanosecond precision
-2. **Rank** (`KernelRanker`): sorts kernels by total GPU time, classifies as Gemm/Attention/Norm/Activation/Memory, marks which are tunable (ours) vs library internals (cuBLAS)
-3. **Sweep** (`ConfigSweeper`): generates alternative launch configs (block sizes, shared memory, tile parameters) and benchmarks each
-4. **Cache** (`TuneCache`): persists winning configs to `~/.cache/rvllm/tune.json`
-
-The workflow:
-```
-nsys profile  -->  identify top kernels  -->  autotune those kernels  -->  cache results
-     |                    |                          |                         |
-  CUPTI API        KernelRanker              ConfigSweeper               TuneCache
-```
-
-## Telemetry
-
-Prometheus-compatible metrics exposed at `/metrics`, plus structured logging via `tracing`:
-
-**Histograms**: request latency, time-to-first-token (TTFT), inter-token latency (ITL), forward pass time, sample time, API request duration
-
-**Gauges**: tokens/sec, running requests, waiting requests, GPU cache usage %, in-flight API requests, worker tokens/sec
-
-**Counters**: preemptions, total requests, finished requests, prompt tokens, generation tokens, forward passes, tokens sampled, engine steps, API requests, API errors
-
-Configurable via `--prometheus-port`, `--otlp-endpoint`, and `--log-level`.
-
-## Configuration
-
-### CLI Arguments
-
-```bash
-rvllm serve --model <path_or_repo> [options]
-```
-
-| Flag | Default | Description |
+| commit | fix | N=128 gain |
 |---|---|---|
-| `--model` | required | HuggingFace repo ID or local path |
-| `--dtype` | `auto` | `auto`, `float32`, `float16`, `bfloat16` |
-| `--max-model-len` | 2048 | Maximum context length |
-| `--gpu-memory-utilization` | 0.90 | Fraction of GPU memory for KV cache |
-| `--gpu-memory-reserve-gb` | 0.0 | VRAM to leave free for scratch (GiB) |
-| `--num-gpu-blocks` | auto | Fixed GPU block count override |
-| `--num-cpu-blocks` | auto | Fixed CPU block count override |
-| `--tensor-parallel-size` | 1 | Number of GPUs for TP |
-| `--max-num-seqs` | 256 | Max concurrent sequences |
-| `--max-num-batched-tokens` | 8192 | Max tokens per batch |
-| `--max-prefill-chunk` | 128 | Max prompt tokens per prefill step |
-| `--host` | 0.0.0.0 | Bind address |
-| `--port` | 8000 | Bind port |
-| `--log-level` | info | Minimum log level |
-| `--disable-telemetry` | false | Turn off metrics collection |
+| `6dabb76a5` | `last_padded_batch` tracking: prefill's non-padded metadata no longer overwrites decode's padded layout → captured graph reads correct offsets | crash → works |
+| `31716269d` | Re-enable fused FP8 o_proj + residual with variant `v1` (Coop/Coop matched); revert the earlier "disable all variants" stopgap | +83% |
+| `eb9e247fd` | Restore `patch_metadata_decode` fast path with **real** block-change detection via `ContinuedRequest::block_table_update` (catches page-boundary growth, not just CoW) | +10% |
 
-### Environment Variables
+Plus `libfa3_kernels.so` built on the box (23 MB, once) — eliminates the silent .ptx fallback.
 
-| Variable | Description |
-|---|---|
-| `RVLLM_FP8_WEIGHTS=1` | Quantize all projection weights to FP8 E4M3 at startup |
-| `RVLLM_FP8_KV=1` | Store KV cache in FP8 (doubles concurrent sequences) |
-| `RVLLM_CUBLAS_DECODE=1` | Use cuBLAS GEMV decode instead of fused kernels |
-| `RVLLM_INT4_DECODE=1` | W4A16 GEMV decode path (planned) |
-| `RVLLM_SPECULATIVE=1` | Enable self-draft speculative decoding |
-| `RVLLM_SPECULATIVE_K=3` | Draft tokens per speculative step |
-| `RVLLM_SPECULATIVE_DRAFT_LAYERS=N` | Layers for self-draft (default: total/4) |
-| `RVLLM_AUTOTUNE=1` | Enable cublasLt algorithm autotuning at startup |
-| `RVLLM_L2_PERSIST=1` | Enable L2 cache persistence hints |
-| `RVLLM_PTX_DIR` | Override directory for compiled PTX kernels |
-| `HF_TOKEN` | HuggingFace auth token for gated models |
-| `VLLM_HOST` / `VLLM_PORT` | Override server bind address/port |
-| `VLLM_BATCH_OUTPUT_DIR` | Directory for batch API output files |
-
-### Feature Flags (Cargo)
-
-| Feature | Description |
-|---|---|
-| `cuda` | Real CUDA GPU support (required for inference) |
-| `cublaslt` | cuBLASLt autotuned GEMM plans |
-| `zig` | Zig SIMD backend for sampling hot paths |
-| `llvm` | LLVM NVPTX backend for fusion compiler (requires LLVM 20.1) |
-| `mock-gpu` | CPU-only mock GPU for testing |
-
-## Deployment Tooling
-
-### vast.ai Integration
-
-Full lifecycle automation for H100/B200 instances:
-
-| Script | Purpose |
-|---|---|
-| `race.sh` | One-command lifecycle race vs stock vLLM |
-| `deploy/vastai-provision.sh` | Provision a vast.ai instance |
-| `deploy/vastai-deploy.sh` | Build + deploy rvLLM to instance |
-| `deploy/vastai-benchmark.sh` | Run benchmark suite |
-| `deploy/vastai-teardown.sh` | Destroy instance |
-| `deploy/setup_instance.sh` | Instance environment setup |
-| `deploy/deploy_and_bench.sh` | Combined deploy + benchmark |
-| `deploy/rsync_and_run.sh` | Incremental sync + run |
-| `install.sh` | Local install script |
-
-### Benchmark Harnesses
-
-| Script | Purpose |
-|---|---|
-| `bench/run.sh` | Full benchmark sweep |
-| `bench/quick_bench.sh` | Fast smoke test |
-| `bench/compare_vllm.sh` | Side-by-side vLLM comparison |
-| `bench/loadtest.sh` | HTTP load testing |
-| `bench/bench_cutlass.sh` | CUTLASS kernel benchmarks |
-| `bench/bench_jit.sh` | JIT compiler benchmarks |
-| `bench/bench_long_context.sh` | Long context attention benchmarks |
-| `bench/verify_fusion.sh` | Verify fused kernel correctness |
-| `deploy/benchmark_client.py` | Python HTTP benchmark client |
-| `deploy/compare_results.py` | Result comparison tool |
-| `deploy/vllm_direct_bench.py` | Direct vLLM engine benchmark |
-| `bench/loadtest.py` | Python load test driver |
-
-### CI/CD
-
-GitHub Actions workflow (`.github/workflows/ci.yml`): `cargo check --workspace` + `cargo test --workspace` on every push.
-
-GitHub Pages deployment (`.github/workflows/pages.yml`) for documentation.
-
-## Install
+## Reproduce
 
 ```bash
-# From crates.io
-cargo install rvllm --features cuda,cublaslt
-
-# From PyPI
-uv pip install rvllm
+# One-shot: rent an H100 on vast.ai, build from source, run bench, land JSON locally.
+VASTAI_API_KEY=<your_key> ./race.sh
 ```
 
-Or build from source:
+Manual:
 
 ```bash
-git clone https://github.com/m0at/rvllm
-cd rvllm
-cargo build --release --features cuda
+# Build kernels on an H100 box (first time only, ~15 min)
+bash kernels/build.sh              # custom PTX
+bash kernels/build_cutlass_so.sh   # CUTLASS .so
+bash kernels/build_fa3.sh          # FA3 .so
+
+# Populate autotune policy
+./target/release/autotune-cutlass  # writes /root/.cache/rvllm/cutlass_autotune.json
+
+# Run bench
+cargo build --release --features cuda-graphs --bin rvllm-v2-bench
+./target/release/rvllm-v2-bench \
+  --model Qwen/Qwen2.5-7B \
+  --fp8 \
+  --n "1,4,8,16,32,64,128" \
+  --output-len 512 \
+  --iters 3
 ```
 
-## Quick Start
+## Supported models
 
-```bash
-# Serve Qwen2.5-7B with safe-max VRAM sizing
-rvllm serve --model Qwen/Qwen2.5-7B --dtype half --gpu-memory-utilization 1.0 --gpu-memory-reserve-gb 2.0
+Tested end-to-end with CUTLASS FP8 + FA3 paged decode:
 
-# Benchmark (direct engine, no HTTP)
-# IMPORTANT: --fp8 enables CUTLASS FP8 GEMMs. Without it, all projections run f16 cuBLAS.
-rvllm benchmark --model Qwen/Qwen2.5-7B --dtype half --fp8 --n "1,4,8,16,32" --output-len 256
+- **Qwen2** / Qwen2.5 (verified bench model)
+- **Llama 2 / 3 / 3.1**
+- **Mistral 7B**
+- **Gemma 1 / 2**
+
+GQA via `num_heads / num_kv_heads`. `head_dim == 128` required for FA3. Other architectures compile but have not been end-to-end validated against HF reference on this version.
+
+Weight formats: SafeTensors (sharded + single-file). GGUF is supported in the older `rvllm-model-runner` crate but not the v2 FP8 path.
+
+## Crate map (hot path)
+
+```
+rvllm-api         HTTP/OpenAI routes
+  └── rvllm-engine / rvllm-v2::engine   step_pipelined()
+       └── rvllm-worker / rvllm-v2::worker
+            ├── rvllm-scheduler    request state, paged KV, preemption
+            ├── rvllm-v2::runner   HBM arena, packed metadata, layer dispatch
+            │    └── rvllm-v2::layer
+            │         ├── rvllm-gpu::cutlass_ffi   FP8 GEMM variants + residual
+            │         ├── rvllm-gpu::fa3_ffi        libfa3_kernels.so bindings
+            │         └── kernel_loader             PTX/.so loader
+            └── rvllm-gpu::cuda_graph  GraphPool, bucket capture
 ```
 
-### Optional Features
+Full crate table for multimodal, embeddings, speculative decode, gRPC, telemetry, Python bindings: see [`docs/arch.md`](docs/arch.md).
 
-**FP8 Weights** (`--fp8` flag or `RVLLM_FP8_WEIGHTS=1`): Quantizes all projection weights (QKV, O-proj, gate-up, down-proj) to FP8 E4M3 at startup and routes all GEMMs through CUTLASS FP8 kernels with per-tensor scaling. This is the primary performance path on H100/B200 -- without it, all projections run f16 cuBLAS and you leave significant throughput on the table. Always pass `--fp8` when benchmarking on SM90+.
+## License
 
-**FP8 KV Cache** (`RVLLM_FP8_KV=1`): Stores KV cache in FP8, doubling the number of concurrent sequences at the cost of minor precision loss.
+Apache-2.0.
 
-**Speculative Decoding** (`RVLLM_SPECULATIVE=1`): Self-draft speculative decoding using the first N layers of the target model as a draft. Primarily beneficial for large models (70B+) where single-token decode latency is high enough that the draft+verify overhead is worthwhile.
+## Further reading
 
-```bash
-RVLLM_SPECULATIVE=1 RVLLM_SPECULATIVE_K=3 rvllm serve --model meta-llama/Llama-3-70B --dtype half
-```
-
-## Deployment
-
-| Metric | rvLLM | Python vLLM |
-|---|---|---|
-| Install | `cargo install rvllm --features cuda,cublaslt` | `pip install vllm` (+ PyTorch) |
-| Container image | ~50 MB | ~15 GB |
-| Build from source | 35 sec | N/A |
-| Kernel compilation | 30 sec (54 PTX via nvcc) + 0 sec (JIT at runtime) | 0 or ~60s (torch.compile) |
-| GPU architectures | sm_80, sm_86, sm_89, sm_90 | Same + ROCm |
-
-## Benchmark Methodology
-
-Both engines serve the same OpenAI-compatible `/v1/completions` endpoint. Direct engine benchmarks use the built-in `rvllm benchmark` command (no HTTP overhead). The latest published HTTP comparison used `deploy/benchmark_client.py`; the repo also includes `bench/loadtest.py` and `bench/compare_vllm.sh` for broader load and side-by-side runs.
-
-Each engine runs on its own vast.ai H100 SXM 80GB instance -- separate GPUs, clean CUDA state, no cross-contamination.
-
-See [docs/arch.md](docs/arch.md) for the full forward pass trace, [docs/benchmark-history.md](docs/benchmark-history.md) for optimization history, and [docs/cutlass-epilogue-spec.md](docs/cutlass-epilogue-spec.md) for the CUTLASS fusion roadmap.
-
-To run the full lifecycle race yourself, see [Reproduce the Benchmark](#reproduce-the-benchmark) at the top.
+- [`v3/SPEC.md`](v3/SPEC.md), [`v3/IMPL_PLAN.md`](v3/IMPL_PLAN.md) — the clean-slate rewrite plan, 16 focused agent specs, with CUTLASS schedule-mismatch made a compile error, one metadata upload path, `GraphSafe` marker trait enforcing no-realloc-during-capture at the type level.
+- [`docs/paper/rvllm.pdf`](docs/paper/rvllm.pdf) — technical paper.
+- [`docs/arch.md`](docs/arch.md) — full crate architecture.

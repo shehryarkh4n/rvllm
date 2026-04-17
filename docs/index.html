@@ -128,348 +128,319 @@ footer a:hover{color:#999}
 
 <header>
   <h1>rvLLM</h1>
-  <p class="sub">High-performance LLM inference in Rust. 31-crate workspace. 54 CUDA kernels. 13 model architectures. FA3 SM90 WGMMA/TMA attention. FP8 E4M3 quantization. JIT PTX compiler. CUTLASS FP8 autotune.</p>
+  <p class="sub">Single-GPU, FP8, graph-captured LLM inference in Rust. No Python in the hot path. No fallbacks. Missing artifacts refuse to start.</p>
   <p class="links">
     <a href="https://github.com/m0at/rvllm">GitHub</a>
     <a href="paper/rvllm.pdf">Paper (color)</a>
-    <a href="paper/rvllm-bw.pdf">Paper (B&W)</a>
+    <a href="paper/rvllm-bw.pdf">Paper (B&amp;W)</a>
     <a href="paper/rvllm-dark.pdf">Paper (dark)</a>
   </p>
 </header>
 
 <div class="hero">
-  <div class="big">19,973 tok/s</div>
-  <div class="sub">Qwen2.5-7B FP8 on H100, N=128, 512 output tokens. 0.89x vLLM 0.19.0 FP8. From-scratch Rust + CUDA, closing the gap. FA3 SM90 attention + CUTLASS FP8 GEMMs + fused kernels, 8 kernels per layer.</div>
+  <div class="big">19,287 tok/s</div>
+  <div class="sub">Qwen2.5-7B FP8 on a single H100 SXM. N=128, 512 output tokens, greedy, CUDA graphs on, FA3 .so loaded. April 16, 2026, SHA <code>eb9e247fd</code>. rvllm-v2-bench direct engine, 3 iters, stdev 38.5.</div>
   <div class="hero-graphic">
-    <div class="hero-graphic-title">Honest H100 FP8 vs FP8 Comparison</div>
-    <div class="hero-graphic-sub">April 15, 2026 -- both engines: FP8, CUDA graphs, torch.compile (vLLM)</div>
-    <div class="hero-chart-root" aria-label="rvLLM H100 comparison chart">
-      <div class="hero-chart-legend">
-        <span><i style="background:#78CFFF"></i>vLLM 0.19.0 FP8</span>
-        <span><i style="background:#84E6B7"></i>rvLLM v2 FP8</span>
-      </div>
-
+    <div class="hero-graphic-title">Throughput by Batch Size</div>
+    <div class="hero-graphic-sub">Same GPU, same model, same FP8 path. Greedy decode, 512 output tokens, CUDA graphs on.</div>
+    <div class="hero-chart-root" aria-label="rvLLM throughput by batch size">
       <div class="hero-chart-grid">
         <div class="hero-chart-card">
           <div class="hero-chart-head">
             <div>
-              <h3>FP8 vs FP8 -- 512 output tokens</h3>
-              <p>Same GPU, same Qwen2.5-7B, FP8 E4M3, greedy decode, 3 iterations. April 15, 2026.</p>
+              <h3>rvLLM v2 FP8 E4M3 &mdash; Qwen2.5-7B &mdash; H100 SXM 80GB</h3>
+              <p>Per-N throughput. Bars scaled relative to N=128.</p>
             </div>
           </div>
           <div class="hero-static-block">
             <div class="hero-static-row">
               <div class="hero-static-label">N=1</div>
               <div class="hero-static-bars">
-                <div class="hero-static-track"><div class="hero-static-fill" style="width:1.1%;background:#78CFFF"></div></div>
-                <div class="hero-static-track"><div class="hero-static-fill" style="width:0.85%;background:#84E6B7"></div></div>
-                <div class="hero-static-meta">
-                  <span class="hero-static-series"><i style="background:#78CFFF"></i>246</span>
-                  <span class="hero-static-series"><i style="background:#84E6B7"></i>191 (0.78x)</span>
-                </div>
+                <div class="hero-static-track"><div class="hero-static-fill" style="width:1.0%;background:#84E6B7"></div></div>
+                <div class="hero-static-meta"><span class="hero-static-series"><i style="background:#84E6B7"></i>195.2</span></div>
+              </div>
+            </div>
+            <div class="hero-static-row">
+              <div class="hero-static-label">N=4</div>
+              <div class="hero-static-bars">
+                <div class="hero-static-track"><div class="hero-static-fill" style="width:4.0%;background:#84E6B7"></div></div>
+                <div class="hero-static-meta"><span class="hero-static-series"><i style="background:#84E6B7"></i>770.2</span></div>
+              </div>
+            </div>
+            <div class="hero-static-row">
+              <div class="hero-static-label">N=8</div>
+              <div class="hero-static-bars">
+                <div class="hero-static-track"><div class="hero-static-fill" style="width:7.9%;background:#84E6B7"></div></div>
+                <div class="hero-static-meta"><span class="hero-static-series"><i style="background:#84E6B7"></i>1,529.6</span></div>
+              </div>
+            </div>
+            <div class="hero-static-row">
+              <div class="hero-static-label">N=16</div>
+              <div class="hero-static-bars">
+                <div class="hero-static-track"><div class="hero-static-fill" style="width:15.6%;background:#84E6B7"></div></div>
+                <div class="hero-static-meta"><span class="hero-static-series"><i style="background:#84E6B7"></i>3,011.8</span></div>
               </div>
             </div>
             <div class="hero-static-row">
               <div class="hero-static-label">N=32</div>
               <div class="hero-static-bars">
-                <div class="hero-static-track"><div class="hero-static-fill" style="width:31.2%;background:#78CFFF"></div></div>
-                <div class="hero-static-track"><div class="hero-static-fill" style="width:26.0%;background:#84E6B7"></div></div>
-                <div class="hero-static-meta">
-                  <span class="hero-static-series"><i style="background:#78CFFF"></i>7,022</span>
-                  <span class="hero-static-series"><i style="background:#84E6B7"></i>5,848 (0.83x)</span>
-                </div>
+                <div class="hero-static-track"><div class="hero-static-fill" style="width:30.8%;background:#84E6B7"></div></div>
+                <div class="hero-static-meta"><span class="hero-static-series"><i style="background:#84E6B7"></i>5,935.0</span></div>
               </div>
             </div>
             <div class="hero-static-row">
               <div class="hero-static-label">N=64</div>
               <div class="hero-static-bars">
-                <div class="hero-static-track"><div class="hero-static-fill" style="width:59.6%;background:#78CFFF"></div></div>
-                <div class="hero-static-track"><div class="hero-static-fill" style="width:49.8%;background:#84E6B7"></div></div>
-                <div class="hero-static-meta">
-                  <span class="hero-static-series"><i style="background:#78CFFF"></i>13,396</span>
-                  <span class="hero-static-series"><i style="background:#84E6B7"></i>11,204 (0.84x)</span>
-                </div>
-              </div>
-            </div>
-            <div class="hero-static-row">
-              <div class="hero-static-label">N=96</div>
-              <div class="hero-static-bars">
-                <div class="hero-static-track"><div class="hero-static-fill" style="width:77.1%;background:#78CFFF"></div></div>
-                <div class="hero-static-track"><div class="hero-static-fill" style="width:70.6%;background:#84E6B7"></div></div>
-                <div class="hero-static-meta">
-                  <span class="hero-static-series"><i style="background:#78CFFF"></i>17,345</span>
-                  <span class="hero-static-series"><i style="background:#84E6B7"></i>15,868 (0.92x)</span>
-                </div>
+                <div class="hero-static-track"><div class="hero-static-fill" style="width:57.4%;background:#84E6B7"></div></div>
+                <div class="hero-static-meta"><span class="hero-static-series"><i style="background:#84E6B7"></i>11,064.3</span></div>
               </div>
             </div>
             <div class="hero-static-row">
               <div class="hero-static-label">N=128</div>
               <div class="hero-static-bars">
-                <div class="hero-static-track"><div class="hero-static-fill" style="width:100%;background:#78CFFF"></div></div>
-                <div class="hero-static-track"><div class="hero-static-fill" style="width:88.8%;background:#84E6B7"></div></div>
-                <div class="hero-static-meta">
-                  <span class="hero-static-series"><i style="background:#78CFFF"></i>22,486</span>
-                  <span class="hero-static-series"><i style="background:#84E6B7"></i>19,973 (0.89x)</span>
-                </div>
+                <div class="hero-static-track"><div class="hero-static-fill" style="width:100%;background:#84E6B7"></div></div>
+                <div class="hero-static-meta"><span class="hero-static-series"><i style="background:#84E6B7"></i>19,287.5</span></div>
               </div>
             </div>
           </div>
         </div>
-
       </div>
-
       <div class="hero-chart-notes">
         <div class="hero-chart-pill">
-          <strong>0.89x vLLM at N=128</strong>
-          Gap narrows at higher batch sizes. CUTLASS autotuned FP8 GEMMs + fused kernels, 8 kernels per layer.
+          <strong>FA3 SM90 .so</strong>
+          FlashAttention-3 built from Hopper source. WGMMA + TMA. head_dim=128. Engine refuses to start without it.
         </div>
         <div class="hero-chart-pill">
-          <strong>FA3 SM90 attention</strong>
-          FlashAttention-3 WGMMA/TMA paged-KV decode at 7.5us/layer. Attention is competitive -- GEMMs are the gap.
+          <strong>CUTLASS FP8 autotune</strong>
+          40 non-residual + 10 residual-fused variants. Mainloop schedule must match epilogue schedule &mdash; mismatches are a build error.
         </div>
         <div class="hero-chart-pill">
-          <strong>Work in progress</strong>
-          From-scratch Rust + CUDA engine at 78-92% of production vLLM. Closing the FP8 GEMM gap is the next target.
+          <strong>311 launches &rarr; 1 replay</strong>
+          Embedding + 28 layers x 11 ops + final norm + LM head + argmax captured into one <code>cuGraphLaunch</code>.
         </div>
       </div>
     </div>
   </div>
-
 </div>
 
 <section>
-<h2>Abstract</h2>
-<p class="section-sub">Andy Norris (m0at) -- San Francisco, April 15, 2026</p>
-<p>
-  rvLLM is a from-scratch Rust implementation of the vLLM inference engine for
-  OpenAI-compatible API serving with CUDA GPU acceleration. 310+ commits, 31 crates,
-  ~76K lines of Rust, 253 source files. The current tree has 54 CUDA kernels, a
-  Rust-native PTX compiler that generates fused kernels 2-7.5x faster than the
-  hand-written CUDA versions in the measured decode microbenchmarks, FA3 SM90 WGMMA/TMA
-  paged-KV decode attention, no-fallback kernel validation, and 13 model architectures
-  including Llama, Qwen2, Mistral, DeepSeek-V2, Mixtral, NemotronH MoE, and Gemma.
-</p>
-<p>
-  In an honest apples-to-apples FP8 comparison (both engines: FP8 E4M3, CUDA graphs,
-  torch.compile on vLLM side), rvLLM v2 reaches <strong>78-92% of vLLM 0.19.0</strong>
-  throughput on Qwen2.5-7B on H100 SXM 80GB. At N=128 with 512 output tokens:
-  <strong>19,973 tok/s</strong> vs vLLM's 22,486 tok/s (0.89x). The gap narrows at higher
-  batch sizes (0.92x at N=96). The primary bottleneck is FP8 GEMM kernel speed -- vLLM's
-  nvjet kernels outperform our autotuned CUTLASS variants. FA3 SM90 attention is already
-  competitive. Work is ongoing.
-</p>
-<p>
-  The FP8 inference stack uses CUTLASS 3x SM90 FP8 GEMMs (Hopper WGMMA + TMA), FA3 SM90
-  paged-KV decode attention (7.5us/layer), fused RMSNorm + per-token FP8 quantize kernels,
-  and fused SiLU*mul + per-token FP8 quantize kernels. Each fused kernel replaces 3 separate
-  kernels, bringing the total to 8 kernels per transformer layer (down from 15 with the
-  cuBLASLt path).
-</p>
-<p>
-  The API layer implements 14 OpenAI-compatible endpoints including completions, chat
-  completions with tool/function calling, the Responses API (stored multi-turn conversations,
-  background execution, streaming argument deltas), embeddings, batch inference, and a
-  Prometheus metrics endpoint. Weight loading supports SafeTensors (single and sharded) and
-  GGUF (Q4_0, Q4_K_M, Q5_0, Q5_K_M, Q8_0). Guided decoding enforces JSON, JSON Schema,
-  and regex constraints at the token level. Sampling uses a Zig SIMD backend for hot paths
-  (softmax, argmax, weight conversion) with 1.4-6.3x speedups over scalar Rust.
-</p>
+<h2>The stack, every layer</h2>
+<p class="section-sub">What is running when a token is generated</p>
+<pre>HTTP / OpenAI API        rvllm-api (axum)
+Engine                   rvllm-v2::engine       step_pipelined() = launch + collect
+                                                 double-buffered pinned argmax DtoH
+Scheduler                continuous batching    paged KV (block_size=64)
+                                                 page-boundary growth signal
+Worker                   CUDA graph pool        35 pre-captured batch buckets
+                                                 1 compute stream per worker
+Runner                   rvllm-v2::runner       1 HBM arena, pre-allocated slab
+                                                 packed metadata, 1 HtoD per step
+Layer                    rvllm-v2::layer        11 kernel launches / layer / decode
+Kernels                  CUTLASS 3.x SM90 FP8 GEMM
+                         FlashAttention-3 SM90 paged decode (.so)
+                         custom fused PTX (norm / silu / rope / argmax)
+                         cuBLAS HGEMM (LM head)</pre>
 </section>
 
 <section>
-<h2>JIT Kernel Compiler</h2>
-<p class="section-sub">Rust-native PTX generation -- no nvcc, no Triton, no Python</p>
-<div class="note">
-  The rvLLM fusion compiler (<code>crates/rvllm-fusion/src/ptx_emit.rs</code>) emits PTX assembly
-  directly from Rust at model load time. Kernels are shape-specialized with vectorized loads,
-  warp shuffle reductions, and shared memory tiling tuned for the exact model dimensions.
-  No external compiler dependency.
-</div>
+<h2>Kernels</h2>
+<p class="section-sub">Every kernel has a pinned variant and a workspace contract. No dispatch fallback chains.</p>
+
+<h3>CUTLASS SM90 FP8 GEMM</h3>
+<p><code>kernels/cutlass_fp8_gemm.cu</code>, <code>kernels/cutlass_fp8_gemm_residual.cu</code></p>
+<p>
+  40 non-residual variants + 10 residual-fused variants, all templated on
+  <code>(TileShape, ClusterShape, KernelSchedule)</code>. Autotuned per shape, result pinned into
+  <code>policy.json</code> (shipped as a build artifact, not a runtime cache).
+</p>
+<ul>
+  <li><strong>Non-residual</strong>: QKV, gate_up, down_proj.</li>
+  <li><strong>Residual-fused</strong>: o_proj. One launch writes <code>GEMM(act_fp8, W_fp8) + residual</code>; eliminates one HBM round-trip per layer.</li>
+  <li><strong>Schedule rule</strong>: mainloop schedule must match epilogue schedule. <code>KernelTmaWarpSpecialized</code> (WS) mainloop paired with <code>TmaWarpSpecializedCooperative</code> (Coop) epilogue causes <code>CUDA_ERROR_ILLEGAL_ADDRESS</code> only inside graph replay &mdash; caught in a CUDA <code>static_assert</code>.</li>
+  <li>v2 dispatch pins o_proj residual to variant <code>v1</code> (128x128x128 Coop/Coop matched).</li>
+</ul>
+
+<h3>FlashAttention-3 SM90 paged decode</h3>
+<p><code>kernels/fa3_sm90_wrapper.cu</code> &rarr; <code>libfa3_kernels.so</code> (23 MB)</p>
+<p>
+  WGMMA + TMA, built from FlashAttention-3 Hopper source. Paged KV layout
+  <code>[2, num_blocks, block_size, num_kv_heads, head_dim]</code>, GQA via
+  <code>num_heads / num_kv_heads</code> ratio. <code>head_dim = 128</code> hard gate.
+</p>
+<p><strong>No PTX fallback.</strong> If <code>libfa3_kernels.so</code> is not present, the engine refuses to load.</p>
+
+<h3>Fused pre/post kernels</h3>
+<p>Custom PTX compiled at deploy time. Each kernel fuses one recognizable composite &mdash; no megakernels.</p>
 <div class="tbl">
 <table>
-<thead><tr><th>Fused Kernel</th><th class="r">JIT (us)</th><th class="r">Hand-written (us)</th><th class="r">Speedup</th></tr></thead>
+<thead><tr><th>Kernel</th><th>Fuses</th><th class="r">Launches saved</th></tr></thead>
 <tbody>
-<tr class="peak"><td>Add+RMSNorm+QKV GEMV [1,4608,3584]</td><td class="r">5.5</td><td class="r">10.6</td><td class="r">1.92x</td></tr>
-<tr class="peak"><td>Add+RMSNorm+GateUp GEMV [1,37888,3584]</td><td class="r">19.3</td><td class="r">98.6</td><td class="r">5.12x</td></tr>
-<tr class="peak"><td>SiLU*Mul+Down GEMV [1,3584,18944]</td><td class="r">9.5</td><td class="r">70.7</td><td class="r">7.48x</td></tr>
-<tr class="peak"><td>RMSNorm+QKV GEMV [1,4608,3584]</td><td class="r">5.3</td><td class="r">10.8</td><td class="r">2.03x</td></tr>
+<tr><td><code>embedding_gather</code></td><td>token_ids &rarr; f16 hidden</td><td class="r">1 &rarr; 1</td></tr>
+<tr><td><code>fused_add_rmsnorm_fp8_quant</code></td><td>residual add + RMSNorm + per-token FP8 quantize</td><td class="r">3 &rarr; 1</td></tr>
+<tr><td><code>fused_rmsnorm_fp8_quant</code></td><td>RMSNorm + per-token FP8 quantize</td><td class="r">2 &rarr; 1</td></tr>
+<tr><td><code>quantize_fp8_per_token</code></td><td>post-attention activation &rarr; FP8 + scale</td><td class="r">1 &rarr; 1</td></tr>
+<tr><td><code>fused_rope_kv_write</code></td><td>RoPE + KV-cache paged write</td><td class="r">3 &rarr; 1</td></tr>
+<tr><td><code>fused_silu_mul_fp8_quant</code></td><td>SiLU + element-wise mul + FP8 quantize</td><td class="r">3 &rarr; 1</td></tr>
+<tr><td><code>argmax</code></td><td>f32 logits &rarr; i32 token</td><td class="r">1 &rarr; 1</td></tr>
+<tr><td><code>residual_add_f16</code></td><td>x + y in place (not fused with GEMM)</td><td class="r">1 &rarr; 1</td></tr>
 </tbody>
 </table>
 </div>
+</section>
+
+<section>
+<h2>One decode step, in order</h2>
+<p class="section-sub">What happens between <code>step_launch</code> and <code>step_collect</code></p>
+<pre>step_launch(diff):
+  1. schedule(diff)                          CPU, O(N), zero allocs
+  2. metadata pack + 1x HtoD                 positions, context_lens, block_tables,
+                                             slot_mapping into one packed i32 buffer
+  3. graph_pool.replay(bucket = pad_up(N))   one cuGraphLaunch
+       embedding_gather                      1 kernel
+       for layer in 0..28:                   11 kernels / layer = 308
+         fused_add_rmsnorm_fp8_quant
+         CUTLASS FP8 GEMM  (QKV)
+         fused_rope_kv_write
+         FA3 paged_decode
+         quantize_fp8_per_token  (post-attn)
+         CUTLASS FP8 GEMM + residual  (o_proj, v1)
+         fused_rmsnorm_fp8_quant
+         CUTLASS FP8 GEMM  (gate_up)
+         fused_silu_mul_fp8_quant
+         CUTLASS FP8 GEMM  (down_proj)
+         residual_add_f16
+       fused_residual_rmsnorm  (final)       1 kernel
+       cuBLAS HGEMM f32 &rarr; lm_head            1 kernel
+       argmax                                1 kernel
+  4. cuMemcpyDtoHAsync argmax &rarr; pinned[w]    4 x N bytes (512 B at N=128)
+     cuEventRecord event[w]
+  5. return; w ^= 1                          double-buffer flip
+
+step_collect():
+  1. cuEventSynchronize event[r]             wait for step-1 DtoH
+  2. read pinned[r][0..N]                    CPU reads new tokens
+  3. scheduler.commit()                       mark tokens, free finished</pre>
 <p>
-  Per-step savings at N=1 (28 layers, 4 fused kernels each): <strong>4.2 ms</strong>.
-  On a 9.3 ms baseline step, this is a 45% reduction in kernel time.
+  <strong>Total GPU kernels per decode step:</strong> 1 + 28x11 + 1 + 1 + 1 = <strong>311 launches</strong>, all
+  captured into <strong>1 <code>cuGraphLaunch</code></strong>.
+  <strong>Total DtoH per step:</strong> one 4xN byte copy of argmax token IDs.
+  <strong>Total HtoD per step:</strong> one packed metadata buffer (&lt;100 KB at N=128, max_blocks=129).
 </p>
 </section>
 
 <section>
-<h2>Current H100 Direct -- FP8 vs FP8</h2>
-<p class="section-sub">Qwen2.5-7B FP8 E4M3, vLLM 0.19.0 (FP8 + CUDA graphs + torch.compile) vs rvLLM v2 FP8, same GPU (April 15, 2026)</p>
-
-<h3>128 output tokens</h3>
-<div class="tbl">
-<table>
-<thead><tr><th class="r">N</th><th class="r">vLLM 0.19.0 FP8</th><th class="r">rvLLM v2 FP8</th><th>rvLLM / vLLM</th></tr></thead>
-<tbody>
-<tr><td class="r">1</td><td class="r">247</td><td class="r">192</td><td>0.78x</td></tr>
-<tr><td class="r">16</td><td class="r">3,849</td><td class="r">2,992</td><td>0.78x</td></tr>
-<tr><td class="r">32</td><td class="r">7,060</td><td class="r">5,930</td><td>0.84x</td></tr>
-<tr><td class="r">48</td><td class="r">10,560</td><td class="r">8,464</td><td>0.80x</td></tr>
-<tr><td class="r">64</td><td class="r">13,624</td><td class="r">11,026</td><td>0.81x</td></tr>
-<tr><td class="r">96</td><td class="r">17,895</td><td class="r">15,268</td><td>0.85x</td></tr>
-<tr><td class="r">128</td><td class="r">22,680</td><td class="r">19,743</td><td>0.87x</td></tr>
-</tbody>
-</table>
-</div>
-
-<h3>512 output tokens</h3>
-<div class="tbl">
-<table>
-<thead><tr><th class="r">N</th><th class="r">vLLM 0.19.0 FP8</th><th class="r">rvLLM v2 FP8</th><th>rvLLM / vLLM</th></tr></thead>
-<tbody>
-<tr><td class="r">1</td><td class="r">246</td><td class="r">191</td><td>0.78x</td></tr>
-<tr><td class="r">16</td><td class="r">3,848</td><td class="r">2,939</td><td>0.76x</td></tr>
-<tr><td class="r">32</td><td class="r">7,022</td><td class="r">5,848</td><td>0.83x</td></tr>
-<tr><td class="r">48</td><td class="r">10,382</td><td class="r">8,709</td><td>0.84x</td></tr>
-<tr><td class="r">64</td><td class="r">13,396</td><td class="r">11,204</td><td>0.84x</td></tr>
-<tr class="peak"><td class="r">96</td><td class="r">17,345</td><td class="r">15,868</td><td>0.92x</td></tr>
-<tr><td class="r">128</td><td class="r">22,486</td><td class="r">19,973</td><td>0.89x</td></tr>
-</tbody>
-</table>
-</div>
-<div class="note">
-  <strong>Honest apples-to-apples comparison</strong>: both engines running FP8 E4M3, CUDA graphs, torch.compile (vLLM side). Previous numbers in this repo compared against vLLM F16 eager mode -- those have been retracted. The gap is 15-22% and narrows at higher batch sizes (0.92x at N=96). Primary bottleneck is FP8 GEMM kernel speed (vLLM nvjet vs rvLLM autotuned CUTLASS). Work is ongoing.
-</div>
-</section>
-
-<section>
-<h2>v2 Engine FP8 Stack</h2>
-<p class="section-sub">Qwen2.5-7B, H100 SXM 80GB, April 15 2026</p>
-
-<div class="note">
-  <strong>FP8 inference stack</strong>: CUTLASS 3x SM90 FP8 GEMM (32 autotuned variants including stream-K/split-K). FA3 SM90 paged-KV decode attention via shared library (WGMMA/TMA, 7.5us/layer). Fused RMSNorm + per-token FP8 quantize (single kernel replaces 3). Fused SiLU*mul + per-token FP8 quantize (single kernel replaces 3). Vectorized SiLU+FP8 with 128-bit loads and 64-bit FP8 stores. 8 kernels per transformer layer (down from 15 with cublasLt path). GPU-resident argmax eliminates DtoH transfers.
-</div>
-<div class="note">
-  <strong>Where the gap is</strong>: vLLM's nvjet FP8 GEMM kernels are faster than our autotuned CUTLASS variants. This accounts for the bulk of the 15-22% throughput difference. FA3 SM90 attention is already competitive. Fused norm/activation kernels are competitive. The GEMM gap is the primary optimization target.
-</div>
-</section>
-
-<section>
-<h2>What Changed</h2>
-<p class="section-sub">CUTLASS FP8, FA3 SM90, fused kernels, vectorized SiLU+FP8, stream-K/split-K autotune</p>
+<h2>Correctness discipline</h2>
+<p class="section-sub">Explicit rules. Violations fail the build or startup &mdash; never degrade silently.</p>
 <ol>
-<li><strong>FlashAttention-3 SM90 paged-KV decode (April 15).</strong> WGMMA/TMA-accelerated via shared library (libfa3_kernels.so). Paged-KV decode attention at 7.5us/layer, down from 16us with the previous FA3 v3 path.</li>
-<li><strong>CUTLASS SM90 FP8 GEMMs replaced cublasLt.</strong> Same kernel family vLLM uses (Hopper WGMMA + TMA), driven directly from Rust via the CUTLASS 3x C++ API.</li>
-<li><strong>Fused RMSNorm + per-token FP8 quantize.</strong> A single kernel reads the hidden state, normalizes, quantizes to FP8 E4M3 per-token, and writes the result. Replaces 3 separate kernels.</li>
-<li><strong>Fused SiLU*mul + per-token FP8 quantize.</strong> Same pattern for the MLP activation: gate activation, element-wise mul, quantize in one kernel. Replaces 3 separate kernels.</li>
-<li><strong>8 kernels per transformer layer.</strong> Down from 15 with the old cublasLt path.</li>
-<li><strong>Vectorized fused SiLU*mul + FP8 quantize (April 14).</strong> 128-bit loads (uint4) and 64-bit FP8 stores (uint2) with register caching.</li>
-<li><strong>Stream-K / split-K FP8 GEMM autotune (April 14).</strong> 7 new CUTLASS variants with StreamKScheduler and explicit K-decomposition.</li>
-<li><strong>32 FP8 GEMM variants total.</strong> Standalone autotune binary benchmarks all shapes. FP8FastAccum schedule aliases.</li>
-</ol>
-<div class="note">
-  The engine is at 78-92% of vLLM 0.19.0 FP8 throughput. The remaining gap is primarily in FP8 GEMM kernel speed (nvjet vs CUTLASS). FA3 SM90 attention and fused kernels are already competitive. Work continues on closing the GEMM gap.
-</div>
-</section>
-
-
-<section>
-<h2>Three-Tier Kernel Stack</h2>
-<p class="section-sub">JIT > Hand-written CUDA > cuBLAS</p>
-<ol>
-<li><strong>JIT fused kernels</strong> (fastest) -- Rust PTX emitter generates shape-specialized fused kernels at model load. 2-7.5x faster than hand-written CUDA for M=1 decode. Patterns: RMSNorm+GEMV, Add+RMSNorm+GEMV, SiLU*Mul+GEMV.</li>
-<li><strong>54 hand-written CUDA kernels</strong> -- fused decode (add+norm+QKV+bias, RoPE+cache, GQA attention, O-proj+gateup, silu+down), FP8 E4M3 variants, TMA async-prefetch GEMV, WGMMA tensor core GEMV, split-KV attention, INT4 W4A16 GEMV (4 fused variants, pending Rust wiring). No-fallback validation at startup ensures every kernel loads or the server fails fast.</li>
-<li><strong>cuBLAS/cublasLt</strong> (batched QKV/O/down) -- autotuned algorithm selection with vendored type shim for cudarc 0.19. 32 candidates benchmarked per GEMM shape at startup.</li>
-<li><strong>CUTLASS</strong> (batched GateUp+SiLU) -- the current default hybrid epilogue path for the MLP expansion.</li>
-</ol>
-<p>Plus an <strong>LLVM NVPTX backend</strong> (experimental) -- full compiler pipeline: Fusion IR -> LLVM IR -> NVPTX -> PTX via inkwell. Same backend as Triton.</p>
-</section>
-
-<section>
-<h2>Where the Speed Comes From</h2>
-<p class="section-sub">Compound effect of fifteen reinforcing mechanisms</p>
-<ol>
-<li><strong>JIT fused kernels</strong> -- compiler-generated fused norm+GEMV eliminates HBM round-trips</li>
-<li><strong>GPU-resident argmax</strong> -- eliminates 74 MB DtoH per step</li>
-<li><strong>CUDA graph replay</strong> -- 35 pre-captured graphs, 1.7 sec total capture time</li>
-<li><strong>Batch-1 dispatch fix</strong> -- normal single-stream decode now takes the right default path</li>
-<li><strong>Explicit batched hybrid GEMM routing</strong> -- QKV/O/down on cuBLAS, GateUp+SiLU on CUTLASS</li>
-<li><strong>cuBLAS autotuning</strong> -- best algorithm per GEMM shape, benchmarked at startup</li>
-<li><strong>FP16 hgemm + f16 KV cache</strong> -- tensor cores for all projections</li>
-<li><strong>FA3 SM90 WGMMA/TMA paged-KV decode</strong> -- FlashAttention-3 via shared library, 7.5us/layer, WGMMA + TMA hardware acceleration</li>
-<li><strong>No GIL, no GC</strong> -- deterministic Rust, parallel scheduling via Rayon</li>
-<li><strong>CUTLASS SM90 FP8 GEMMs</strong> -- Hopper WGMMA + TMA, same kernel family as vLLM, driven from Rust via CUTLASS 3x C++ API</li>
-<li><strong>Fused RMSNorm + FP8 quantize</strong> -- single kernel replaces norm + abs-max + quantize (3 kernels down to 1)</li>
-<li><strong>Fused SiLU*mul + FP8 quantize</strong> -- single kernel replaces activation + mul + quantize (3 kernels down to 1)</li>
-<li><strong>8 kernels per layer</strong> -- down from 15 with cublasLt path, fewer launches, fewer HBM round-trips</li>
-<li><strong>Zig SIMD sampling</strong> -- NEON/AVX-512 softmax, argmax, weight conversion (1.4-6.3x)</li>
-<li><strong>Chunked prefill scheduler</strong> -- bounds prefill tokens per step, prevents decode starvation</li>
-<li><strong>Scheduler preemption fix</strong> -- eliminates watermark-triggered eviction cliff at N=96+</li>
-<li><strong>Vectorized fused SiLU+FP8</strong> -- uint4 128-bit loads, register caching, uint2 64-bit FP8 stores (8 FP8 values per store)</li>
-<li><strong>Stream-K / split-K autotune</strong> -- CUTLASS StreamKScheduler decomposes K across SMs; split-K=4 gives 85% SM utilization on memory-bound shapes</li>
-<li><strong>FP8 GEMM autotune</strong> -- 32 variants benchmarked per shape, standalone binary populates cache</li>
+<li>
+  <strong>No fallbacks.</strong> Missing autotune policy entry for a shape panics with the shape. Missing FA3 <code>.so</code> refuses startup. Missing CUTLASS <code>.so</code> refuses startup. Stale autotune caches from prior deploys are not consulted &mdash; policy lives in the SHA-pinned build artifact.
+</li>
+<li>
+  <strong>Graph-capture invariant.</strong> Metadata buffer layout is frozen per
+  <code>(bucket, max_blocks_per_seq)</code>. Captured graphs bind those exact offsets. There is no
+  "non-padded" upload path. Prefill and decode have separate APIs; they do not share metadata offsets.
+  This is the fix for the April 16 <code>CUDA_ERROR_ILLEGAL_ADDRESS</code> regression.
+</li>
+<li>
+  <strong>Real block-change detection.</strong> Scheduler emits
+  <code>ContinuedRequest::block_table_update: Option&lt;Vec&lt;BlockId&gt;&gt;</code> whenever a sequence's
+  physical block list grows. Worker unions this with CoW copies. Missing either signal leaves stale
+  block_ids in the captured graph &mdash; wrong KV reads, silent correctness bug, no crash.
+</li>
+<li>
+  <strong>CUTLASS schedule/epilogue pairing.</strong> Mainloop and epilogue must match. Mismatched
+  variants cause <code>CUDA_ERROR_ILLEGAL_ADDRESS</code> only inside graph replay. Enforced in v3
+  as a CUDA <code>static_assert</code>. In v2, dispatch pins the fused residual path to variant
+  <code>v1</code> (Coop/Coop, hand-verified).
+</li>
+<li>
+  <strong>No <code>unwrap()</code> in libraries.</strong> <code>Result&lt;T, RvllmError&gt;</code>
+  end-to-end. Errors carry structured context (stream, kernel name, launch config) &mdash; not
+  stringified <code>DriverError</code> that loses fault location.
+</li>
 </ol>
 </section>
 
 <section>
-<h2>CPU Benchmarks</h2>
-<p class="section-sub">Apple M5, 10 cores</p>
+<h2>Measured recovery, April 16 2026</h2>
+<p class="section-sub">One-day pass. 9,531 &rarr; 19,287 tok/s at N=128 (+102%). Three root-cause fixes, no stopgaps.</p>
 <div class="tbl">
 <table>
-<thead><tr><th>Operation</th><th class="r">Rust</th><th class="r">Python</th><th class="r">Speedup</th></tr></thead>
+<thead><tr><th>Commit</th><th>Fix</th><th class="r">N=128 gain</th></tr></thead>
 <tbody>
-<tr><td>Combined penalties</td><td class="r">2.6 us</td><td class="r">63 us</td><td class="r">24x</td></tr>
-<tr><td>Repetition penalty (2K)</td><td class="r">3.1 us</td><td class="r">34 us</td><td class="r">11x</td></tr>
-<tr><td>Multinomial (32K vocab)</td><td class="r">12 us</td><td class="r">66 us</td><td class="r">5.5x</td></tr>
-<tr><td>Top-p nucleus (128K)</td><td class="r">1.6 ms</td><td class="r">6.9 ms</td><td class="r">4.3x</td></tr>
-<tr><td>Batch sampling (64 seqs)</td><td class="r">4.3 ms</td><td class="r">36.4 ms</td><td class="r">8.5x</td></tr>
+<tr>
+  <td><code>6dabb76a5</code></td>
+  <td><code>last_padded_batch</code> tracking: prefill's non-padded metadata no longer overwrites decode's padded layout; captured graphs read correct offsets.</td>
+  <td class="r">crash &rarr; runs</td>
+</tr>
+<tr>
+  <td><code>31716269d</code></td>
+  <td>Re-enable fused FP8 o_proj + residual with variant <code>v1</code> (Coop/Coop matched). Reverts the earlier "disable all variants" stopgap after template-level analysis proved only WS/Coop mismatches crash.</td>
+  <td class="r">+83%</td>
+</tr>
+<tr>
+  <td><code>eb9e247fd</code></td>
+  <td>Restore <code>patch_metadata_decode</code> fast path with <em>real</em> block-change detection via <code>ContinuedRequest::block_table_update</code> (catches page-boundary growth, not just CoW).</td>
+  <td class="r">+10%</td>
+</tr>
 </tbody>
 </table>
 </div>
+<p>Plus: <code>libfa3_kernels.so</code> built on the box (23 MB), eliminating a silent .ptx fallback path.</p>
 </section>
 
+<section>
+<h2>Reproduce</h2>
+<p class="section-sub">One command, one H100, everything from source</p>
+<pre># One-shot: rent an H100 on vast.ai, build from source, run bench, land JSON locally.
+VASTAI_API_KEY=&lt;your_key&gt; ./race.sh
+
+# Manual (on an H100 box)
+bash kernels/build.sh               # custom PTX (fused norm / silu / argmax / ...)
+bash kernels/build_cutlass_so.sh    # CUTLASS SM90 FP8 GEMM .so
+bash kernels/build_fa3.sh           # FlashAttention-3 SM90 .so (~10 min)
+
+./target/release/autotune-cutlass   # populates policy.json for your GPU
+
+cargo build --release --features cuda-graphs --bin rvllm-v2-bench
+./target/release/rvllm-v2-bench \
+  --model Qwen/Qwen2.5-7B \
+  --fp8 \
+  --n "1,4,8,16,32,64,128" \
+  --output-len 512 \
+  --iters 3</pre>
+</section>
 
 <section>
-<h2>Architecture</h2>
-<p class="section-sub">31 crates, 54 CUDA kernels, 13 model architectures, CUTLASS SM90 FP8 + FA3 SM90 attention as of April 15</p>
-<pre>rvllm-server          CLI binary (serve, benchmark, info)
-  +-- rvllm-api         axum HTTP server, 14 OpenAI-compatible routes, SSE streaming
-  +-- rvllm-engine      async engine, continuous batching, dedicated GPU thread
-  |     +-- rvllm-scheduler    chunked prefill, FCFS/priority/SJF, preemption
-  |     +-- rvllm-worker       GPU worker, CUDA graph capture/replay (35 sizes)
-  |     +-- rvllm-speculative  self-draft speculative decoding
-  +-- rvllm-model-runner   forward pass, 13 architectures, 6 decode paths, megakernel
-  |     +-- rvllm-attention    FA3 v3 cp.async, GQA, split-KV, sliding window
-  |     +-- rvllm-kv-cache     paged KV (f16 + FP8)
-  |     +-- rvllm-model-loader SafeTensors + GGUF, HF hub, TP sharding
-  +-- rvllm-fusion         JIT PTX compiler, 2-7.5x faster than hand-written CUDA
-  +-- rtriton              Triton-style GPU kernel compiler (research crate)
-  +-- rvllm-gpu            CUDA, cuBLAS/cublasLt, kernel loader (~60 modules)
-  +-- rvllm-sampling       temp/top-k/p/min-p, guided decoding (JSON schema, regex)
-  +-- rvllm-tp             tensor parallelism (NCCL, Megatron sharding)
-  +-- rvllm-tokenizer      HF tokenizers, ChatML/Harmony templates, tool parsing
-  +-- rvllm-vision         image preprocessing, vision encoder trait
-  +-- rvllm-zig            Zig SIMD backend (softmax, argmax, weight conversion)
-  +-- rvllm-telemetry      Prometheus metrics, structured logging, OTLP traces
-  +-- rvllm-python         PyO3 bindings (import rvllm)
+<h2>Crate map (hot path)</h2>
+<pre>rvllm-api         HTTP / OpenAI routes
+  rvllm-engine / rvllm-v2::engine   step_pipelined()
+    rvllm-worker / rvllm-v2::worker
+      rvllm-scheduler    request state, paged KV, preemption
+      rvllm-v2::runner   HBM arena, packed metadata, layer dispatch
+        rvllm-v2::layer
+          rvllm-gpu::cutlass_ffi    FP8 GEMM variants + residual
+          rvllm-gpu::fa3_ffi         libfa3_kernels.so bindings
+          kernel_loader              PTX / .so loader
+      rvllm-gpu::cuda_graph  GraphPool, bucket capture</pre>
+<p>
+  Full crate table for multimodal, embeddings, speculative decode, gRPC, telemetry, Python bindings:
+  <a href="https://github.com/m0at/rvllm/blob/main/docs/arch.md">docs/arch.md</a>.
+</p>
+</section>
 
-Model architectures:
-  LlamaForCausalLM, MistralForCausalLM, Qwen2ForCausalLM, CohereForCausalLM,
-  GPTNeoXForCausalLM, StableLMForCausalLM, GemmaForCausalLM, Gemma2ForCausalLM,
-  DeepseekV2ForCausalLM, MixtralForCausalLM, NemotronHMoE, Phi3SmallForCausalLM,
-  SentenceTransformer (embedding models)
-
-Decode paths (N=1):
-  Batched ............... current default normal path
-  CUTLASS FP8 .......... v2 FP8 E4M3, CUTLASS SM90 WGMMA+TMA + FA3 SM90 attention
-  CublasGemvDecode ..... legacy       (older single-token cuBLAS path)
-  FusedDecode .......... legacy       (older fused path, now opt-in)
-  Megakernel ............ 50 tok/s   (28-layer single-launch, instruction tape)
-  Persistent ............ 51 tok/s   (SM-DAG cooperative kernel)
-  Fp8Decode (cublasLt) .. legacy     (replaced by CUTLASS SM90 path)
-  FP8 kernel stack: CUTLASS 3x SM90 FP8 GEMM + fused RMSNorm/quantize + fused SiLU*mul/quantize
-  8 kernels per layer (down from 15 with cublasLt)
-  Current: 78-92% of vLLM 0.19.0 FP8 throughput, closing the GEMM gap</pre>
+<section>
+<h2>v3: clean-slate rewrite (in progress)</h2>
+<p class="section-sub">16-agent spec swarm + 15-crate scaffold with DAG and LoC invariants</p>
+<p>
+  v3 collapses the frankenstein dispatch chain into a single execution path, makes
+  CUTLASS schedule mismatches a compile error, enforces one metadata upload path,
+  and introduces a <code>GraphSafe</code> marker trait that makes realloc-inside-capture
+  unrepresentable at the type level. 16 focused specs (<a href="https://github.com/m0at/rvllm/tree/main/v3/specs">v3/specs</a>) consolidated into
+  <a href="https://github.com/m0at/rvllm/blob/main/v3/IMPL_PLAN.md">v3/IMPL_PLAN.md</a>.
+  DAG and per-crate LoC budgets enforced in CI via <code>tests/dag.rs</code> and
+  <code>tests/loc_budget.rs</code>.
+</p>
 </section>
 
 <section>
@@ -477,10 +448,9 @@ Decode paths (N=1):
 <div class="refs">
 <ol>
 <li>Kwon et al. "Efficient Memory Management for Large Language Model Serving with PagedAttention." SOSP, 2023.</li>
-<li>Dao. "FlashAttention-2: Faster Attention with Better Parallelism." ICLR, 2024.</li>
-<li>Tillet et al. "Triton: An Intermediate Language and Compiler for Tiled Neural Network Computations." MLSys, 2019.</li>
-<li>NVIDIA. "CUTLASS: CUDA Templates for Linear Algebra Subroutines." 2024.</li>
-<li>NVIDIA. "TensorRT-LLM." 2024.</li>
+<li>Dao et al. "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision." NeurIPS, 2024.</li>
+<li>NVIDIA. "CUTLASS 3.x: CUDA Templates for Linear Algebra Subroutines." 2024.</li>
+<li>NVIDIA. "Hopper Architecture: WGMMA Tensor Cores and TMA." H100 whitepaper, 2022.</li>
 </ol>
 </div>
 </section>
