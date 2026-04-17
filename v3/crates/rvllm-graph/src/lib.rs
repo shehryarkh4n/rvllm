@@ -1,6 +1,15 @@
-// rvllm-graph — scaffold only. See v3/specs/14-graph.md.
-//   pub mod capture;      // CaptureScope::record closure API (uses rvllm-mem CaptureScope)
-//   pub mod replay;       // GraphPool::replay(bucket, scope) -> &Tensor<i32>
-//   pub mod pool;         // GraphPool::capture_all(rt, buckets, body)
-//   pub mod fingerprint;  // walk captured graph nodes; emit + compare JSON
-//   pub mod validate;     // eager-mode numeric ref compare (CI)
+//! rvllm-graph: captured-graph pool per spec 14.
+//!
+//! Invariants:
+//! - Graphs are captured at engine init for every declared bucket —
+//!   NO lazy capture during warmup.
+//! - Every replay is gated on a `MetadataLayout` hash check; a drifted
+//!   layout (meaning the captured graph is not structurally valid for
+//!   the current bucket) returns `GraphError::CaptureMetadataMismatch`
+//!   instead of crashing under `cuGraphLaunch` with ILLEGAL_ADDRESS.
+//! - Missing bucket is a typed error (engine-init-time); no fallback
+//!   to non-graph execution.
+
+pub mod pool;
+
+pub use pool::{CapturedGraph, GraphFingerprint, GraphPool};

@@ -1,5 +1,11 @@
-// rvllm-sampling — scaffold only. See v3/specs/13-sampling.md.
-//   pub mod greedy;       // argmax_kernel launcher
-//   pub mod topk_topp;    // combined sampling kernel launcher
-//   pub mod dtoh_pinned;  // PinnedTokens double buffer + DtoHTicket<'p> type-state
-//   pub mod rng;          // per-seq Philox state in HBM
+//! rvllm-sampling: GPU-side greedy argmax + optional top-k/p.
+//!
+//! DtoH coordination uses a consume-once `DtoHTicket<'p>` that borrows
+//! `&mut PinnedTokens`. The type state makes "launch twice before
+//! collect" and "read without wait" compile errors.
+
+pub mod dtoh;
+pub mod params;
+
+pub use dtoh::{DtoHTicket, PinnedTokens};
+pub use params::SamplingParams;
