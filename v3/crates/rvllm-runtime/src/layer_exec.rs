@@ -47,6 +47,7 @@ pub struct LayerWeights {
     pub attn_norm_gamma: u64,
     pub qkv_fp8: u64,
     pub qkv_scale: u64,
+    pub qkv_bias: u64, // [q_dim + 2*kv_dim] f16
     pub o_fp8: u64,
     pub o_scale: u64,
     pub mlp_norm_gamma: u64,
@@ -94,6 +95,7 @@ pub struct LayerKernels {
     pub fused_rope_cache: KernelFn,
     pub fused_silu_mul: KernelFn,
     pub quantize_fp8_per_token: KernelFn,
+    pub add_bias_f16: KernelFn,
 }
 
 #[derive(Clone, Debug)]
@@ -145,6 +147,7 @@ pub unsafe fn forward(
     //      rows[q_dim+kv_dim:]       -> V
     //    The scratch carries q_out as the packed base; k_out and v_out
     //    are byte offsets into the same buffer (set by bring_up).
+    let qkv_n = dims.num_heads * dims.head_dim + 2 * dims.num_kv_heads * dims.head_dim;
     #[cfg(feature = "cuda")]
     cutlass.launch_fp8_gemm(
         &plans.qkv,
@@ -157,6 +160,13 @@ pub unsafe fn forward(
         scratch.cutlass_workspace_bytes,
         stream,
     )?;
+    // Bias: Qwen2.5 attention_bias=true. Add q/k/v biases to the
+    // packed qkv output in-place.
+    rvllm_fused::AddBiasF16Launch {
+        num_tokens: dims.num_tokens,
+        dim: qkv_n,
+    }
+    .launch(kernels.add_bias_f16, scratch.q_out, weights.qkv_bias, stream)?;
 
     // 5. RoPE q/k in place, write k/v into paged cache.
     FusedRopeKvWriteLaunch {

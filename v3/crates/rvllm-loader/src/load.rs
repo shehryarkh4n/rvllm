@@ -235,6 +235,24 @@ pub fn load_model(model_dir: &Path, arena: &HbmArena, arch: &ModelArch) -> Resul
             model_dir,
         )?;
 
+        // Concat q/k/v biases. Qwen2.5 has attention_bias=true; leaving
+        // these out would silently produce wrong logits after QKV.
+        let qkv_bias_bytes = concat_qkv_bias(
+            &must_get(&ln("self_attn.q_proj.bias"))?,
+            &must_get(&ln("self_attn.k_proj.bias"))?,
+            &must_get(&ln("self_attn.v_proj.bias"))?,
+            &shards,
+            model_dir,
+        )?;
+        let qkv_bias = {
+            let r = arena.region("qkv_bias", qkv_bias_bytes.len(), 16)?;
+            unsafe { r.copy_from_host(&qkv_bias_bytes)? };
+            F16Weight {
+                offset_bytes: r.device_ptr() - arena_base(arena),
+                shape: vec![qkv_rows],
+            }
+        };
+
         let o_proj = upload_fp8_from(
             arena,
             "o_proj",
@@ -291,6 +309,7 @@ pub fn load_model(model_dir: &Path, arena: &HbmArena, arch: &ModelArch) -> Resul
 
         layers.push(LayerWeights {
             qkv,
+            qkv_bias,
             gate_up,
             o_proj,
             down_proj,
@@ -469,6 +488,35 @@ fn upload_fp8(
 }
 
 fn concat_qkv(
+    q: &(usize, TensorEntry),
+    k: &(usize, TensorEntry),
+    v: &(usize, TensorEntry),
+    shards: &[ShardMap],
+    model_dir: &Path,
+) -> Result<Vec<u8>> {
+    let qb = tensor_to_f16_bytes(
+        &q.1,
+        &shards[q.0].bytes()[q.1.file_offset as usize..(q.1.file_offset + q.1.nbytes) as usize],
+        model_dir,
+    )?;
+    let kb = tensor_to_f16_bytes(
+        &k.1,
+        &shards[k.0].bytes()[k.1.file_offset as usize..(k.1.file_offset + k.1.nbytes) as usize],
+        model_dir,
+    )?;
+    let vb = tensor_to_f16_bytes(
+        &v.1,
+        &shards[v.0].bytes()[v.1.file_offset as usize..(v.1.file_offset + v.1.nbytes) as usize],
+        model_dir,
+    )?;
+    let mut out = Vec::with_capacity(qb.len() + kb.len() + vb.len());
+    out.extend_from_slice(&qb);
+    out.extend_from_slice(&kb);
+    out.extend_from_slice(&vb);
+    Ok(out)
+}
+
+fn concat_qkv_bias(
     q: &(usize, TensorEntry),
     k: &(usize, TensorEntry),
     v: &(usize, TensorEntry),

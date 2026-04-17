@@ -32,9 +32,15 @@ pub struct Fp8Weight {
 
 /// One transformer layer's weights. Borrows into the model's HBM
 /// slab; the borrow keeps the slab alive.
+///
+/// `qkv_bias` is the f16 concatenation of q_proj.bias || k_proj.bias ||
+/// v_proj.bias, shape [q_dim + 2*kv_dim]. Applied after the fused QKV
+/// GEMM. Qwen2.5 sets attention_bias=true; leaving this out produces
+/// wrong logits.
 #[derive(Debug)]
 pub struct LayerWeights {
     pub qkv: Fp8Weight,
+    pub qkv_bias: F16Weight,
     pub gate_up: Fp8Weight,
     pub o_proj: Fp8Weight,
     pub down_proj: Fp8Weight,

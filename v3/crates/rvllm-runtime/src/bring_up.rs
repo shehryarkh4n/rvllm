@@ -54,12 +54,14 @@ pub struct FusedModules {
     pub rope_mod: LoadedModule,
     pub silu_mod: LoadedModule,
     pub argmax_mod: LoadedModule,
+    pub add_bias_mod: LoadedModule,
     pub fn_rmsnorm: KernelFn,
     pub fn_add_rmsnorm: KernelFn,
     pub fn_quantize: KernelFn,
     pub fn_rope_cache: KernelFn,
     pub fn_silu_mul: KernelFn,
     pub fn_argmax: KernelFn,
+    pub fn_add_bias_f16: KernelFn,
 }
 
 impl Bringup {
@@ -343,6 +345,7 @@ impl Bringup {
             fused_rope_cache: self.fused_modules.fn_rope_cache,
             fused_silu_mul: self.fused_modules.fn_silu_mul,
             quantize_fp8_per_token: self.fused_modules.fn_quantize,
+            add_bias_f16: self.fused_modules.fn_add_bias_f16,
         };
         let plans = layer_exec::LayerGemmPlans {
             qkv: plan_qkv,
@@ -362,6 +365,7 @@ impl Bringup {
                     attn_norm_gamma: layer.input_layernorm.offset_bytes,
                     qkv_fp8: layer.qkv.offset_bytes,
                     qkv_scale: layer.qkv.scale_ptr,
+                    qkv_bias: layer.qkv_bias.offset_bytes,
                     o_fp8: layer.o_proj.offset_bytes,
                     o_scale: layer.o_proj.scale_ptr,
                     mlp_norm_gamma: layer.post_attention_layernorm.offset_bytes,
@@ -530,6 +534,7 @@ fn load_fused(loader: &KernelLoader) -> Result<FusedModules> {
     let rope_mod = loader.load_ptx("fused_rope_cache_f16tbl")?;
     let silu_mod = loader.load_ptx("fused_silu_fp8_quant")?;
     let argmax_mod = loader.load_ptx("argmax")?;
+    let add_bias_mod = loader.load_ptx("add_bias_f16")?;
 
     let fn_rmsnorm = rmsnorm_mod.get_function("fused_rmsnorm_fp8_quant_kernel")?;
     let fn_add_rmsnorm = rmsnorm_mod.get_function("fused_add_rmsnorm_fp8_quant_kernel")?;
@@ -537,17 +542,20 @@ fn load_fused(loader: &KernelLoader) -> Result<FusedModules> {
     let fn_rope_cache = rope_mod.get_function("fused_rope_cache_f16tbl_kernel")?;
     let fn_silu_mul = silu_mod.get_function("fused_silu_mul_fp8_quant_kernel")?;
     let fn_argmax = argmax_mod.get_function("argmax_kernel")?;
+    let fn_add_bias_f16 = add_bias_mod.get_function("add_bias_f16_kernel")?;
 
     Ok(FusedModules {
         rmsnorm_mod,
         rope_mod,
         silu_mod,
         argmax_mod,
+        add_bias_mod,
         fn_rmsnorm,
         fn_add_rmsnorm,
         fn_quantize,
         fn_rope_cache,
         fn_silu_mul,
         fn_argmax,
+        fn_add_bias_f16,
     })
 }

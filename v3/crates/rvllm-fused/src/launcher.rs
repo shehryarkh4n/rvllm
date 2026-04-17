@@ -434,6 +434,45 @@ impl FusedRopeKvWriteLaunch {
 // residual_add_f16
 // ---------------------------------------------------------------------------
 
+pub struct AddBiasF16Launch {
+    pub num_tokens: u32,
+    pub dim: u32,
+}
+
+impl AddBiasF16Launch {
+    pub fn validate(&self) -> Result<()> {
+        if self.num_tokens == 0 || self.dim == 0 {
+            return Err(invalid("add_bias_f16", "zero dim"));
+        }
+        Ok(())
+    }
+
+    /// Kernel sig: `(tensor_inout, bias, dim)`. Grid.x = num_tokens.
+    ///
+    /// # Safety
+    /// Caller owns pointers.
+    pub unsafe fn launch(
+        &self,
+        kernel: KernelFn,
+        tensor: u64,
+        bias: u64,
+        stream: u64,
+    ) -> Result<()> {
+        self.validate()?;
+        let mut tensor = tensor;
+        let mut bias = bias;
+        let mut dim = self.dim as i32;
+        let args = [
+            (&mut tensor) as *mut u64 as *mut core::ffi::c_void,
+            (&mut bias) as *mut u64 as *mut core::ffi::c_void,
+            (&mut dim) as *mut i32 as *mut core::ffi::c_void,
+        ];
+        let block = (self.dim.min(1024), 1, 1);
+        let grid = (self.num_tokens, 1, 1);
+        launch_raw(kernel, grid, block, 0, stream, &args)
+    }
+}
+
 pub struct ResidualAddF16Launch {
     pub n: u32,
 }
