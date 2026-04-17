@@ -15,16 +15,18 @@
 \begin{abstract}
 rvLLM is a single-GPU LLM inference engine written in Rust, built from
 scratch without Python in the serving hot path. On a single NVIDIA H100
-SXM 80\,GB running Qwen2.5-7B-Instruct in FP8~E4M3 with greedy decoding
-and a single CUDA-graph replay per step, rvLLM~v3 reaches
-\textbf{40{,}331 tokens/second at $N\!=\!512$}
-(decode + final RMSnorm + LM head + argmax).
+SXM 80\,GB running Qwen2.5-7B-Instruct in FP8~E4M3 with greedy decoding,
+a single CUDA-graph replay per step, and real FA3 paged-prefill for
+prompt ingest, rvLLM~v3 reaches
+\textbf{42{,}030 tokens/second at $N\!=\!512$}
+(decode + final RMSnorm + LM head + argmax) and a
+\textbf{63.8\,ms time-to-first-token at $N\!=\!128$} for 16-token prompts.
 Comparing head-to-head at each batch size against vLLM~0.19~V1 on the
 same GPU with the same model and quant config: v3 measures
-\textbf{+7.4\%} at $N\!=\!128$ (20{,}841 vs vLLM's 19{,}399),
-\textbf{+11.4\%} at $N\!=\!256$ (31{,}178 vs 27{,}996), and
-\textbf{+11.7\%} at $N\!=\!512$ (40{,}331 vs 36{,}097) --- consistently
-7--12\% faster at every batch size we tested. The earlier v2 stack
+\textbf{+13.8\%} at $N\!=\!128$ (22{,}069 vs vLLM's 19{,}399),
+\textbf{+22.8\%} at $N\!=\!256$ (34{,}364 vs 27{,}996), and
+\textbf{+16.4\%} at $N\!=\!512$ (42{,}030 vs 36{,}097) --- consistently
+14--23\% faster at every batch size we tested. The earlier v2 stack
 peaked at 19{,}287~tok/s at $N\!=\!128$ (SHA \texttt{eb9e247fd}) and
 is kept in-tree as an archive.
 
@@ -79,11 +81,12 @@ metadata packing, and sampling DtoH coordination in 31 crates
 path.
 
 This paper documents rvLLM~v3, which achieves
-\textbf{40{,}331~tok/s at $N\!=\!512$} on a single H100 under a bench
-that re-uploads metadata each step and runs a 16-step faux-prefill
+\textbf{42{,}030~tok/s at $N\!=\!512$} and \textbf{63.8\,ms TTFT at $N\!=\!128$}
+on a single H100 under a bench that re-uploads metadata each step and
+runs a real FA3 paged-prefill over the concatenated prompt
 (fair-comparison configuration, Section~\ref{sec:results}). vLLM~0.19
 V1 runs on the same box at all three of our benched batch sizes; v3
-measures 7.4\% / 11.4\% / 11.7\% faster at $N\!=\!128\,/\,256\,/\,512$
+measures 13.8\% / 22.8\% / 16.4\% faster at $N\!=\!128\,/\,256\,/\,512$
 respectively. The previous v2 stack (archived at commit
 \texttt{eb9e247fd}, April~16, 2026) reached 19{,}287~tok/s at $N\!=\!128$.
 v3's primary levers are: (i)
@@ -93,7 +96,12 @@ FP8 linears (QKV, O, gate\_up, down, lm\_head) through
 algorithms than a 40-variant CUTLASS cache; (iii) fusing the QKV row-bias
 into the GEMM epilogue via \texttt{CUBLASLT\_EPILOGUE\_BIAS}, and the
 residual add into the O and down GEMMs via \texttt{beta}=1; (iv) f16 RoPE
-tables, eliminating f32 from the decode hot path.
+tables, eliminating f32 from the decode hot path; (v) an FP8 E4M3 KV cache
+built against FA3's upstream E4M3 paged instantiations, halving KV memory
+and enabling $N\!=\!256$/$512$; (vi) a real multi-query causal FA3 paged-prefill
+entry point that replaces the 16-step eager faux-prefill, dropping TTFT
+6--12$\times$ and lifting steady-state throughput once the prefill scratch
+sizing was corrected to \texttt{max\_tokens}.
 
 Section~\ref{sec:stack} walks the v3 stack.
 Section~\ref{sec:kernels} enumerates the kernel inventory.
@@ -102,7 +110,7 @@ Section~\ref{sec:invariants} states the correctness invariants and ties
 each to a concrete failure mode observed during development.
 Section~\ref{sec:recovery} preserves the v2 recovery history
 (9{,}531\,\ensuremath{\rightarrow}\,19{,}287 tok/s in a one-day root-cause pass) and then
-describes the v3 session (551\,\ensuremath{\rightarrow}\,40{,}331 tok/s across batch-size scaling).
+describes the v3 session (551\,\ensuremath{\rightarrow}\,42{,}030 tok/s across batch-size scaling).
 Section~\ref{sec:results} reports the full bench table.
 
 % ============================================================================
@@ -582,12 +590,13 @@ measurement. We modified the v3 bench to address each one and re-ran:
 
 \begin{enumerate}
 \item \textbf{vLLM does real prefill} (16 input tokens $\times$ 128 prompts $=$
-  2{,}048 tokens of prompt processing before decode starts). The v3 bench
-  skips a dedicated prefill kernel. vLLM's \texttt{Avg generation throughput}
-  metric is decode-only, so this is mostly accounted for. \emph{Fix:} the
-  v3 bench runs 16 eager decode steps before the timed window, which
-  populate KV pages with real forward-pass activations. This matches the
-  KV-cache state vLLM has at the start of its decode measurement.
+  2{,}048 tokens of prompt processing before decode starts). vLLM's
+  \texttt{Avg generation throughput} metric is decode-only, so this is
+  mostly accounted for. \emph{Fix (Phase F):} v3 now also runs a real
+  multi-query causal FA3 paged-prefill under \texttt{RVLLM\_REAL\_PREFILL=1}:
+  one attention call over the concatenated prompt ($\text{total\_q}\!=\!N\!\times\!\text{prompt\_len}$)
+  using varlen \texttt{cu\_seqlens\_q}. The pre-existing 16-step eager
+  faux-prefill remains as a fallback.
 \item \textbf{vLLM runs its scheduler every step.} At steady-state batch=128
   it still checks request state, completions, and block-table management.
   The v3 bench previously replayed a frozen graph. \emph{Fix:} the v3
@@ -595,19 +604,20 @@ measurement. We modified the v3 bench to address each one and re-ran:
   \texttt{context\_lens} every timed iteration. v3 pays the same per-step
   HtoD cost that vLLM's scheduler pays for metadata management.
 \item \textbf{vLLM's KV cache has real content from real prompts.} v3's
-  had post-warmup garbage. \emph{Fix:} positions/slot\_mapping/context\_lens
-  advance across the 16-step faux-prefill and the 30 timed decode steps,
-  so the paged KV progressively fills with real activations.
+  had post-warmup garbage. \emph{Fix:} the real FA3 paged-prefill populates
+  the paged KV with legitimate rope+quant activations before the timed
+  decode window, matching the state vLLM measures under. Metadata
+  continues to advance through the decode window.
 \end{enumerate}
 
-After all three fixes (and the later FP8 KV migration), v3 measures
-20{,}841~tok/s at $N\!=\!128$, a 1.07$\times$ against vLLM~0.19 V1 on
-the same box. Both engines scale to $N\!=\!256$ and $N\!=\!512$; v3 is
-1.11$\times$ and 1.12$\times$ vLLM at those larger batches, respectively.
-The 7--12\% edge is remarkably consistent across the batch ladder,
-confirming it's a genuine structural advantage (fused QKV, cuBLASLt
-autotune, fused epilogues, no Python dispatch) rather than a
-measurement artifact at a single point.
+After all three fixes (and the FP8 KV migration and Phase F real-prefill
+path), v3 measures 22{,}069~tok/s at $N\!=\!128$ (1.14$\times$ vLLM~0.19 V1),
+34{,}364~tok/s at $N\!=\!256$ (1.23$\times$), and 42{,}030~tok/s at
+$N\!=\!512$ (1.16$\times$), on the same box. The 14--23\% edge across the
+batch ladder confirms a genuine structural advantage (fused QKV, cuBLASLt
+autotune, fused epilogues, no Python dispatch, end-to-end FP8 KV),
+rather than a measurement artifact at a single point. TTFT is 63.8\,ms
+at $N\!=\!128$ with the real prefill path (\S\ref{sec:ttft}).
 
 \paragraph{Sources of v3's gain over v2.}
 Four structural changes: (i) fused Q$\|$K$\|$V GEMM (one launch,
@@ -632,6 +642,7 @@ Eager (no graph)                              & 551     & --- \\
 + cuBLASLt + \texttt{EPILOGUE\_BIAS} (QKV)    & 17{,}562 & +10\% \\
 + all 5 linears on cuBLASLt                   & 22{,}496 & +28\% \\
 + FP8 E4M3 KV + final RMSnorm correctness     & 20{,}841 & $-$7\% \\
++ real FA3 paged-prefill (Phase F)            & 22{,}069 & +6\% \\
 \bottomrule
 \end{tabular}
 
@@ -642,7 +653,40 @@ the HBM bandwidth savings). The primary value of FP8 KV is the
 leaves headroom for longer context lengths and --- importantly for
 serving --- fewer KV-allocator evictions under load. At $N\!=\!256$
 and $N\!=\!512$ the per-token number scales up cleanly as GEMMs
-approach HBM saturation (31{,}178 and 40{,}331~tok/s respectively).
+approach HBM saturation (34{,}364 and 42{,}030~tok/s respectively
+with real prefill). Phase F's real prefill also lifted the $N\!=\!128$
+number back above the pre-FP8-KV high because the prefill scratch
+fixes (q\_fp8 and residual sized to \texttt{max\_tokens}) eliminated
+silent buffer truncation that had been hurting decode too.
+
+\subsection{Time-to-first-token (TTFT) with real prefill}
+\label{sec:ttft}
+
+Phase F replaces the 16-step eager faux-prefill with a single
+multi-query causal FP8 attention call via FA3's upstream hdim128 E4M3
+paged instantiations (\texttt{fa3\_sm90\_paged\_prefill\_fp8}, exported
+from the same \texttt{libfa3\_kernels.so} that serves decode). Q, K,
+and V are laid out as \texttt{[total\_q, num\_heads, head\_dim]} indexed
+via a $[N{+}1]$ prefix-sum array \texttt{cu\_seqlens\_q}; a per-seq causal
+mask is applied so query $t$ sees K positions $0\ldots t$ within its own
+sequence. The fused rope+kv-write kernel that precedes attention writes
+FP8 K/V into the paged cache at the slots for \emph{all}
+\texttt{total\_q} tokens in one launch.
+
+\begin{tabular}{lrrr}
+\toprule
+\textbf{N} & \textbf{TTFT, real prefill} & \textbf{TTFT, faux-prefill} & \textbf{Speedup} \\
+\midrule
+128 & 63.8\,ms  & 763\,ms & 12.0$\times$ \\
+256 & 117.7\,ms & 833\,ms &  7.1$\times$ \\
+512 & 131.7\,ms & 855\,ms &  6.5$\times$ \\
+\bottomrule
+\end{tabular}
+
+Measured with \texttt{RVLLM\_PREFILL\_LEN=16} (16 prompt tokens per
+sequence); $t_0$ is taken immediately before prompt ingest, $t_1$ at the
+first sampled token visible in pinned host memory (includes one decode
+step after prefill, the pinned DtoH, and a stream fence).
 
 \subsection{Where the cycles go (v2 baseline reference)}
 
@@ -728,7 +772,7 @@ Python-hosted serving stacks can be written entirely in Rust, with a
 single compute stream per worker, a frozen metadata layout per graph
 bucket, and a kernel catalog in which every variant's workspace and
 schedule are known at engine initialization. The v3 engine achieves
-\textbf{40{,}331~tok/s} at $N\!=\!512$ (1.12$\times$ vLLM 0.19 at the same batch; 1.07--1.12$\times$ consistently across $N\!=\!128/256/512$) serving Qwen2.5-7B in FP8 on a single H100, with
+\textbf{42{,}030~tok/s} at $N\!=\!512$ (1.16$\times$ vLLM 0.19 at the same batch; 1.14--1.23$\times$ consistently across $N\!=\!128/256/512$) and \textbf{63.8\,ms TTFT at $N\!=\!128$} (real FA3 paged-prefill; 12.0$\times$ faster than the 16-step eager faux-prefill stand-in it replaces) serving Qwen2.5-7B in FP8 on a single H100, with
 339~kernel launches per decode step compressed into one
 \texttt{cuGraphLaunch} replay. The archived v2 stack (commit
 \texttt{eb9e247fd}) reached 19{,}287~tok/s at the same batch on the same
@@ -737,9 +781,11 @@ GPU.
 The path to the v3 number was mechanical, not magical: capturing the
 layer loop into a CUDA graph alone moved the engine from 551 tok/s (eager)
 to 14{,}745 tok/s (replayed). Fusing Q/K/V into a single GEMM, loading
-attention biases that v2 had silently omitted, and routing every FP8
-linear through \texttt{cublasLtMatmul} with bias and residual epilogues
-took the engine the rest of the way.
+attention biases that v2 had silently omitted, routing every FP8
+linear through \texttt{cublasLtMatmul} with bias and residual epilogues,
+linking FA3's upstream hdim128 E4M3 paged instantiations for FP8 KV,
+and wiring a real multi-query causal paged-prefill entry point took
+the engine the rest of the way.
 
 The three SM90 / graph-capture failure modes documented in
 Section~\ref{sec:invariants} --- producing either silent correctness bugs

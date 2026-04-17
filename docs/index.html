@@ -138,8 +138,8 @@ footer a:hover{color:#999}
 </header>
 
 <div class="hero">
-  <div class="big">40,331 tok/s</div>
-  <div class="sub">Qwen2.5-7B FP8 on a single H100 SXM 80GB. N=512, greedy, CUDA graph captured, FP8 E4M3 KV cache, full decode + final RMSnorm + LM head + argmax. <strong>+11.7% vs vLLM 0.19 at the same batch on the same box.</strong> Consistently 7&ndash;12% faster than vLLM across N=128 / 256 / 512. Detail below.</div>
+  <div class="big">42,030 tok/s</div>
+  <div class="sub">Qwen2.5-7B FP8 on a single H100 SXM 80GB. N=512, greedy, CUDA graph captured, FP8 E4M3 KV cache, real FA3 paged-prefill, full decode + final RMSnorm + LM head + argmax. <strong>+16.4% vs vLLM 0.19 at the same batch on the same box.</strong> Consistently 14&ndash;23% faster than vLLM across N=128 / 256 / 512. TTFT 63.8 ms at N=128. Detail below.</div>
   <div class="hero-graphic">
     <div class="hero-graphic-title">Throughput by Batch Size</div>
     <div class="hero-graphic-sub">Same GPU, same model, same FP8 path. Greedy decode, 512 output tokens, CUDA graphs on.</div>
@@ -157,42 +157,42 @@ footer a:hover{color:#999}
               <div class="hero-static-label"><strong>N=512 v3</strong></div>
               <div class="hero-static-bars">
                 <div class="hero-static-track"><div class="hero-static-fill" style="width:100%;background:#84E6B7"></div></div>
-                <div class="hero-static-meta"><span class="hero-static-series"><i style="background:#84E6B7"></i><strong>40,331 tok/s</strong></span></div>
+                <div class="hero-static-meta"><span class="hero-static-series"><i style="background:#84E6B7"></i><strong>42,030 tok/s</strong></span></div>
               </div>
             </div>
             <div class="hero-static-row">
               <div class="hero-static-label">N=512 vLLM</div>
               <div class="hero-static-bars">
-                <div class="hero-static-track"><div class="hero-static-fill" style="width:89.5%;background:#5a8bd4"></div></div>
-                <div class="hero-static-meta"><span class="hero-static-series"><i style="background:#5a8bd4"></i>36,097 tok/s &nbsp; v3 +11.7%</span></div>
+                <div class="hero-static-track"><div class="hero-static-fill" style="width:85.9%;background:#5a8bd4"></div></div>
+                <div class="hero-static-meta"><span class="hero-static-series"><i style="background:#5a8bd4"></i>36,097 tok/s &nbsp; v3 +16.4%</span></div>
               </div>
             </div>
             <div class="hero-static-row">
               <div class="hero-static-label"><strong>N=256 v3</strong></div>
               <div class="hero-static-bars">
-                <div class="hero-static-track"><div class="hero-static-fill" style="width:77.3%;background:#84E6B7"></div></div>
-                <div class="hero-static-meta"><span class="hero-static-series"><i style="background:#84E6B7"></i><strong>31,178 tok/s</strong></span></div>
+                <div class="hero-static-track"><div class="hero-static-fill" style="width:81.8%;background:#84E6B7"></div></div>
+                <div class="hero-static-meta"><span class="hero-static-series"><i style="background:#84E6B7"></i><strong>34,364 tok/s</strong></span></div>
               </div>
             </div>
             <div class="hero-static-row">
               <div class="hero-static-label">N=256 vLLM</div>
               <div class="hero-static-bars">
-                <div class="hero-static-track"><div class="hero-static-fill" style="width:69.4%;background:#5a8bd4"></div></div>
-                <div class="hero-static-meta"><span class="hero-static-series"><i style="background:#5a8bd4"></i>27,996 tok/s &nbsp; v3 +11.4%</span></div>
+                <div class="hero-static-track"><div class="hero-static-fill" style="width:66.6%;background:#5a8bd4"></div></div>
+                <div class="hero-static-meta"><span class="hero-static-series"><i style="background:#5a8bd4"></i>27,996 tok/s &nbsp; v3 +22.8%</span></div>
               </div>
             </div>
             <div class="hero-static-row">
               <div class="hero-static-label"><strong>N=128 v3</strong></div>
               <div class="hero-static-bars">
-                <div class="hero-static-track"><div class="hero-static-fill" style="width:51.7%;background:#84E6B7"></div></div>
-                <div class="hero-static-meta"><span class="hero-static-series"><i style="background:#84E6B7"></i><strong>20,841 tok/s</strong></span></div>
+                <div class="hero-static-track"><div class="hero-static-fill" style="width:52.5%;background:#84E6B7"></div></div>
+                <div class="hero-static-meta"><span class="hero-static-series"><i style="background:#84E6B7"></i><strong>22,069 tok/s</strong></span></div>
               </div>
             </div>
             <div class="hero-static-row">
               <div class="hero-static-label">N=128 vLLM</div>
               <div class="hero-static-bars">
-                <div class="hero-static-track"><div class="hero-static-fill" style="width:48.1%;background:#5a8bd4"></div></div>
-                <div class="hero-static-meta"><span class="hero-static-series"><i style="background:#5a8bd4"></i>19,399 tok/s &nbsp; v3 +7.4%</span></div>
+                <div class="hero-static-track"><div class="hero-static-fill" style="width:46.2%;background:#5a8bd4"></div></div>
+                <div class="hero-static-meta"><span class="hero-static-series"><i style="background:#5a8bd4"></i>19,399 tok/s &nbsp; v3 +13.8%</span></div>
               </div>
             </div>
           </div>
@@ -253,12 +253,12 @@ Kernels                  CUTLASS 3.x SM90 FP8 GEMM
 
 <h3>The three original caveats &mdash; and how v3's bench now addresses each</h3>
 <ol>
-<li><strong>vLLM does real prefill</strong> (16 input tokens &times; 128 prompts = 2,048 tokens of real prompt processing before decode starts). Our bench skips prefill entirely. However, vLLM's <code>Avg generation throughput</code> metric is measured only during the decode phase, so this is mostly accounted for. <em>Fix:</em> v3's bench now runs 16 eager decode steps before the timed window to populate KV pages with real forward-pass activations &mdash; a faux-prefill that matches the KV state vLLM has at the start of its decode measurement.</li>
+<li><strong>vLLM does real prefill</strong> (16 input tokens &times; 128 prompts = 2,048 tokens of real prompt processing before decode starts). <em>Fix:</em> v3 now does real prefill too under <code>RVLLM_REAL_PREFILL=1</code> &mdash; one multi-query causal FP8 attention call via FA3 paged-prefill over the concatenated prompt (<code>total_q = N &times; prompt_len</code>) with varlen <code>cu_seqlens_q</code>. Both engines' <code>Avg generation throughput</code> is measured during the decode phase, under identical KV-populated state.</li>
 <li><strong>vLLM runs its scheduler every step.</strong> Even at steady-state batch=128, it checks for request state, completions, block table management. Our graph was frozen. <em>Fix:</em> v3's bench now re-uploads <code>positions</code>, <code>slot_mapping</code>, and <code>context_lens</code> every iteration inside the timed loop, so v3 pays the same per-step HtoD cost that vLLM's scheduler pays for metadata management.</li>
-<li><strong>vLLM's KV cache has real content from real prompts.</strong> Ours had post-warmup garbage. <em>Fix:</em> v3's bench now advances positions/slot_mapping/context_lens across the 16-step faux-prefill + 30-step decode, so the paged KV fills up step by step with real activations.</li>
+<li><strong>vLLM's KV cache has real content from real prompts.</strong> Ours had post-warmup garbage. <em>Fix:</em> v3's bench now runs the real FA3 paged-prefill before the timed window, so paged KV is populated with legitimate rope+quant activations &mdash; matching what vLLM measures under.</li>
 </ol>
 <p>
-  <strong>Net impact of all three fairness fixes at matched N=128: &minus;0.3% (22,559 &rarr; 22,496 originally; today with FP8 KV that N=128 number is 20,841).</strong> The per-step metadata upload and faux-prefill are cheap against the 28-layer forward + LM head compute, so the +7.4% edge at matched batch &mdash; and the 60%+ edge at N=256/512 that vLLM cannot run &mdash; are genuine improvements, not measurement tricks.
+  <strong>Net impact of all three fairness fixes: &minus;0.3% at N=128; final v3 throughput with real prefill is 22,069 / 34,364 / 42,030 tok/s at N=128/256/512.</strong> The per-step metadata upload is cheap against the 28-layer forward + LM head compute, so the +13.8% edge at N=128 &mdash; and the +16.4% / +22.8% edges at N=256/512 &mdash; are genuine improvements, not measurement tricks.
 </p>
 <p>
   Also different but unchanged by these fixes: vLLM uses FlashInfer for attention; v3 uses FlashAttention-3 built from source. vLLM's FP8 path is its own; v3 quantizes weights at load time to FP8 E4M3 with a clamp-ppm gate and routes every linear through <code>cublasLtMatmul</code> with fused bias / residual epilogues.
@@ -266,10 +266,31 @@ Kernels                  CUTLASS 3.x SM90 FP8 GEMM
 
 <h3>What this comparison tells you</h3>
 <p>
-  <strong>At the decode kernel level, v3 is faster.</strong> 16% faster steady-state tokens per second on the same GPU, same model, same quantization, both with CUDA graphs. That delta comes from four structural choices (fused QKV, cuBLASLt for every linear, fused epilogues, no Python dispatch).
+  <strong>At the decode kernel level, v3 is faster.</strong> 14&ndash;23% faster steady-state tokens per second on the same GPU, same model, same quantization, both with CUDA graphs. That delta comes from four structural choices (fused QKV, cuBLASLt for every linear, fused epilogues, no Python dispatch).
 </p>
 <p>
-  <strong>In a full serving scenario, the gap would narrow.</strong> v3 would need to implement continuous batching, prefill, and scheduling to be tested under realistic load. Some of the 16% advantage would pay for scheduler and prefill overhead that v3 currently dodges. The comparison is legitimate for kernel-throughput, not yet for end-to-end serving.
+  <strong>In a full serving scenario, the gap would narrow.</strong> v3 now runs real prefill but continuous batching and a full scheduler are still future work. Some of the 14&ndash;23% advantage would pay for that scheduler overhead. The comparison is legitimate for kernel-throughput and prompt-ingest, not yet for end-to-end multi-request serving.
+</p>
+</section>
+
+<section>
+<h2>Time-to-first-token (TTFT)</h2>
+<p class="section-sub">Phase F: real FA3 paged-prefill replaces the 16-step eager faux-prefill stand-in</p>
+<p>
+  <code>RVLLM_REAL_PREFILL=1</code> runs one multi-query causal FP8 attention call over the concatenated prompt via varlen <code>cu_seqlens_q</code>. The same FA3 <code>.so</code> that handles decode exports a second entry point (<code>fa3_sm90_paged_prefill_fp8</code>) linked from upstream's hdim128 E4M3 paged kernels. Causal mask applied per-sequence; K and V are written once into the paged cache during the fused rope+kv-write kernel that precedes attention.
+</p>
+<div class="tbl">
+<table>
+<thead><tr><th>N</th><th class="r">TTFT (real prefill)</th><th class="r">TTFT (faux-prefill)</th><th class="r">Speedup</th></tr></thead>
+<tbody>
+<tr><td>128</td><td class="r"><strong>63.8 ms</strong></td><td class="r">763 ms</td><td class="r"><strong>12.0&times;</strong></td></tr>
+<tr><td>256</td><td class="r"><strong>117.7 ms</strong></td><td class="r">833 ms</td><td class="r"><strong>7.1&times;</strong></td></tr>
+<tr><td>512</td><td class="r"><strong>131.7 ms</strong></td><td class="r">855 ms</td><td class="r"><strong>6.5&times;</strong></td></tr>
+</tbody>
+</table>
+</div>
+<p>
+  Measured with <code>RVLLM_PREFILL_LEN=16</code> (16 prompt tokens per sequence). <code>t<sub>0</sub></code> is taken right before prompt ingest; <code>t<sub>1</sub></code> is the first sampled token visible in pinned host memory. Includes one decode step after prefill, the pinned-memory DtoH, and a stream fence.
 </p>
 </section>
 
@@ -317,7 +338,7 @@ Kernels                  CUTLASS 3.x SM90 FP8 GEMM
 <tr><td><code>fused_add_rmsnorm_fp8_quant</code></td><td>residual add + RMSNorm + per-token FP8 quantize</td><td class="r">3 &rarr; 1</td></tr>
 <tr><td><code>fused_rmsnorm_fp8_quant</code></td><td>RMSNorm + per-token FP8 quantize</td><td class="r">2 &rarr; 1</td></tr>
 <tr><td><code>quantize_fp8_per_token</code></td><td>post-attention activation &rarr; FP8 + scale</td><td class="r">1 &rarr; 1</td></tr>
-<tr><td><code>fused_rope_kv_write</code></td><td>RoPE + KV-cache paged write</td><td class="r">3 &rarr; 1</td></tr>
+<tr><td><code>fused_rope_cache_fp8kv</code></td><td>RoPE + FP8 Q quantize + FP8 KV-cache paged write</td><td class="r">4 &rarr; 1</td></tr>
 <tr><td><code>fused_silu_mul_fp8_quant</code></td><td>SiLU + element-wise mul + FP8 quantize</td><td class="r">3 &rarr; 1</td></tr>
 <tr><td><code>argmax</code></td><td>f32 logits &rarr; i32 token</td><td class="r">1 &rarr; 1</td></tr>
 <tr><td><code>residual_add_f16</code></td><td>x + y in place (not fused with GEMM)</td><td class="r">1 &rarr; 1</td></tr>
@@ -333,7 +354,7 @@ Kernels                  CUTLASS 3.x SM90 FP8 GEMM
   for layer in 0..28:                          12 launches / layer
     fused_add_rmsnorm_fp8_quant                attn norm + FP8 quant
     cublasLtMatmul(FP8, EPILOGUE_BIAS)          QKV (packed, N=4608) + bias
-    fused_rope_cache_f16tbl                    rope in place + KV paged write
+    fused_rope_cache_fp8kv                     rope + FP8 Q quant + FP8 KV paged write
     fa3_sm90_paged_decode                      attention
     quantize_fp8_per_token                     post-attn -> FP8 + scale
     cublasLtMatmul(FP8, beta=1 residual)        O proj + residual add
@@ -386,7 +407,7 @@ Kernels                  CUTLASS 3.x SM90 FP8 GEMM
 </section>
 
 <section>
-<h2>v3 path to 40,331 tok/s</h2>
+<h2>v3 path to 42,030 tok/s</h2>
 <p class="section-sub">Step-by-step progression; numbers quoted at the fair-bench config at each stage's best batch.</p>
 <div class="tbl">
 <table>
@@ -400,11 +421,12 @@ Kernels                  CUTLASS 3.x SM90 FP8 GEMM
 <tr><td>+ all 5 linears on cuBLASLt</td><td class="r">22,496</td><td class="r">128</td><td class="r">+28%</td></tr>
 <tr><td>+ FP8 KV cache + final RMSnorm correctness</td><td class="r">20,841</td><td class="r">128</td><td class="r">&minus;7% at matched N, but&hellip;</td></tr>
 <tr><td>&hellip;FP8 KV memory halving unlocks N=256</td><td class="r">31,178</td><td class="r">256</td><td class="r"><strong>+50%</strong></td></tr>
-<tr><td><strong>&hellip;and N=512</strong></td><td class="r"><strong>40,331</strong></td><td class="r"><strong>512</strong></td><td class="r"><strong>+29%</strong></td></tr>
+<tr><td>&hellip;and N=512</td><td class="r">40,331</td><td class="r">512</td><td class="r">+29%</td></tr>
+<tr><td><strong>+ real FA3 paged-prefill (Phase F)</strong></td><td class="r"><strong>42,030</strong></td><td class="r"><strong>512</strong></td><td class="r"><strong>+4% &amp; TTFT 12&times;</strong></td></tr>
 </tbody>
 </table>
 </div>
-<p>The cuBLASLt move was the dominant per-token win. FP8 KV is the capacity unlock: at matched N=128 it's a small regression (&minus;0.5% to &minus;7% depending on context length) because FA3's dequant overhead eats the bandwidth savings, but the 2&times; KV-memory reduction enables N=256 and N=512, where GEMMs saturate HBM and absolute throughput doubles.</p>
+<p>The cuBLASLt move was the dominant per-token win. FP8 KV is the capacity unlock: the 2&times; KV-memory reduction enabled N=256 and N=512, where GEMMs saturate HBM and absolute throughput doubles. Real FA3 prefill (Phase F) is the TTFT win &mdash; one multi-query causal FP8 attention call replaces a 16-step eager stand-in and drops N=128 TTFT from 763 ms to 63.8 ms. The Phase F scratch-buffer fixes also lifted steady-state throughput at every batch (+6% at N=128, +10% at N=256, +4% at N=512) because the prior sizing silently truncated prefill activations.</p>
 
 <h3 style="margin-top:1.5rem">v2 archive (April 16 2026)</h3>
 <p class="section-sub">rvllm-v2 at commit <code>eb9e247fd</code> hit 19,287 tok/s after a one-day recovery pass:</p>

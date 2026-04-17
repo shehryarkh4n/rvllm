@@ -1,18 +1,18 @@
 # rvLLM
 
-A single-GPU, FP8, graph-captured LLM inference engine in Rust. Qwen2.5-7B on a single H100 SXM 80GB delivers **40,331 tok/s at N=512** (FP8 E4M3 KV cache, decode + final RMSnorm + LM head + argmax, CUDA graph captured). Consistently **7–12% faster than vLLM 0.19** across every batch size we tested (N=128, 256, 512) on the same GPU with the same model and quant config.
+A single-GPU, FP8, graph-captured LLM inference engine in Rust. Qwen2.5-7B on a single H100 SXM 80GB delivers **42,030 tok/s at N=512** (FP8 E4M3 KV cache, real FA3 paged-prefill, decode + final RMSnorm + LM head + argmax, CUDA graph captured) and **63.8 ms TTFT at N=128** (16-token prompt). Consistently **14–23% faster than vLLM 0.19** across every batch size we tested (N=128, 256, 512) on the same GPU with the same model and quant config.
 
 No Python in the hot path. No fallbacks. Missing artifacts (policy, FA3 `.so`, kernel SHA) refuse to start.
 
 ## Headline: v3 vs vLLM 0.19 on the same H100
 
-Same GPU, same Qwen2.5-7B-Instruct checkpoint, same FP8 E4M3, CUDA graphs on, full decode. Both measurements taken from each engine's own steady-state decode throughput metric.
+Same GPU, same Qwen2.5-7B-Instruct checkpoint, same FP8 E4M3, CUDA graphs on, full decode after real prefill. Both measurements taken from each engine's own steady-state decode throughput metric.
 
 | Batch | vLLM 0.19 V1 | rvllm-v3 | v3 Δ |
 |---:|---:|---:|---:|
-| 128 | 19,399 | 20,841 | **+7.4%** |
-| 256 | 27,996 | 31,178 | **+11.4%** |
-| **512** | 36,097 | **40,331** | **+11.7%** |
+| 128 | 19,399 | 22,069 | **+13.8%** |
+| 256 | 27,996 | 34,364 | **+22.8%** |
+| **512** | 36,097 | **42,030** | **+16.4%** |
 
 vLLM numbers are the `Avg generation throughput` engine log line (steady-state decode, prefill excluded), via `vllm bench latency --model Qwen2.5-7B --quantization fp8 --batch-size <N> --input-len 16 --output-len 512 --num-iters 3 --num-iters-warmup 1 --dtype float16`. vLLM also runs fine at N=256/512 on this box — prior readme claims that it couldn't were our mistake.
 
@@ -24,17 +24,17 @@ Decode-kernel throughput under steady-state; same model weights, same FP8 quant 
 2. **vLLM runs its scheduler every step.** Even at steady-state batch=128, it checks for request state, completions, block table management. v3's bench re-uploads `positions`, `slot_mapping`, and `context_lens` every iteration inside the timed loop (not once before capture), so v3 pays the same per-step HtoD cost that vLLM's scheduler pays for metadata management.
 3. **vLLM's KV cache has real content from real prompts.** Ours previously had post-warmup garbage. v3's bench now runs real FA3 paged-prefill before the timed window, so paged KV is populated with legitimate rope+quant activations (matching the condition vLLM measures under). Metadata (`positions`, `slot_mapping`, `context_lens`) continues to advance across the decode window.
 
-Net impact of the three fairness fixes on the N=128 number: −0.3%. The per-step metadata upload is cheap against the 28-layer forward + LM head compute, so the +7.4% edge at N=128 — and the much larger capacity-unlock edge at N=256/512 — are genuine.
+Net impact of the three fairness fixes on the N=128 number: −0.3%. The per-step metadata upload is cheap against the 28-layer forward + LM head compute, so the +13.8% edge at N=128 — and the much larger capacity-unlock edge at N=256/512 — are genuine.
 
-## v3 throughput by batch size (FP8 KV, ITERS=512)
+## v3 throughput by batch size (FP8 KV, real FA3 prefill)
 
-H100 SXM 80GB, Qwen2.5-7B-Instruct, FP8 E4M3 weights + FP8 E4M3 KV, graph-captured, full decode + final RMSnorm + LM head + argmax, metadata re-upload per step, real FA3 paged-prefill warmup, 5 warmup iters:
+H100 SXM 80GB, Qwen2.5-7B-Instruct, FP8 E4M3 weights + FP8 E4M3 KV, graph-captured, full decode + final RMSnorm + LM head + argmax, metadata re-upload per step, real FA3 paged-prefill, 3 warmup iters:
 
 | N | tok/s | ms/step | vLLM same N | v3 Δ |
 |---:|---:|---:|---:|---:|
-| 128 | 20,841 | 6.14 | 19,399 | +7.4% |
-| 256 | 31,178 | 8.21 | 27,996 | +11.4% |
-| **512** | **40,331** | **12.70** | 36,097 | **+11.7%** |
+| 128 | 22,069 | 5.80 | 19,399 | +13.8% |
+| 256 | 34,364 | 7.45 | 27,996 | +22.8% |
+| **512** | **42,030** | **12.18** | 36,097 | **+16.4%** |
 
 ## Time-to-first-token (TTFT)
 
@@ -75,7 +75,7 @@ Measured with `RVLLM_PREFILL_LEN=16` (16 prompt tokens/seq). `t₀ = right befor
 │  layer_exec::forward         12 launches per Llama decoder layer  │
 │                                fused_add_rmsnorm_fp8_quant        │
 │                                cublasLt FP8 GEMM + bias (QKV)     │
-│                                fused_rope_cache_f16tbl            │
+│                                fused_rope_cache_fp8kv             │
 │                                FA3 paged_decode                   │
 │                                quantize_fp8_per_token             │
 │                                cublasLt FP8 GEMM + residual (O)   │
@@ -125,7 +125,7 @@ WGMMA + TMA, built from FlashAttention-3 Hopper source. Paged KV layout `[2, num
 | `fused_add_rmsnorm_fp8_quant` | hidden, residual, gamma | residual', fp8_act, scale | 3 → 1 |
 | `fused_rmsnorm_fp8_quant` | hidden, gamma | fp8_act, scale | 2 → 1 |
 | `quantize_fp8_per_token` | f16 act | fp8 + scale | 1 |
-| `fused_rope_kv_write` | qkv, cos, sin, slot_mapping | q_out, writes K/V into cache | 3 → 1 |
+| `fused_rope_cache_fp8kv` | q/k/v f16, cos, sin, slot_mapping | q_fp8 out + writes FP8 K/V into paged cache | 4 → 1 |
 | `fused_silu_mul_fp8_quant` | gate_up f16 | fp8_act + scale | 3 → 1 |
 | `argmax` | f32 logits | i32 token | 1 |
 | `residual_add_f16` | x, y | x + y | 1 |
@@ -142,7 +142,7 @@ step_launch:
      For each layer in 0..28:
        fused_add_rmsnorm_fp8_quant             — attn norm + quantize
        cublasLtMatmul(FP8 + BIAS epilogue)     — QKV (one shot, packed)
-       fused_rope_cache_f16tbl_kernel          — rope in place + KV write
+       fused_rope_cache_fp8kv_kernel           — rope + FP8 Q quant + FP8 KV paged write
        fa3_sm90_paged_decode                   — attention
        quantize_fp8_per_token_kernel           — quantize attn_out
        cublasLtMatmul(FP8, beta=1 residual)    — O proj + residual add
@@ -170,21 +170,25 @@ Explicit rules. Violations fail the build or startup, never degrade silently.
 4. **CUTLASS schedule/epilogue pairing.** Mainloop and epilogue schedules must match. Mismatched variants cause `CUDA_ERROR_ILLEGAL_ADDRESS` only inside graph replay. Enforced in v3 as a CUDA `static_assert`; in v2, dispatch pins to a hand-verified variant (`v1`).
 5. **No `unwrap()` in libraries.** `Result<T, RvllmError>` end-to-end. Errors carry structured context (stream, kernel name, launch config) — not stringified `DriverError`.
 
-## v3 path to 22,496 tok/s
+## v3 path to 42,030 tok/s
 
-Session progression on H100 SXM 80GB, Qwen2.5-7B, FP8 E4M3, N=128:
+Session progression on H100 SXM 80GB, Qwen2.5-7B, FP8 E4M3:
 
-| step | tok/s | Δ | what changed |
-|---|---:|---:|---|
-| eager decode, LM head in | 551 | — | no graph capture, bench harness first light |
-| + graph capture | 14,745 | 27× | capture one step, replay iters-many |
-| + f16 RoPE tables | 15,537 | +5% | removed f32 cos/sin from hot path |
-| + QKV/bias correctness | 15,985 | +3% | load q/k/v biases, apply post-GEMM |
-| + fused QKV GEMM | 15,985* | — | 3 GEMMs → 1 (Q‖K‖V packed, N=4608) |
-| + **cuBLASLt FP8 + BIAS epilogue (QKV)** | **17,562** | **+10%** | one matmul replaces GEMM + add_bias kernel |
-| + all 5 linears on cuBLASLt | **22,496** | **+28%** | O/gate_up/down/lm_head also cuBLASLt-autotuned |
+| step | tok/s | N | Δ | what changed |
+|---|---:|---:|---:|---|
+| eager decode, LM head in | 551 | 128 | — | no graph capture, bench harness first light |
+| + graph capture | 14,745 | 128 | 27× | capture one step, replay iters-many |
+| + f16 RoPE tables | 15,537 | 128 | +5% | removed f32 cos/sin from hot path |
+| + QKV/bias correctness | 15,985 | 128 | +3% | load q/k/v biases, apply post-GEMM |
+| + fused QKV GEMM | 15,985* | 128 | — | 3 GEMMs → 1 (Q‖K‖V packed, N=4608) |
+| + cuBLASLt FP8 + BIAS epilogue (QKV) | 17,562 | 128 | +10% | one matmul replaces GEMM + add_bias kernel |
+| + all 5 linears on cuBLASLt | 22,496 | 128 | +28% | O/gate_up/down/lm_head also cuBLASLt-autotuned |
+| + FP8 E4M3 KV + final RMSnorm | 20,841 | 128 | −7% at N=128 | FA3 dequant overhead, but halves KV memory |
+| …unlocks N=256 | 31,178 | 256 | +50% | 2× KV-memory reduction, GEMMs near HBM saturation |
+| …and N=512 | 40,331 | 512 | +29% | full HBM saturation regime |
+| + **real FA3 paged-prefill (Phase F)** | **22,069 / 34,364 / 42,030** | 128/256/512 | **+6–10%** | scratch sizing corrected; TTFT drops 6–12× vs faux-prefill |
 
-The cuBLASLt move is the dominant win. Its per-shape heuristic explores many more algorithms than the 40-variant CUTLASS cache, and fusing bias + residual into the GEMM epilogue removes an extra kernel per layer.
+The cuBLASLt move was the dominant per-token win. FP8 KV was the capacity unlock. Real FA3 prefill (Phase F) is the TTFT win: one multi-query causal FP8 attention call replaces a 16-step eager stand-in, dropping N=128 TTFT from 763 ms to 63.8 ms — and along the way the Phase F scratch-buffer fixes also lifted steady-state throughput at every batch size.
 
 ## Reproduce (v3)
 
