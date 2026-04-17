@@ -27,17 +27,22 @@ pub struct EnginePaths {
 }
 
 /// Assembled subsystems.
+///
+/// Field order matters for Drop: CUDA resources (modules, .so handles,
+/// memory) must drop BEFORE the context. Rust drops fields in source
+/// order, so everything that touches CUDA comes first and the context
+/// is last.
 pub struct Bringup {
-    pub ctx: Arc<CudaContextHandle>,
-    pub arena: HbmArena<'static>,
-    pub stream: Stream,
+    pub fused_modules: FusedModules,
+    pub fa3: Fa3Kernels,
+    pub cutlass: CutlassLib,
+    pub policy: Policy,
     pub arch: ModelArch,
     pub model: LoadedModel,
     pub kernels: Arc<KernelLoader>,
-    pub cutlass: CutlassLib,
-    pub fa3: Fa3Kernels,
-    pub policy: Policy,
-    pub fused_modules: FusedModules,
+    pub stream: Stream,
+    pub arena: HbmArena<'static>,
+    pub ctx: Arc<CudaContextHandle>,
 }
 
 /// Loaded CUDA modules + resolved kernel handles. One PTX file per
