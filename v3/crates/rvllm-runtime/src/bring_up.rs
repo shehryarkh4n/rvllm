@@ -317,7 +317,7 @@ impl Bringup {
         let cutlass_ws = arena.region("cutlass_ws", cutlass_ws_bytes, 256)?;
         let fa3_ws = arena.region("fa3_ws", 64 * 1024 * 1024, 256)?;
 
-        let residual = arena.region("residual", (num_seqs * hidden * 2) as usize, 16)?;
+        let residual = arena.region("residual", (max_tokens * hidden * 2) as usize, 16)?;
 
         // Metadata: populate with valid decode-step values so FA3 walks
         // real KV pages instead of reading garbage.
