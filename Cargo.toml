@@ -29,9 +29,7 @@ members = [
     "crates/rvllm-zig",
     "crates/rvllm-autotune",
     "crates/rvllm-v2",
-    "crates/rvllm-v3",
 ]
-
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
@@ -43,7 +41,6 @@ authors = ["m0at"]
 readme = "README.md"
 keywords = ["llm", "inference", "vllm", "gpu", "transformer"]
 categories = ["science", "concurrency", "hardware-support"]
-
 [workspace.dependencies]
 # Internal crates
 rvllm-core = { version = "0.1.0", path = "crates/rvllm-core" }
@@ -71,7 +68,6 @@ rvllm-fusion = { version = "0.1.0", path = "crates/rvllm-fusion" }
 rvllm-zig = { version = "0.1.0", path = "crates/rvllm-zig" }
 rvllm-autotune = { version = "0.1.0", path = "crates/rvllm-autotune" }
 rvllm-v2 = { version = "0.1.0", path = "crates/rvllm-v2" }
-rvllm-v3 = { version = "0.1.0", path = "crates/rvllm-v3" }
 # External dependencies
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
