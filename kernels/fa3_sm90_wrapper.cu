@@ -14,15 +14,23 @@
 #include "tile_size.h"
 
 // Forward declarations of the instantiated templates we link against.
-// Paged, non-split, PackGQA=true (matches vLLM decode path)
+// Paged, non-split, PackGQA=true (matches vLLM decode path), fp16
 template<> void run_mha_fwd_<90, cutlass::half_t, 128, 128, false, true, false, true>(
     Flash_fwd_params &params, cudaStream_t stream);
 
-// Paged, split, PackGQA=true (for low-batch high-seqlen)
+// Paged, split, PackGQA=true (for low-batch high-seqlen), fp16
 template<> void run_mha_fwd_<90, cutlass::half_t, 128, 128, true, true, false, true>(
     Flash_fwd_params &params, cudaStream_t stream);
 
-// Combine kernel for split-KV
+// Paged, non-split, PackGQA=true, e4m3 (FP8 KV)
+template<> void run_mha_fwd_<90, cutlass::float_e4m3_t, 128, 128, false, true, false, true>(
+    Flash_fwd_params &params, cudaStream_t stream);
+
+// Paged, split, PackGQA=true, e4m3 (FP8 KV)
+template<> void run_mha_fwd_<90, cutlass::float_e4m3_t, 128, 128, true, true, false, true>(
+    Flash_fwd_params &params, cudaStream_t stream);
+
+// Combine kernel for split-KV (reduction is fp16 O regardless of Q/K/V dtype)
 template<> void run_mha_fwd_combine_<cutlass::half_t, float, 128>(
     Flash_fwd_params &params, cudaStream_t stream, bool enable_pdl);
 
@@ -37,11 +45,7 @@ static constexpr int kBlockN = 128;
 // Round up helper
 static inline int round_multiple(int x, int m) { return (x + m - 1) / m * m; }
 
-extern "C" {
-
-// Returns minimum workspace size in bytes for fa3_sm90_paged_decode.
-// Caller allocates this on device and passes to the decode function.
-int fa3_sm90_workspace_size(
+extern "C" int fa3_sm90_workspace_size(
     int batch_size,
     int num_heads,
     int max_num_splits  // pass 128 for safety
@@ -68,33 +72,30 @@ int fa3_sm90_workspace_size(
     return metadata_bytes + lse_bytes + oaccum_bytes + lseaccum_bytes;
 }
 
-// Main decode attention function using FA3 SM90 paged KV.
-//
-// Q:            [batch, num_heads, head_dim] fp16
-// K cache:      [num_blocks, block_size, num_kv_heads, head_dim] fp16
-// V cache:      [num_blocks, block_size, num_kv_heads, head_dim] fp16
-// O:            [batch, num_heads, head_dim] fp16
-// block_tables: [batch, max_blocks_per_seq] int32
-// context_lens: [batch] int32 (actual KV length per sequence)
-// workspace:    device buffer >= fa3_sm90_workspace_size() bytes
-//
-// Returns 0 on success, non-zero on error.
-int fa3_sm90_paged_decode(
-    void* q_ptr,            // [batch, num_heads, head_dim] fp16
-    void* k_cache_ptr,      // [num_blocks, block_size, num_kv_heads, head_dim] fp16
-    void* v_cache_ptr,      // [num_blocks, block_size, num_kv_heads, head_dim] fp16
-    void* o_ptr,            // [batch, num_heads, head_dim] fp16
-    int*  block_tables_ptr, // [batch, max_blocks_per_seq] int32
-    int*  context_lens_ptr, // [batch] int32
-    void* workspace_ptr,    // device workspace
+// Internal dispatcher: both fp16 KV and fp8 (e4m3) KV paths share param setup.
+// Caller sets is_fp8=false for the original path and is_fp8=true for FP8 KV.
+// When is_fp8=true, q_descale_ptr / k_descale_ptr / v_descale_ptr point at
+// per-tensor f32 scale scalars on the device (strides zeroed for broadcast).
+static int fa3_sm90_paged_decode_impl(
+    void* q_ptr,
+    void* k_cache_ptr,
+    void* v_cache_ptr,
+    void* o_ptr,
+    int*  block_tables_ptr,
+    int*  context_lens_ptr,
+    void* workspace_ptr,
     float scale,
     int   batch_size,
     int   num_heads,
     int   num_kv_heads,
     int   head_dim,
-    int   block_size,       // page size (tokens per block)
+    int   block_size,
     int   max_blocks_per_seq,
-    int   num_blocks_total,  // total physical blocks in KV cache
+    int   num_blocks_total,
+    bool  is_fp8,
+    float* q_descale_ptr,
+    float* k_descale_ptr,
+    float* v_descale_ptr,
     cudaStream_t stream
 ) {
     if (head_dim != 128) {
@@ -131,7 +132,17 @@ int fa3_sm90_paged_decode(
 
     params.is_bf16 = false;
     params.is_fp32 = false;
-    params.is_e4m3 = false;
+    params.is_e4m3 = is_fp8;
+    // Per-tensor FP8 descale: scalar broadcast (strides all zero).
+    params.q_descale_ptr = is_fp8 ? q_descale_ptr : nullptr;
+    params.k_descale_ptr = is_fp8 ? k_descale_ptr : nullptr;
+    params.v_descale_ptr = is_fp8 ? v_descale_ptr : nullptr;
+    params.q_descale_batch_stride = 0;
+    params.q_descale_head_stride  = 0;
+    params.k_descale_batch_stride = 0;
+    params.k_descale_head_stride  = 0;
+    params.v_descale_batch_stride = 0;
+    params.v_descale_head_stride  = 0;
 
     // Q: [batch, num_heads, head_dim] treated as [batch, 1, num_heads, head_dim]
     params.q_ptr = q_ptr;
@@ -238,7 +249,8 @@ int fa3_sm90_paged_decode(
     int num_m_blocks = (1 * qhead_per_khead + kBlockM - 1) / kBlockM;  // seqlen_q=1
     int num_n_blocks = (params.seqlen_k + kBlockN - 1) / kBlockN;
     int total_mblocks = batch_size * num_kv_heads * num_m_blocks;
-    int size_one_kv_head = params.seqlen_k * head_dim * 2 * 2;  // K+V, 2 bytes per element
+    int kv_bytes_per_elem = is_fp8 ? 1 : 2;
+    int size_one_kv_head = params.seqlen_k * head_dim * 2 * kv_bytes_per_elem;  // K+V
     int ns = num_splits_heuristic(total_mblocks, num_sm, num_n_blocks,
                                   num_m_blocks, size_one_kv_head,
                                   false /*is_causal_or_local*/, 128);
@@ -286,16 +298,88 @@ int fa3_sm90_paged_decode(
 
     params.rng_state = nullptr;
 
-    // Launch the kernel
-    if (use_split) {
-        run_mha_fwd_<90, cutlass::half_t, 128, 128, true, true, false, true>(params, stream);
-        // Combine split outputs
-        run_mha_fwd_combine_<cutlass::half_t, float, 128>(params, stream, false);
+    // Launch the kernel. FP8 and FP16 KV use different template instantiations;
+    // the combine kernel is fp16-output only, reused by both.
+    if (is_fp8) {
+        if (use_split) {
+            run_mha_fwd_<90, cutlass::float_e4m3_t, 128, 128, true, true, false, true>(params, stream);
+            run_mha_fwd_combine_<cutlass::half_t, float, 128>(params, stream, false);
+        } else {
+            run_mha_fwd_<90, cutlass::float_e4m3_t, 128, 128, false, true, false, true>(params, stream);
+        }
     } else {
-        run_mha_fwd_<90, cutlass::half_t, 128, 128, false, true, false, true>(params, stream);
+        if (use_split) {
+            run_mha_fwd_<90, cutlass::half_t, 128, 128, true, true, false, true>(params, stream);
+            run_mha_fwd_combine_<cutlass::half_t, float, 128>(params, stream, false);
+        } else {
+            run_mha_fwd_<90, cutlass::half_t, 128, 128, false, true, false, true>(params, stream);
+        }
     }
 
     return 0;
+}
+
+extern "C" {
+
+// FP16 KV path (unchanged ABI): calls the shared impl with is_fp8=false.
+int fa3_sm90_paged_decode(
+    void* q_ptr,
+    void* k_cache_ptr,
+    void* v_cache_ptr,
+    void* o_ptr,
+    int*  block_tables_ptr,
+    int*  context_lens_ptr,
+    void* workspace_ptr,
+    float scale,
+    int   batch_size,
+    int   num_heads,
+    int   num_kv_heads,
+    int   head_dim,
+    int   block_size,
+    int   max_blocks_per_seq,
+    int   num_blocks_total,
+    cudaStream_t stream
+) {
+    return fa3_sm90_paged_decode_impl(
+        q_ptr, k_cache_ptr, v_cache_ptr, o_ptr,
+        block_tables_ptr, context_lens_ptr, workspace_ptr,
+        scale, batch_size, num_heads, num_kv_heads, head_dim,
+        block_size, max_blocks_per_seq, num_blocks_total,
+        /*is_fp8=*/false, /*q_descale=*/nullptr, /*k_descale=*/nullptr, /*v_descale=*/nullptr,
+        stream);
+}
+
+// FP8 E4M3 KV path. Q / K cache / V cache are FP8 (1 byte/elem).
+// q_descale / k_descale / v_descale point at single-scalar f32 scales on device.
+// O is fp16 (FA3 E4M3 kernels dequant inside softmax and write fp16 output).
+int fa3_sm90_paged_decode_fp8(
+    void* q_fp8_ptr,
+    void* k_cache_fp8_ptr,
+    void* v_cache_fp8_ptr,
+    void* o_f16_ptr,
+    int*  block_tables_ptr,
+    int*  context_lens_ptr,
+    void* workspace_ptr,
+    float* q_descale_ptr,
+    float* k_descale_ptr,
+    float* v_descale_ptr,
+    float scale,
+    int   batch_size,
+    int   num_heads,
+    int   num_kv_heads,
+    int   head_dim,
+    int   block_size,
+    int   max_blocks_per_seq,
+    int   num_blocks_total,
+    cudaStream_t stream
+) {
+    return fa3_sm90_paged_decode_impl(
+        q_fp8_ptr, k_cache_fp8_ptr, v_cache_fp8_ptr, o_f16_ptr,
+        block_tables_ptr, context_lens_ptr, workspace_ptr,
+        scale, batch_size, num_heads, num_kv_heads, head_dim,
+        block_size, max_blocks_per_seq, num_blocks_total,
+        /*is_fp8=*/true, q_descale_ptr, k_descale_ptr, v_descale_ptr,
+        stream);
 }
 
 }  // extern "C"

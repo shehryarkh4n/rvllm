@@ -40,6 +40,8 @@ SRCS=(
     "${SCRIPT_DIR}/fa3_sm90_wrapper.cu"
     "${FA3_DIR}/instantiations/flash_fwd_hdim128_fp16_paged_sm90.cu"
     "${FA3_DIR}/instantiations/flash_fwd_hdim128_fp16_paged_split_sm90.cu"
+    "${FA3_DIR}/instantiations/flash_fwd_hdim128_e4m3_paged_sm90.cu"
+    "${FA3_DIR}/instantiations/flash_fwd_hdim128_e4m3_paged_split_sm90.cu"
     "${FA3_DIR}/flash_fwd_combine.cu"
     "${FA3_DIR}/flash_prepare_scheduler.cu"
 )
