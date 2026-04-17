@@ -96,6 +96,27 @@ impl<'ctx> HbmArena<'ctx> {
         self.capacity - self.used()
     }
 
+    /// Returns the current bump-pointer value. Paired with `restore` to
+    /// free a block of scratch regions at once (e.g. between sweep
+    /// iterations). The user is responsible for ensuring no outstanding
+    /// `Region` borrows reference memory above the checkpoint — a safety
+    /// that is enforced by the borrow checker when all regions allocated
+    /// after the checkpoint have been dropped.
+    pub fn checkpoint(&self) -> usize {
+        self.used.load(Ordering::Acquire)
+    }
+
+    /// Reset the bump pointer to an earlier checkpoint.
+    ///
+    /// # Safety
+    /// Caller must ensure every `Region` allocated between `checkpoint`
+    /// and this `restore` call has been dropped. Any live `Region`
+    /// whose bytes lie above the restored pointer now aliases arena
+    /// bytes that may be rewritten by subsequent `region` calls.
+    pub unsafe fn restore(&self, ck: usize) {
+        self.used.store(ck, Ordering::Release);
+    }
+
     /// Carve a named, aligned region out of the arena. Takes `&self`
     /// (not `&mut self`) so a `CaptureScope` holding `&HbmArena` can
     /// still call `region` during init — but *inside* a captured

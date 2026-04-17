@@ -77,23 +77,72 @@ fn run() -> Result<(), String> {
     );
     eprintln!("arena used = {} MiB", br.arena.used() / (1024 * 1024));
 
+    if std::env::var("RVLLM_SWEEP").ok().as_deref() == Some("1") {
+        return run_sweep(&br, batch, iters, warmup);
+    }
+
     let result = unsafe { br.run_bench(batch, iters, warmup) }
         .map_err(|e| format!("run_bench: {e}"))?;
+    print_result(result);
+    Ok(())
+}
 
-    let tok_per_sec = if result.total_ns > 0 {
-        (result.iters as f64 * result.num_seqs as f64) * 1.0e9 / result.total_ns as f64
+fn print_result(r: rvllm_runtime::bring_up::BenchResult) {
+    let tok_per_sec = if r.total_ns > 0 {
+        (r.iters as f64 * r.num_seqs as f64) * 1.0e9 / r.total_ns as f64
     } else {
         0.0
     };
-    let ms_per_step = result.ns_per_step as f64 / 1.0e6;
-
+    let ms_per_step = r.ns_per_step as f64 / 1.0e6;
     eprintln!(
         "bench: batch={} iters={} -> {:.0} tok/s ({:.3} ms/step)",
-        batch, iters, tok_per_sec, ms_per_step
+        r.num_seqs, r.iters, tok_per_sec, ms_per_step
     );
     println!(
         "{{\"batch\":{},\"iters\":{},\"tok_per_sec\":{:.1},\"ms_per_step\":{:.4}}}",
-        batch, iters, tok_per_sec, ms_per_step
+        r.num_seqs, r.iters, tok_per_sec, ms_per_step
     );
+}
+
+fn run_sweep(br: &Bringup, batch: u32, iters: u32, warmup: u32) -> Result<(), String> {
+    // Variant grid. Policy knows 40 non-residual + 10 residual (per the
+    // autotune .so). Sample a promising subset.
+    let nonres: &[u32] = &[0, 2, 5, 8, 10, 12, 14];
+    let residuals: &[u32] = &[100, 102, 105, 108];
+
+    let mut best = (u128::MAX, 0u32, 0u32);
+    eprintln!("== sweep @ N={batch} ==");
+    for &nr in nonres {
+        for &r in residuals {
+            let ck = br.arena.checkpoint();
+            let res = unsafe { br.run_bench_with_variants(batch, iters, warmup, Some(nr), Some(r)) };
+            unsafe { br.arena.restore(ck) };
+            match res {
+                Ok(r_) => {
+                    let tok_per_sec = if r_.total_ns > 0 {
+                        (r_.iters as f64 * r_.num_seqs as f64) * 1.0e9 / r_.total_ns as f64
+                    } else {
+                        0.0
+                    };
+                    eprintln!(
+                        "nonres={nr} res={r} -> {:.0} tok/s ({:.3} ms/step)",
+                        tok_per_sec,
+                        r_.ns_per_step as f64 / 1.0e6
+                    );
+                    println!(
+                        "{{\"nonres\":{nr},\"res\":{r},\"tok_per_sec\":{:.1}}}",
+                        tok_per_sec
+                    );
+                    if r_.ns_per_step < best.0 {
+                        best = (r_.ns_per_step, nr, r);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("nonres={nr} res={r} -> ERROR: {e}");
+                }
+            }
+        }
+    }
+    eprintln!("BEST: nonres={} res={} ({:.3} ms/step)", best.1, best.2, best.0 as f64 / 1.0e6);
     Ok(())
 }

@@ -502,6 +502,23 @@ impl Bringup {
             num_seqs,
         })
     }
+
+    #[cfg(not(feature = "cuda"))]
+    pub unsafe fn run_bench_with_variants(
+        &self,
+        num_seqs: u32,
+        iters: u32,
+        _warmup: u32,
+        _nonres_override: Option<u32>,
+        _res_override: Option<u32>,
+    ) -> Result<BenchResult> {
+        Ok(BenchResult {
+            ns_per_step: 0,
+            total_ns: 0,
+            iters,
+            num_seqs,
+        })
+    }
 }
 
 #[derive(Copy, Clone, Debug)]
