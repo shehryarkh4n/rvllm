@@ -36,6 +36,18 @@ H100 SXM 80GB, Qwen2.5-7B-Instruct, FP8 E4M3 weights + FP8 E4M3 KV, graph-captur
 | 256 | 31,178 | 8.21 | 27,996 | +11.4% |
 | **512** | **40,331** | **12.70** | 36,097 | **+11.7%** |
 
+## Time-to-first-token (TTFT)
+
+v3 current measurements with `RVLLM_TTFT=1` use a 16-step eager-decode faux-prefill as the prompt-ingest stand-in. **Phase F (real FA3 paged-prefill kernel) will replace that with one multi-query attention call and drop TTFT ~15–30×** — eager dispatch overhead is the dominant cost today.
+
+| N | TTFT (ms), faux-prefill | projected after Phase F |
+|---:|---:|---:|
+| 128 | 763 | ~25–40 |
+| 256 | 833 | ~35–55 |
+| 512 | 855 | ~45–70 |
+
+TTFT measures: `t₀ = right before prompt ingest` → `t₁ = first sampled token visible in pinned host memory` (includes one decode step after prefill + DtoH + stream fence).
+
 ## Why v3 is fast (structural wins)
 
 1. **Fused Q‖K‖V GEMM.** One matmul with N=4608 replaces three separate Q/K/V GEMMs. 2 fewer launches per layer × 28 layers = 56 fewer launches per decode step.
