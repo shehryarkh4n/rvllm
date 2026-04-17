@@ -13,11 +13,13 @@
 //!   authoritative number the allocator sizes against; if the runtime
 //!   hands the kernel less, `check_workspace` returns `WorkspaceTooSmall`.
 
+pub mod lib_so;
 pub mod plan;
 pub mod policy;
 pub mod schedule;
 pub mod variants;
 
+pub use lib_so::CutlassLib;
 pub use plan::Fp8GemmPlan;
 pub use policy::{Policy, PolicyEntry, ShapeKey};
 pub use schedule::{Coop, Fp8Coop, Fp8WS, MatchedPair, Schedule, ScheduleTag, WS};

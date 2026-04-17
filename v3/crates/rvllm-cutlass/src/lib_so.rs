@@ -1,0 +1,226 @@
+//! `libcutlass_kernels.so` dlopen + variant fn-pointer table.
+//!
+//! Opens the CUTLASS shared library once at engine init, resolves every
+//! variant that appears in the autotune `Policy`, and caches the fn
+//! pointers for zero-cost dispatch. A variant referenced by the policy
+//! that's missing from the .so returns a typed error at load time — the
+//! engine refuses to start rather than silently downgrade.
+
+#[cfg(feature = "cuda")]
+use std::ffi::c_void;
+use std::path::PathBuf;
+
+use rvllm_core::{CutlassCtx, CutlassError, Result, RvllmError};
+
+use crate::variants::VariantId;
+
+// Non-residual FP8 GEMM variant fn.
+#[cfg(feature = "cuda")]
+#[allow(clippy::type_complexity)]
+pub type Fp8GemmFn = unsafe extern "C" fn(
+    output: *mut c_void,
+    a: *const c_void,
+    b: *const c_void,
+    a_scales: *const c_void,
+    b_scale: *const c_void,
+    m: i32,
+    n: i32,
+    k: i32,
+    workspace: *mut c_void,
+    workspace_size: usize,
+    stream: *mut c_void,
+) -> i32;
+
+// Residual-fused FP8 GEMM variant fn (epilogue adds a host-provided C).
+#[cfg(feature = "cuda")]
+#[allow(clippy::type_complexity)]
+pub type Fp8GemmResidualFn = unsafe extern "C" fn(
+    output: *mut c_void,
+    a: *const c_void,
+    b: *const c_void,
+    a_scales: *const c_void,
+    b_scale: *const c_void,
+    residual: *const c_void,
+    m: i32,
+    n: i32,
+    k: i32,
+    workspace: *mut c_void,
+    workspace_size: usize,
+    stream: *mut c_void,
+) -> i32;
+
+#[cfg(feature = "cuda")]
+pub type WorkspaceSizeFn = unsafe extern "C" fn(m: i32, n: i32, k: i32) -> usize;
+
+/// Resolved CUTLASS .so + variant fn-pointer table.
+#[derive(Debug)]
+pub struct CutlassLib {
+    pub so_path: PathBuf,
+    #[cfg(feature = "cuda")]
+    _lib: libloading::Library,
+    /// Keyed by VariantId; `None` if the variant is in the catalog but
+    /// absent from the .so (the caller checks on load — missing for a
+    /// policy-referenced variant is an error).
+    #[cfg(feature = "cuda")]
+    pub fp8_gemm: std::collections::BTreeMap<VariantId, Fp8GemmFn>,
+    #[cfg(feature = "cuda")]
+    pub fp8_gemm_ws: std::collections::BTreeMap<VariantId, WorkspaceSizeFn>,
+    #[cfg(feature = "cuda")]
+    pub fp8_gemm_residual: std::collections::BTreeMap<VariantId, Fp8GemmResidualFn>,
+    #[cfg(feature = "cuda")]
+    pub fp8_gemm_residual_ws: std::collections::BTreeMap<VariantId, WorkspaceSizeFn>,
+}
+
+#[cfg(feature = "cuda")]
+unsafe impl Send for CutlassLib {}
+#[cfg(feature = "cuda")]
+unsafe impl Sync for CutlassLib {}
+
+impl CutlassLib {
+    #[cfg(feature = "cuda")]
+    pub fn load(path: PathBuf, policy_variants: &[VariantId]) -> Result<Self> {
+        let lib = unsafe { libloading::Library::new(&path) }.map_err(|_| cutlass_miss(&path))?;
+        let mut fp8_gemm = std::collections::BTreeMap::new();
+        let mut fp8_gemm_ws = std::collections::BTreeMap::new();
+        let mut fp8_gemm_residual = std::collections::BTreeMap::new();
+        let mut fp8_gemm_residual_ws = std::collections::BTreeMap::new();
+
+        // The catalog separates residual variants by id range (>= 100).
+        // v2's cutlass_fp8_gemm_v{i} / cutlass_fp8_gemm_v{i}_workspace_size
+        // naming convention is preserved for drop-in compat with v2's .so.
+        for &vid in policy_variants {
+            let id = vid.0;
+            if id >= 100 {
+                // residual-fused namespace: cutlass_fp8_gemm_residual_v{i}
+                let res_id = id - 100;
+                let fn_name = format!("cutlass_fp8_gemm_residual_v{res_id}\0");
+                let ws_name = format!("cutlass_fp8_gemm_residual_v{res_id}_workspace_size\0");
+                unsafe {
+                    let f: libloading::Symbol<Fp8GemmResidualFn> =
+                        lib.get(fn_name.as_bytes()).map_err(|_| {
+                            variant_missing(&path, vid, "fp8_gemm_residual")
+                        })?;
+                    let w: libloading::Symbol<WorkspaceSizeFn> =
+                        lib.get(ws_name.as_bytes()).map_err(|_| {
+                            variant_missing(&path, vid, "fp8_gemm_residual_ws")
+                        })?;
+                    fp8_gemm_residual.insert(vid, *f);
+                    fp8_gemm_residual_ws.insert(vid, *w);
+                }
+            } else {
+                let fn_name = format!("cutlass_fp8_gemm_v{id}\0");
+                let ws_name = format!("cutlass_fp8_gemm_v{id}_workspace_size\0");
+                unsafe {
+                    let f: libloading::Symbol<Fp8GemmFn> = lib
+                        .get(fn_name.as_bytes())
+                        .map_err(|_| variant_missing(&path, vid, "fp8_gemm"))?;
+                    let w: libloading::Symbol<WorkspaceSizeFn> = lib
+                        .get(ws_name.as_bytes())
+                        .map_err(|_| variant_missing(&path, vid, "fp8_gemm_ws"))?;
+                    fp8_gemm.insert(vid, *f);
+                    fp8_gemm_ws.insert(vid, *w);
+                }
+            }
+        }
+
+        Ok(Self {
+            so_path: path,
+            _lib: lib,
+            fp8_gemm,
+            fp8_gemm_ws,
+            fp8_gemm_residual,
+            fp8_gemm_residual_ws,
+        })
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    pub fn load(path: PathBuf, _policy_variants: &[VariantId]) -> Result<Self> {
+        if !path.exists() {
+            return Err(cutlass_miss(&path));
+        }
+        Ok(Self { so_path: path })
+    }
+}
+
+fn cutlass_miss(path: &std::path::Path) -> RvllmError {
+    RvllmError::cutlass(
+        CutlassError::AutotuneCacheMiss {
+            m: 0,
+            n: 0,
+            k: 0,
+            dtype: rvllm_core::DType::Fp8E4M3,
+        },
+        CutlassCtx {
+            kernel: "libcutlass_kernels.so",
+            stream: 0,
+        },
+    )
+    // note: the actual error classifies as SoMissing; we overload
+    // AutotuneCacheMiss here until the core error enum adds CutlassSoMissing.
+    .into_cutlass_so_missing(path.to_path_buf())
+}
+
+fn variant_missing(path: &std::path::Path, vid: VariantId, kind: &'static str) -> RvllmError {
+    RvllmError::cutlass(
+        CutlassError::KernelLaunchFailed {
+            variant: vid.0,
+            cuda: rvllm_core::CudaErrorKind::ModuleLoadFailed,
+        },
+        CutlassCtx {
+            kernel: kind,
+            stream: 0,
+        },
+    )
+    .into_cutlass_variant_missing(path.to_path_buf(), vid)
+}
+
+// Small extension to chain on an existing error. Avoids adding new
+// variants to rvllm_core::RvllmError for this one case.
+trait CutlassErrExt {
+    fn into_cutlass_so_missing(self, path: PathBuf) -> RvllmError;
+    fn into_cutlass_variant_missing(self, path: PathBuf, vid: VariantId) -> RvllmError;
+}
+
+impl CutlassErrExt for RvllmError {
+    fn into_cutlass_so_missing(self, path: PathBuf) -> RvllmError {
+        // Repackage with a loader-style path context.
+        RvllmError::Loader {
+            err: rvllm_core::LoaderError::Corrupt {
+                detail: format!("libcutlass_kernels.so not at {}", path.display()),
+            },
+            ctx: rvllm_core::LoaderCtx {
+                path,
+                tensor: None,
+            },
+            bt: std::backtrace::Backtrace::capture(),
+        }
+    }
+    fn into_cutlass_variant_missing(self, path: PathBuf, vid: VariantId) -> RvllmError {
+        RvllmError::Loader {
+            err: rvllm_core::LoaderError::Corrupt {
+                detail: format!(
+                    "libcutlass_kernels.so at {} missing variant {}",
+                    path.display(),
+                    vid.0,
+                ),
+            },
+            ctx: rvllm_core::LoaderCtx {
+                path,
+                tensor: None,
+            },
+            bt: std::backtrace::Backtrace::capture(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_so_rejected() {
+        let err = CutlassLib::load("/nonexistent/libcutlass.so".into(), &[]).unwrap_err();
+        let s = format!("{err}");
+        assert!(s.contains("libcutlass_kernels.so not at"));
+    }
+}
