@@ -190,7 +190,6 @@ impl W4a8Lib {
         }
         Ok(())
     }
-}
 
     /// Encode FP16 weights [N, K] (row-major, device ptr) to unified-
     /// encoded INT4 [N, K/2] bytes + LUT packed FP8 scales [N, K/g, 8]
