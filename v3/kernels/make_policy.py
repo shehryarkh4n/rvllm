@@ -38,12 +38,11 @@ def main():
     entries = {}
     ws = 16 * 1024 * 1024  # conservative workspace budget
 
+    qkv_rows = q_dim + 2 * kv_dim  # fused Q||K||V projection
     for m in SHAPES["buckets"]:
-        # Non-residual: Q, K, V, gate_up, lm_head
+        # Non-residual: fused QKV, gate_up, lm_head
         for n, k in [
-            (q_dim, hidden),        # Q
-            (kv_dim, hidden),       # K
-            (kv_dim, hidden),       # V (same shape; duplicate key ok)
+            (qkv_rows, hidden),     # fused QKV (4608 for Qwen2.5-7B)
             (2 * inter, hidden),    # gate||up
             (SHAPES["vocab"], hidden),  # lm_head
         ]:
