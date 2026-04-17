@@ -646,13 +646,20 @@ impl Bringup {
             Ok(())
         };
 
-        // Faux-prefill loop: when not measuring TTFT just run it normally;
-        // when measuring TTFT, wrap the whole "prompt ingest -> first token
-        // on host" sequence in a timer.
+        // TTFT: two timed passes.
+        //   "cold" = first prefill call from a fresh process. Includes
+        //            cuBLASLt heuristic cost for any shape never seen
+        //            (prefill M = num_seqs × prompt_len differs from
+        //            decode M = num_seqs, so heuristics are cold).
+        //   "hot"  = second prefill call (heuristics cached). Represents
+        //            per-request TTFT a real deployment would see.
+        // When TTFT isn't requested we still need one prefill to populate
+        // KV with real activations before the timed decode window.
         let sampled_d_ptr = sampled_tokens.device_ptr();
-        let ttft_ns: Option<u128> = if measure_ttft {
+        let (ttft_ns, ttft_hot_ns): (Option<u128>, Option<u128>) = if measure_ttft {
+            // --- cold pass (timed) ---
             self.stream.fence()?;
-            let t_ttft_start = std::time::Instant::now();
+            let t_cold = std::time::Instant::now();
             if real_prefill {
                 run_real_prefill(&mut ttft_host_buf)?;
             } else {
@@ -661,11 +668,29 @@ impl Bringup {
                     one_step(layer_exec::LayerPhase::Decode)?;
                 }
             }
-            // Fence to ensure prefill's sampled_tokens are written before DtoH.
             self.stream.fence()?;
             dtoh_async_sync(sampled_d_ptr, ttft_host_buf.as_mut_ptr(), n * 4, stream)?;
             self.stream.fence()?;
-            Some(t_ttft_start.elapsed().as_nanos())
+            let cold_ns = t_cold.elapsed().as_nanos();
+
+            // --- hot pass (timed) — repeat the same prefill, heuristics
+            // now cached. Mirrors per-request TTFT under steady load.
+            self.stream.fence()?;
+            let t_hot = std::time::Instant::now();
+            if real_prefill {
+                run_real_prefill(&mut ttft_host_buf)?;
+            } else {
+                for step in 0..FAUX_PREFILL_STEPS {
+                    set_step_meta(step)?;
+                    one_step(layer_exec::LayerPhase::Decode)?;
+                }
+            }
+            self.stream.fence()?;
+            dtoh_async_sync(sampled_d_ptr, ttft_host_buf.as_mut_ptr(), n * 4, stream)?;
+            self.stream.fence()?;
+            let hot_ns = t_hot.elapsed().as_nanos();
+
+            (Some(cold_ns), Some(hot_ns))
         } else {
             if real_prefill {
                 run_real_prefill(&mut ttft_host_buf)?;
@@ -676,7 +701,7 @@ impl Bringup {
                 }
             }
             self.stream.fence()?;
-            None
+            (None, None)
         };
 
         // Capture one decode step into a CUDA graph then replay for the bench.
@@ -703,6 +728,7 @@ impl Bringup {
             iters,
             num_seqs,
             ttft_ns,
+            ttft_hot_ns,
         })
     }
 
@@ -714,6 +740,7 @@ impl Bringup {
             iters,
             num_seqs,
             ttft_ns: None,
+            ttft_hot_ns: None,
         })
     }
 
@@ -732,6 +759,7 @@ impl Bringup {
             iters,
             num_seqs,
             ttft_ns: None,
+            ttft_hot_ns: None,
         })
     }
 }
@@ -742,9 +770,15 @@ pub struct BenchResult {
     pub total_ns: u128,
     pub iters: u32,
     pub num_seqs: u32,
-    /// Time from "prefill starts" to "first sampled token on host" in ns.
+    /// Cold TTFT in ns: time from "prefill starts" → "first sampled
+    /// token on host" on the first prefill call in this process.
+    /// Includes cuBLASLt per-shape heuristic cost (one-time per engine).
     /// None if TTFT measurement was not requested.
     pub ttft_ns: Option<u128>,
+    /// Hot TTFT in ns: same measurement on a second prefill call, with
+    /// cuBLASLt algos already cached. Represents per-request TTFT under
+    /// steady serving load. None if TTFT measurement was not requested.
+    pub ttft_hot_ns: Option<u128>,
 }
 
 #[cfg(feature = "cuda")]
