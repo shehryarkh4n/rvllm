@@ -121,11 +121,16 @@ impl<'a> PendingStep<'a> {
 
 impl<'a> Drop for PendingStep<'a> {
     fn drop(&mut self) {
-        // If the caller drops without collecting, we must still fence the
-        // DtoH event or the next launch will see stale argmax output.
-        // The v2 step_collect handles this idempotently.
-        if let Some(p) = self.pending.take() {
-            let _ = self.engine.inner.step_collect(Some(p));
+        // No fallback: if the caller drops without collect() the scheduled
+        // diff is leaked (recycled pool won't get it back). This is a
+        // programmer error — the #[must_use] attribute warns at compile
+        // time. In debug builds, panic to make the mistake unmissable.
+        if self.pending.is_some() {
+            debug_assert!(
+                false,
+                "PendingStep dropped without collect(); scheduled step is leaked. \
+                 Call .collect() or hold the value until the step completes."
+            );
         }
     }
 }
