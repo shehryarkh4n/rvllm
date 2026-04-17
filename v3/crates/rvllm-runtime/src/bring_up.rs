@@ -207,10 +207,12 @@ impl Bringup {
         let arena = &self.arena;
         let hidden_fp8 = arena.region("hidden_fp8", (num_seqs * hidden) as usize, 16)?;
         let hidden_scale = arena.region("hidden_scale", (num_seqs * 4) as usize, 16)?;
-        let q_out = arena.region("q_out", (num_seqs * q_dim * 2) as usize, 16)?;
-        let k_out = arena.region("k_out", (num_seqs * kv_dim * 2) as usize, 16)?;
-        let v_out = arena.region("v_out", (num_seqs * kv_dim * 2) as usize, 16)?;
-        let _ = qkv_rows; // shape only needed for the old packed-QKV path
+        // One packed QKV output: [num_tokens, q_dim + 2*kv_dim] f16.
+        let qkv_out_bytes = (num_seqs * qkv_rows * 2) as usize;
+        let qkv_out = arena.region("qkv_out", qkv_out_bytes, 16)?;
+        let q_base = qkv_out.device_ptr();
+        let k_base = q_base + (num_seqs as u64) * (q_dim as u64) * 2;
+        let v_base = k_base + (num_seqs as u64) * (kv_dim as u64) * 2;
         let attn_out = arena.region("attn_out", (num_seqs * q_dim * 2) as usize, 16)?;
         let attn_out_fp8 = arena.region("attn_out_fp8", (num_seqs * q_dim) as usize, 16)?;
         let attn_out_scale = arena.region("attn_out_scale", (num_seqs * 4) as usize, 16)?;
@@ -268,8 +270,8 @@ impl Bringup {
             block_tables.copy_from_host(bytemuck_cast_i32(&bt_host))?;
         }
 
-        // Plans (from policy) for this specific bucket. Q, K, V each get
-        // their own plan since they have different N dimensions.
+        // Plans (from policy) for this specific bucket. Fused QKV uses
+        // one GEMM with N = q_dim + 2*kv_dim = (heads + 2*kv_heads)*head_dim.
         let override_nonres = |mut p: Fp8GemmPlan| -> Fp8GemmPlan {
             if let Some(v) = nonres_override {
                 p.variant = rvllm_cutlass::VariantId(v);
@@ -282,24 +284,10 @@ impl Bringup {
             }
             p
         };
-        let plan_q = override_nonres(Fp8GemmPlan::from_policy(
+        let plan_qkv = override_nonres(Fp8GemmPlan::from_policy(
             &self.policy,
             num_seqs,
-            q_dim,
-            hidden,
-            rvllm_core::DType::Fp8E4M3,
-        )?);
-        let plan_k = override_nonres(Fp8GemmPlan::from_policy(
-            &self.policy,
-            num_seqs,
-            kv_dim,
-            hidden,
-            rvllm_core::DType::Fp8E4M3,
-        )?);
-        let plan_v = override_nonres(Fp8GemmPlan::from_policy(
-            &self.policy,
-            num_seqs,
-            kv_dim,
+            qkv_rows,
             hidden,
             rvllm_core::DType::Fp8E4M3,
         )?);
@@ -357,9 +345,7 @@ impl Bringup {
             quantize_fp8_per_token: self.fused_modules.fn_quantize,
         };
         let plans = layer_exec::LayerGemmPlans {
-            q: plan_q,
-            k: plan_k,
-            v: plan_v,
+            qkv: plan_qkv,
             o: plan_o,
             gate_up: plan_gate_up,
             down: plan_down,
@@ -387,9 +373,9 @@ impl Bringup {
                 let scratch = layer_exec::LayerScratch {
                     hidden_fp8: hidden_fp8.device_ptr(),
                     hidden_scale: hidden_scale.device_ptr(),
-                    q_out: q_out.device_ptr(),
-                    k_out: k_out.device_ptr(),
-                    v_out: v_out.device_ptr(),
+                    q_out: q_base,
+                    k_out: k_base,
+                    v_out: v_base,
                     k_cache: layer_kv_base,
                     v_cache: layer_kv_base + (kv_per_layer / 2) as u64,
                     attn_out: attn_out.device_ptr(),

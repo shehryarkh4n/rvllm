@@ -98,9 +98,8 @@ pub struct LayerKernels {
 
 #[derive(Clone, Debug)]
 pub struct LayerGemmPlans {
-    pub q: Fp8GemmPlan,
-    pub k: Fp8GemmPlan,
-    pub v: Fp8GemmPlan,
+    /// Fused Q||K||V projection: N = (num_heads + 2*num_kv_heads) * head_dim.
+    pub qkv: Fp8GemmPlan,
     pub o: Fp8GemmPlan,        // residual-fused
     pub gate_up: Fp8GemmPlan,
     pub down: Fp8GemmPlan,     // residual-fused
@@ -121,8 +120,6 @@ pub unsafe fn forward(
 ) -> Result<()> {
     let q_dim = dims.num_heads * dims.head_dim;
     let kv_dim = dims.num_kv_heads * dims.head_dim;
-    let q_weight_bytes = (q_dim * dims.hidden) as u64;
-    let kv_weight_bytes = (kv_dim * dims.hidden) as u64;
 
     // 1. rmsnorm(residual) + fp8 quant, residual updated in-place.
     FusedAddRmsnormFp8QuantLaunch {
@@ -141,43 +138,25 @@ pub unsafe fn forward(
         stream,
     )?;
 
-    // 2-4. Q, K, V projections (3 separate FP8 GEMMs over slices of qkv_fp8).
+    // 2. Fused Q||K||V projection: one GEMM with N=q_dim+2*kv_dim.
+    //    Output layout [num_tokens, q_dim+2*kv_dim]:
+    //      rows[:q_dim]              -> Q
+    //      rows[q_dim:q_dim+kv_dim]  -> K
+    //      rows[q_dim+kv_dim:]       -> V
+    //    The scratch carries q_out as the packed base; k_out and v_out
+    //    are byte offsets into the same buffer (set by bring_up).
     #[cfg(feature = "cuda")]
-    {
-        cutlass.launch_fp8_gemm(
-            &plans.q,
-            scratch.q_out,
-            scratch.hidden_fp8,
-            weights.qkv_fp8,
-            scratch.hidden_scale,
-            weights.qkv_scale,
-            scratch.cutlass_workspace,
-            scratch.cutlass_workspace_bytes,
-            stream,
-        )?;
-        cutlass.launch_fp8_gemm(
-            &plans.k,
-            scratch.k_out,
-            scratch.hidden_fp8,
-            weights.qkv_fp8 + q_weight_bytes,
-            scratch.hidden_scale,
-            weights.qkv_scale,
-            scratch.cutlass_workspace,
-            scratch.cutlass_workspace_bytes,
-            stream,
-        )?;
-        cutlass.launch_fp8_gemm(
-            &plans.v,
-            scratch.v_out,
-            scratch.hidden_fp8,
-            weights.qkv_fp8 + q_weight_bytes + kv_weight_bytes,
-            scratch.hidden_scale,
-            weights.qkv_scale,
-            scratch.cutlass_workspace,
-            scratch.cutlass_workspace_bytes,
-            stream,
-        )?;
-    }
+    cutlass.launch_fp8_gemm(
+        &plans.qkv,
+        scratch.q_out,
+        scratch.hidden_fp8,
+        weights.qkv_fp8,
+        scratch.hidden_scale,
+        weights.qkv_scale,
+        scratch.cutlass_workspace,
+        scratch.cutlass_workspace_bytes,
+        stream,
+    )?;
 
     // 5. RoPE q/k in place, write k/v into paged cache.
     FusedRopeKvWriteLaunch {
@@ -313,7 +292,7 @@ pub unsafe fn forward(
 
     #[cfg(not(feature = "cuda"))]
     {
-        let _ = (cutlass, plans, stream, kv_dim, q_weight_bytes, kv_weight_bytes);
+        let _ = (cutlass, plans, stream, kv_dim);
     }
     Ok(())
 }
