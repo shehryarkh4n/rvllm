@@ -57,7 +57,12 @@ fn run() -> Result<(), String> {
     let warmup = env_u32("RVLLM_WARMUP", 10);
 
     // Arena budget: model (~16 GB fp8) + kv (~8 GB) + scratch/workspace (~4 GB).
-    let arena_bytes: usize = 32 * 1024 * 1024 * 1024;
+    // Override with RVLLM_ARENA_GB if GPU memory is constrained.
+    let arena_gb: usize = std::env::var("RVLLM_ARENA_GB")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(32);
+    let arena_bytes: usize = arena_gb * 1024 * 1024 * 1024;
 
     eprintln!("== rvllm-bench v3 ==");
     eprintln!("model_dir   = {}", paths.model_dir.display());

@@ -13,14 +13,24 @@ authors.workspace = true
 name = "rvllm-bench"
 path = "src/main.rs"
 
+[[bin]]
+name = "rvllm-eval"
+path = "src/bin/rvllm_eval.rs"
+
 [features]
 default = []
-cuda = ["rvllm-runtime/cuda"]
+cuda = ["rvllm-runtime/cuda", "rvllm-fused/cuda", "rvllm-mem/cuda", "dep:cudarc"]
 
 [dependencies]
 rvllm-core = { workspace = true }
 rvllm-runtime = { workspace = true }
+rvllm-fused = { workspace = true }
+rvllm-mem = { workspace = true }
+rvllm-kernels = { workspace = true }
+rvllm-cutlass = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+tokenizers = "0.20"
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+cudarc = { version = "0.19", features = ["driver", "cuda-version-from-build-system"], optional = true }
