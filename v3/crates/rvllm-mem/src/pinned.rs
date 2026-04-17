@@ -1,61 +1,125 @@
-//! Pinned (page-locked) host buffer, and the double-buffer pool used by
-//! the DtoH pipeline.
-//!
-//! Real impl allocates via `cuMemAllocHost`; host stub uses a `Box<[T]>`
-//! with the right layout so invariant-level tests pass without CUDA.
+//! Pinned (page-locked) host buffer + double-buffer DtoH pool.
 
 use core::marker::PhantomData;
 
-use rvllm_core::{Result, RvllmError};
+use rvllm_core::{CudaCtx, CudaErrorKind, Result, RvllmError};
 
-/// A pinned host buffer of `N` elements of `T`.
 pub struct PinnedBuf<T> {
-    // Host stub uses Box<[T]>; real impl will replace with a
-    // `cuMemAllocHost`-backed raw pointer + len, behind `#[cfg(feature =
-    // "cuda")]`.
-    data: Box<[T]>,
+    ptr: *mut T,
+    len: usize,
+    owns_cuda: bool,
     _not_send_sync: PhantomData<*const ()>,
 }
 
+unsafe impl<T: Send> Send for PinnedBuf<T> {}
+
 impl<T: Default + Clone> PinnedBuf<T> {
-    /// Allocate a pinned buffer of `len` elements, zero-filled.
+    /// Allocate via `cuMemAllocHost_v2` when cuda feature is on;
+    /// otherwise a heap Box<[T]>.
     pub fn new(len: usize) -> Result<Self> {
-        let data: Box<[T]> = vec![T::default(); len].into_boxed_slice();
-        Ok(Self {
-            data,
-            _not_send_sync: PhantomData,
-        })
+        if len == 0 {
+            return Ok(Self {
+                ptr: core::ptr::null_mut(),
+                len: 0,
+                owns_cuda: false,
+                _not_send_sync: PhantomData,
+            });
+        }
+
+        #[cfg(feature = "cuda")]
+        {
+            use cudarc::driver::sys::*;
+            let bytes = len * core::mem::size_of::<T>();
+            let mut p: *mut core::ffi::c_void = core::ptr::null_mut();
+            let r = unsafe { cuMemAllocHost_v2(&mut p, bytes) };
+            if r != CUresult::CUDA_SUCCESS {
+                return Err(RvllmError::cuda(
+                    "cuMemAllocHost_v2",
+                    CudaErrorKind::AllocFailed,
+                    CudaCtx {
+                        stream: 0,
+                        kernel: "cuMemAllocHost_v2",
+                        launch: None,
+                        device: -1,
+                    },
+                ));
+            }
+            // Zero + default-init.
+            unsafe {
+                core::ptr::write_bytes(p as *mut u8, 0, bytes);
+            }
+            Ok(Self {
+                ptr: p as *mut T,
+                len,
+                owns_cuda: true,
+                _not_send_sync: PhantomData,
+            })
+        }
+
+        #[cfg(not(feature = "cuda"))]
+        {
+            let data: Box<[T]> = vec![T::default(); len].into_boxed_slice();
+            let ptr = Box::into_raw(data) as *mut T;
+            Ok(Self {
+                ptr,
+                len,
+                owns_cuda: false,
+                _not_send_sync: PhantomData,
+            })
+        }
     }
 }
 
 impl<T> PinnedBuf<T> {
     pub fn len(&self) -> usize {
-        self.data.len()
+        self.len
     }
     pub fn is_empty(&self) -> bool {
-        self.data.is_empty()
+        self.len == 0
     }
     pub fn as_slice(&self) -> &[T] {
-        &self.data
+        if self.ptr.is_null() {
+            &[]
+        } else {
+            unsafe { core::slice::from_raw_parts(self.ptr, self.len) }
+        }
     }
     pub fn as_mut_slice(&mut self) -> &mut [T] {
-        &mut self.data
+        if self.ptr.is_null() {
+            &mut []
+        } else {
+            unsafe { core::slice::from_raw_parts_mut(self.ptr, self.len) }
+        }
     }
-    /// Raw host pointer (for `cuMemcpy*`). The runtime's DtoH path uses this.
     pub fn as_ptr(&self) -> *const T {
-        self.data.as_ptr()
+        self.ptr
     }
     pub fn as_mut_ptr(&mut self) -> *mut T {
-        self.data.as_mut_ptr()
+        self.ptr
     }
 }
 
-/// Double-buffered pinned argmax pool. `[A, B]` buffers, `[ev_A, ev_B]`
-/// events owned by the caller; this struct holds just the buffers and
-/// the flip-index.
+impl<T> Drop for PinnedBuf<T> {
+    fn drop(&mut self) {
+        if self.ptr.is_null() || self.len == 0 {
+            return;
+        }
+        #[cfg(feature = "cuda")]
+        unsafe {
+            if self.owns_cuda {
+                let _ = cudarc::driver::sys::cuMemFreeHost(self.ptr as *mut core::ffi::c_void);
+                return;
+            }
+        }
+        #[cfg(not(feature = "cuda"))]
+        unsafe {
+            let _ = Box::<[T]>::from_raw(core::slice::from_raw_parts_mut(self.ptr, self.len));
+        }
+    }
+}
+
 pub struct PinnedPool<T> {
     buffers: [PinnedBuf<T>; 2],
-    /// Index of the buffer the NEXT `launch_dtoh` writes into.
     write_idx: u8,
 }
 
@@ -69,11 +133,9 @@ impl<T: Default + Clone> PinnedPool<T> {
 }
 
 impl<T> PinnedPool<T> {
-    /// Index the next `launch_dtoh` writes into.
     pub fn write_idx(&self) -> usize {
         self.write_idx as usize
     }
-    /// Index that the next `step_collect` reads from.
     pub fn read_idx(&self) -> usize {
         1 - self.write_idx as usize
     }
@@ -83,16 +145,10 @@ impl<T> PinnedPool<T> {
     pub fn read_buf(&self) -> &PinnedBuf<T> {
         &self.buffers[1 - self.write_idx as usize]
     }
-    /// Call after `cuEventRecord` on the outgoing buffer's event. Flips
-    /// the write index so the next launch writes the other buffer.
     pub fn flip(&mut self) {
         self.write_idx = 1 - self.write_idx;
     }
 }
-
-// Pinned buffers are not GraphSafe — a captured graph binds the
-// *device* pointer of a DtoH copy, not the host pointer. The kernel
-// sees zero host pointers directly, so there is nothing to implement.
 
 #[cfg(test)]
 mod tests {

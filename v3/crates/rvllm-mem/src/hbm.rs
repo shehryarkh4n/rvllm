@@ -22,25 +22,66 @@ pub struct HbmArena<'ctx> {
     base: u64,
     capacity: usize,
     used: AtomicUsize,
-    // Tie lifetime to a &'ctx Context marker (not modeled yet; lifetime
-    // exists so that `Region<'a>` can never outlive the arena).
+    owns_cuda: bool,
     _ctx: PhantomData<&'ctx ()>,
+}
+
+impl<'ctx> Drop for HbmArena<'ctx> {
+    fn drop(&mut self) {
+        #[cfg(feature = "cuda")]
+        unsafe {
+            if self.owns_cuda && self.base != 0 {
+                let _ = cudarc::driver::sys::cuMemFree_v2(self.base);
+            }
+        }
+    }
 }
 
 impl<'ctx> HbmArena<'ctx> {
     /// Construct a CPU-side test arena (no GPU). Useful for unit tests
     /// of the bookkeeping. Pretends to own `bytes` starting at some
     /// fake device base.
-    ///
-    /// The GPU constructor lives behind `#[cfg(feature = "cuda")]` in
-    /// `hbm_cuda.rs` once that feature is enabled.
     pub fn new_host_stub(bytes: usize) -> Self {
         Self {
             base: 0x0001_0000_0000_0000, // fake device pointer
             capacity: bytes,
             used: AtomicUsize::new(0),
+            owns_cuda: false,
             _ctx: PhantomData,
         }
+    }
+
+    /// Real constructor: allocate one HBM slab via `cuMemAlloc_v2`.
+    /// Fails if the device doesn't have `bytes` free.
+    #[cfg(feature = "cuda")]
+    pub fn new(_ctx: &crate::context::CudaContextHandle, bytes: usize) -> Result<Self> {
+        use cudarc::driver::sys::*;
+        let mut dptr: CUdeviceptr = 0;
+        let r = unsafe { cuMemAlloc_v2(&mut dptr, bytes) };
+        if r != CUresult::CUDA_SUCCESS {
+            return Err(RvllmError::cuda(
+                "HbmArena::new (cuMemAlloc_v2)",
+                CudaErrorKind::AllocFailed,
+                rvllm_core::CudaCtx {
+                    stream: 0,
+                    kernel: "cuMemAlloc_v2",
+                    launch: None,
+                    device: _ctx.device(),
+                },
+            ));
+        }
+        Ok(Self {
+            base: dptr,
+            capacity: bytes,
+            used: AtomicUsize::new(0),
+            owns_cuda: true,
+            _ctx: PhantomData,
+        })
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    pub fn new(_ctx: &crate::context::CudaContextHandle, bytes: usize) -> Result<Self> {
+        Ok(Self::new_host_stub(bytes))
     }
 
     pub fn capacity(&self) -> usize {
