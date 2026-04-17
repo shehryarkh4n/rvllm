@@ -349,6 +349,7 @@ dependencies = [
 name = "rvllm-runtime"
 version = "0.1.0"
 dependencies = [
+ "cudarc",
  "rvllm-attention",
  "rvllm-core",
  "rvllm-cutlass",
