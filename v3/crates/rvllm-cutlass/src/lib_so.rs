@@ -218,6 +218,11 @@ impl CutlassLib {
     ) -> Result<()> {
         plan.check_workspace(workspace_size)?;
         let f = self.fp8_gemm_residual.get(&plan.variant).ok_or_else(|| {
+            eprintln!(
+                "[rvllm-cutlass] runtime: residual variant {} not in map; loaded keys={:?}",
+                plan.variant.0,
+                self.fp8_gemm_residual.keys().collect::<Vec<_>>()
+            );
             variant_missing(
                 &self.so_path,
                 plan.variant,
