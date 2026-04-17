@@ -1,23 +1,20 @@
 # rvLLM
 
-A single-GPU, FP8, graph-captured LLM inference engine in Rust. Qwen2.5-7B on a single H100 SXM SXM 80GB delivers **40,331 tok/s at N=512** (FP8 KV-cache-enabled batches, decode + final RMSnorm + LM head + argmax, CUDA graph captured). At matched batch (N=128) against vLLM 0.19 the gap is +7.4%; the real Phase E win is the 2× KV memory savings that unlock N=256 and N=512 on the same 80 GB card.
+A single-GPU, FP8, graph-captured LLM inference engine in Rust. Qwen2.5-7B on a single H100 SXM 80GB delivers **40,331 tok/s at N=512** (FP8 E4M3 KV cache, decode + final RMSnorm + LM head + argmax, CUDA graph captured). Consistently **7–12% faster than vLLM 0.19** across every batch size we tested (N=128, 256, 512) on the same GPU with the same model and quant config.
 
 No Python in the hot path. No fallbacks. Missing artifacts (policy, FA3 `.so`, kernel SHA) refuse to start.
 
 ## Headline: v3 vs vLLM 0.19 on the same H100
 
-Same GPU, same Qwen2.5-7B-Instruct checkpoint, same FP8 E4M3, CUDA graphs on, full decode + LM head + argmax.
+Same GPU, same Qwen2.5-7B-Instruct checkpoint, same FP8 E4M3, CUDA graphs on, full decode. Both measurements taken from each engine's own steady-state decode throughput metric.
 
-| Engine | Batch | Decode tok/s | vs vLLM N=128 |
-|---|---:|---:|---:|
-| vLLM 0.19 V1 (FP8 + FlashInfer + graphs) | 128 | 19,399 | — |
-| rvllm-v3 | 128 | 20,841 | **+7.4%** |
-| **rvllm-v3** | **256** | **31,178** | **+60.7%** |
-| **rvllm-v3** | **512** | **40,331** | **+108%** (2.08×) |
+| Batch | vLLM 0.19 V1 | rvllm-v3 | v3 Δ |
+|---:|---:|---:|---:|
+| 128 | 19,399 | 20,841 | **+7.4%** |
+| 256 | 27,996 | 31,178 | **+11.4%** |
+| **512** | 36,097 | **40,331** | **+11.7%** |
 
-**Why the per-batch winner shifts:** v3's FP8 E4M3 KV cache halves KV memory vs f16 (3.6 GB → 1.8 GB per 28-layer stack). At matched N=128 the dequant overhead in FA3's E4M3 attention eats most of the theoretical HBM-bandwidth savings, so the per-token speedup is a modest +0.5%. The *real* Phase E win is that N=256 and N=512 now fit on the same 80 GB card — at those batch sizes, GEMM kernels saturate HBM instead of being dispatch-bound, and absolute throughput doubles.
-
-vLLM number is their engine's own `Avg generation throughput` log line (a steady-state decode metric, prefill excluded), via `vllm bench latency --model Qwen2.5-7B --quantization fp8 --batch-size 128 --input-len 16 --output-len 512 --num-iters 3 --num-iters-warmup 1 --dtype float16` on the same H100 SXM 80GB. We could not run vLLM at N=256/512 on the same box without OOM — vLLM uses f16 KV by default.
+vLLM numbers are the `Avg generation throughput` engine log line (steady-state decode, prefill excluded), via `vllm bench latency --model Qwen2.5-7B --quantization fp8 --batch-size <N> --input-len 16 --output-len 512 --num-iters 3 --num-iters-warmup 1 --dtype float16`. vLLM also runs fine at N=256/512 on this box — prior readme claims that it couldn't were our mistake.
 
 ## The fair-bench setup
 
@@ -33,11 +30,11 @@ Net impact of the three fairness fixes on the N=128 number: −0.3%. The per-ste
 
 H100 SXM 80GB, Qwen2.5-7B-Instruct, FP8 E4M3 weights + FP8 E4M3 KV, graph-captured, full decode + final RMSnorm + LM head + argmax, metadata re-upload per step, 16-step faux-prefill, 5 warmup iters:
 
-| N | tok/s | ms/step | vs vLLM 0.19 @ N=128 |
-|---:|---:|---:|---:|
-| 128 | 20,841 | 6.14 | +7.4% |
-| 256 | 31,178 | 8.21 | +60.7% |
-| **512** | **40,331** | **12.70** | **+108%** |
+| N | tok/s | ms/step | vLLM same N | v3 Δ |
+|---:|---:|---:|---:|---:|
+| 128 | 20,841 | 6.14 | 19,399 | +7.4% |
+| 256 | 31,178 | 8.21 | 27,996 | +11.4% |
+| **512** | **40,331** | **12.70** | 36,097 | **+11.7%** |
 
 ## Why v3 is fast (structural wins)
 

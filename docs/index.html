@@ -139,7 +139,7 @@ footer a:hover{color:#999}
 
 <div class="hero">
   <div class="big">40,331 tok/s</div>
-  <div class="sub">Qwen2.5-7B FP8 on a single H100 SXM 80GB. N=512, greedy, CUDA graph captured, FP8 E4M3 KV cache, full decode + final RMSnorm + LM head + argmax. <strong>2.08&times; vLLM 0.19 at the batch size vLLM can run (N=128).</strong> FP8 KV halves KV memory, unlocking N=256/512 that f16 KV cannot fit. Detail below.</div>
+  <div class="sub">Qwen2.5-7B FP8 on a single H100 SXM 80GB. N=512, greedy, CUDA graph captured, FP8 E4M3 KV cache, full decode + final RMSnorm + LM head + argmax. <strong>+11.7% vs vLLM 0.19 at the same batch on the same box.</strong> Consistently 7&ndash;12% faster than vLLM across N=128 / 256 / 512. Detail below.</div>
   <div class="hero-graphic">
     <div class="hero-graphic-title">Throughput by Batch Size</div>
     <div class="hero-graphic-sub">Same GPU, same model, same FP8 path. Greedy decode, 512 output tokens, CUDA graphs on.</div>
@@ -154,42 +154,49 @@ footer a:hover{color:#999}
           </div>
           <div class="hero-static-block">
             <div class="hero-static-row">
-              <div class="hero-static-label"><strong>v3 N=512</strong></div>
+              <div class="hero-static-label"><strong>N=512 v3</strong></div>
               <div class="hero-static-bars">
                 <div class="hero-static-track"><div class="hero-static-fill" style="width:100%;background:#84E6B7"></div></div>
-                <div class="hero-static-meta"><span class="hero-static-series"><i style="background:#84E6B7"></i><strong>40,331 tok/s</strong> (FP8 KV-enabled batch)</span></div>
+                <div class="hero-static-meta"><span class="hero-static-series"><i style="background:#84E6B7"></i><strong>40,331 tok/s</strong></span></div>
               </div>
             </div>
             <div class="hero-static-row">
-              <div class="hero-static-label"><strong>v3 N=256</strong></div>
+              <div class="hero-static-label">N=512 vLLM</div>
+              <div class="hero-static-bars">
+                <div class="hero-static-track"><div class="hero-static-fill" style="width:89.5%;background:#5a8bd4"></div></div>
+                <div class="hero-static-meta"><span class="hero-static-series"><i style="background:#5a8bd4"></i>36,097 tok/s &nbsp; v3 +11.7%</span></div>
+              </div>
+            </div>
+            <div class="hero-static-row">
+              <div class="hero-static-label"><strong>N=256 v3</strong></div>
               <div class="hero-static-bars">
                 <div class="hero-static-track"><div class="hero-static-fill" style="width:77.3%;background:#84E6B7"></div></div>
-                <div class="hero-static-meta"><span class="hero-static-series"><i style="background:#84E6B7"></i><strong>31,178 tok/s</strong> (FP8 KV-enabled batch)</span></div>
+                <div class="hero-static-meta"><span class="hero-static-series"><i style="background:#84E6B7"></i><strong>31,178 tok/s</strong></span></div>
               </div>
             </div>
             <div class="hero-static-row">
-              <div class="hero-static-label"><strong>v3 N=128</strong></div>
+              <div class="hero-static-label">N=256 vLLM</div>
+              <div class="hero-static-bars">
+                <div class="hero-static-track"><div class="hero-static-fill" style="width:69.4%;background:#5a8bd4"></div></div>
+                <div class="hero-static-meta"><span class="hero-static-series"><i style="background:#5a8bd4"></i>27,996 tok/s &nbsp; v3 +11.4%</span></div>
+              </div>
+            </div>
+            <div class="hero-static-row">
+              <div class="hero-static-label"><strong>N=128 v3</strong></div>
               <div class="hero-static-bars">
                 <div class="hero-static-track"><div class="hero-static-fill" style="width:51.7%;background:#84E6B7"></div></div>
                 <div class="hero-static-meta"><span class="hero-static-series"><i style="background:#84E6B7"></i><strong>20,841 tok/s</strong></span></div>
               </div>
             </div>
             <div class="hero-static-row">
-              <div class="hero-static-label">vLLM N=128</div>
+              <div class="hero-static-label">N=128 vLLM</div>
               <div class="hero-static-bars">
                 <div class="hero-static-track"><div class="hero-static-fill" style="width:48.1%;background:#5a8bd4"></div></div>
-                <div class="hero-static-meta"><span class="hero-static-series"><i style="background:#5a8bd4"></i>19,399 tok/s (FlashInfer + FP8 + graphs, V1 engine)</span></div>
-              </div>
-            </div>
-            <div class="hero-static-row">
-              <div class="hero-static-label" style="color:#6a7383">v2 archive N=128</div>
-              <div class="hero-static-bars">
-                <div class="hero-static-track"><div class="hero-static-fill" style="width:47.8%;background:#4f6274"></div></div>
-                <div class="hero-static-meta"><span class="hero-static-series"><i style="background:#4f6274"></i>19,287 tok/s (SHA <code>eb9e247fd</code>)</span></div>
+                <div class="hero-static-meta"><span class="hero-static-series"><i style="background:#5a8bd4"></i>19,399 tok/s &nbsp; v3 +7.4%</span></div>
               </div>
             </div>
           </div>
-          <p style="color:#888;font-size:0.85rem;margin-top:0.5rem">vLLM could not be run at N=256/512 on the same 80 GB card without OOM &mdash; vLLM uses f16 KV by default. v3's FP8 KV is 1 byte/element (vs 2), halving the KV cache and unlocking the higher batches.</p>
+          <p style="color:#888;font-size:0.85rem;margin-top:0.5rem">Both engines: Qwen2.5-7B-Instruct, FP8 E4M3, CUDA graphs on, <code>Avg generation throughput</code> (prefill excluded), single H100 SXM 80GB. vLLM invoked with <code>vllm bench latency --quantization fp8 --input-len 16 --output-len 512</code>.</p>
         </div>
       </div>
       <div class="hero-chart-notes">

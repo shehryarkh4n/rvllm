@@ -14,21 +14,19 @@
 % --- Abstract ---
 \begin{abstract}
 rvLLM is a single-GPU LLM inference engine written in Rust, built from
-scratch without Python in the serving hot path. On a single NVIDIA H100 SXM
-80\,GB running Qwen2.5-7B-Instruct in FP8~E4M3 with greedy decoding and a
-single CUDA-graph replay per step, rvLLM~v3 reaches
+scratch without Python in the serving hot path. On a single NVIDIA H100
+SXM 80\,GB running Qwen2.5-7B-Instruct in FP8~E4M3 with greedy decoding
+and a single CUDA-graph replay per step, rvLLM~v3 reaches
 \textbf{40{,}331 tokens/second at $N\!=\!512$}
-(decode + final RMSnorm + LM head + argmax). At matched batch $N\!=\!128$,
-v3 measures \textbf{20{,}841~tok/s} vs vLLM~0.19's
-\textbf{19{,}399~tok/s} on the same box with the same model
-(\textbf{1.07}$\boldsymbol\times$), but the larger story is that v3's FP8
-E4M3 KV cache halves KV memory from 3.6\,GB to 1.8\,GB across 28 layers,
-enabling the $N\!=\!256$ and $N\!=\!512$ batches that vLLM's default
-f16 KV cannot fit on one 80\,GB card. At those batches v3 reaches
-31{,}178 and 40{,}331~tok/s respectively, \textbf{1.61}$\boldsymbol\times$
-and \textbf{2.08}$\boldsymbol\times$ vLLM's $N\!=\!128$ throughput.
-The earlier v2 stack peaked at 19{,}287 tok/s at $N\!=\!128$
-(SHA \texttt{eb9e247fd}) and is kept in-tree as an archive.
+(decode + final RMSnorm + LM head + argmax).
+Comparing head-to-head at each batch size against vLLM~0.19~V1 on the
+same GPU with the same model and quant config: v3 measures
+\textbf{+7.4\%} at $N\!=\!128$ (20{,}841 vs vLLM's 19{,}399),
+\textbf{+11.4\%} at $N\!=\!256$ (31{,}178 vs 27{,}996), and
+\textbf{+11.7\%} at $N\!=\!512$ (40{,}331 vs 36{,}097) --- consistently
+7--12\% faster at every batch size we tested. The earlier v2 stack
+peaked at 19{,}287~tok/s at $N\!=\!128$ (SHA \texttt{eb9e247fd}) and
+is kept in-tree as an archive.
 
 v3 ships as a FlashAttention-3 SM90 paged-KV decode kernel (built from the
 Hopper source to \texttt{libfa3\_kernels.so}, compiled with upstream's
@@ -81,14 +79,14 @@ metadata packing, and sampling DtoH coordination in 31 crates
 path.
 
 This paper documents rvLLM~v3, which achieves
-\textbf{40{,}331~tok/s at $N\!=\!512$} and 20{,}841~tok/s at matched
-$N\!=\!128$ on a single H100 under a bench that re-uploads metadata each
-step and runs a 16-step faux-prefill (fair-comparison configuration,
-Section~\ref{sec:results}). The previous v2 stack (archived at commit
-\texttt{eb9e247fd}, April~16, 2026) reached 19{,}287~tok/s at $N\!=\!128$;
-vLLM~0.19 V1 on the same box measures 19{,}399~tok/s at the same batch
-but cannot run at $N\!=\!256$ or $N\!=\!512$ within the 80\,GB
-envelope (its f16 KV cache exhausts HBM). v3's primary levers are: (i)
+\textbf{40{,}331~tok/s at $N\!=\!512$} on a single H100 under a bench
+that re-uploads metadata each step and runs a 16-step faux-prefill
+(fair-comparison configuration, Section~\ref{sec:results}). vLLM~0.19
+V1 runs on the same box at all three of our benched batch sizes; v3
+measures 7.4\% / 11.4\% / 11.7\% faster at $N\!=\!128\,/\,256\,/\,512$
+respectively. The previous v2 stack (archived at commit
+\texttt{eb9e247fd}, April~16, 2026) reached 19{,}287~tok/s at $N\!=\!128$.
+v3's primary levers are: (i)
 fusing Q/K/V into a single GEMM where v2 runs three; (ii) routing all five
 FP8 linears (QKV, O, gate\_up, down, lm\_head) through
 \texttt{cublasLtMatmul}, whose per-shape heuristic explores many more
@@ -530,40 +528,37 @@ linears dispatched via \texttt{cublasLtMatmul},
 \texttt{libfa3\_kernels.so} built from the Hopper FlashAttention-3
 source.
 
-\subsection{v3 throughput by batch size (FP8~E4M3 KV, ITERS=512)}
+\subsection{Head-to-head vs vLLM 0.19 V1 on the same H100}
+
+All figures below are each engine's own steady-state decode
+throughput metric. For vLLM it is the \texttt{Avg generation throughput}
+engine log line (prefill excluded). Same model, same FP8~E4M3
+quantization, same CUDA-graph configuration, same 80\,GB card.
 
 \begin{tabular}{rrrr}
 \toprule
-$\boldsymbol{N}$ & \textbf{tok/s} & \textbf{ms/step} & \textbf{vs vLLM $N\!=\!128$} \\
+$\boldsymbol{N}$ & \textbf{vLLM 0.19} & \textbf{rvllm-v3} & \textbf{v3 $\Delta$} \\
 \midrule
-128 & 20{,}841 & 6.14 & $+$7.4\% \\
-256 & 31{,}178 & 8.21 & $+$60.7\% \\
-512 & \textbf{40{,}331} & \textbf{12.70} & $+$\textbf{108\%} \\
+128 & 19{,}399 & 20{,}841 & $+$7.4\% \\
+256 & 27{,}996 & 31{,}178 & $+$11.4\% \\
+512 & 36{,}097 & \textbf{40{,}331} & $+$\textbf{11.7\%} \\
 \bottomrule
 \end{tabular}
 
-\subsection{Head-to-head at $N\!=\!128$ (matched batch)}
+\paragraph{Both engines scale through $N\!=\!512$.}
+A prior draft of this paper claimed vLLM could not fit
+$N\!=\!256$/$N\!=\!512$ on 80\,GB. That was wrong --- vLLM handles
+those batch sizes fine on the same box. v3's edge is a consistent
+7--12\% across the batch ladder, not a capacity-unlock step function.
 
-\begin{tabular}{lrr}
-\toprule
-\textbf{Engine} & \textbf{tok/s} & \textbf{ratio to v3} \\
-\midrule
-vLLM 0.19 V1 (FP8, FlashInfer, CUDA graphs) & 19{,}399 & 0.931$\times$ \\
-rvllm-v2 (archive, \texttt{eb9e247fd}) & 19{,}287 & 0.925$\times$ \\
-\textbf{rvllm-v3 (FP8 KV + fair bench)} & \textbf{20{,}841} & \textbf{1.00}$\boldsymbol\times$ \\
-\bottomrule
-\end{tabular}
-
-\paragraph{Batches above $N\!=\!128$.}
-vLLM could not be run at $N\!=\!256$ or $N\!=\!512$ on the same
-80\,GB card in its default configuration --- vLLM's KV cache is f16
-(2~bytes/element), which with our 28-layer Qwen2.5-7B page configuration
-requires enough HBM that scaling past $N\!\approx\!128$ triggers OOM in
-the KV allocator. rvLLM~v3 uses FP8~E4M3 KV (1~byte/element), halving
-each layer's KV allocation. At $N\!=\!256$ and $N\!=\!512$ the GEMMs
-approach HBM saturation --- rather than being dispatch-bound as at
-smaller batches --- and absolute throughput scales near-linearly with
-batch until the attention softmax-bandwidth wall.
+\paragraph{What v3 adds architecturally.}
+v3 ships FP8 E4M3 KV (1~byte/element, vs the FA3 default f16), which
+halves our per-layer KV allocation, and routes all five FP8 linears
+(QKV, O, gate\_up, down, lm\_head) through cuBLASLt with fused bias and
+residual epilogues. The per-token measurement above reflects both
+together; individual micro-benches at matched $N$ show the cuBLASLt
+autotune was the dominant per-token win, while FP8 KV was essentially
+flat on per-token but halves the KV-cache memory footprint.
 
 The vLLM measurement is taken on the same H100 SXM 80\,GB box that runs
 v3, using the same \texttt{Qwen2.5-7B-Instruct} checkpoint and the same
@@ -606,14 +601,13 @@ measurement. We modified the v3 bench to address each one and re-ran:
 \end{enumerate}
 
 After all three fixes (and the later FP8 KV migration), v3 measures
-\textbf{20{,}841~tok/s} at $N\!=\!128$. The per-step metadata upload
-and faux-prefill are small relative to the 28-layer forward pass and
-LM head. v3 at matched $N\!=\!128$ is $1.07\times$ vLLM~0.19 on the
-same box; scaling to $N\!=\!256$ and $N\!=\!512$ --- which only v3 can
-fit in 80\,GB because of the FP8 E4M3 KV cache --- yields $1.61\times$
-and $2.08\times$ respectively, confirming the edge is structural
-(fused QKV, cuBLASLt autotune, fused epilogues, FP8 KV memory,
-no Python dispatch).
+20{,}841~tok/s at $N\!=\!128$, a 1.07$\times$ against vLLM~0.19 V1 on
+the same box. Both engines scale to $N\!=\!256$ and $N\!=\!512$; v3 is
+1.11$\times$ and 1.12$\times$ vLLM at those larger batches, respectively.
+The 7--12\% edge is remarkably consistent across the batch ladder,
+confirming it's a genuine structural advantage (fused QKV, cuBLASLt
+autotune, fused epilogues, no Python dispatch) rather than a
+measurement artifact at a single point.
 
 \paragraph{Sources of v3's gain over v2.}
 Four structural changes: (i) fused Q$\|$K$\|$V GEMM (one launch,
@@ -625,28 +619,30 @@ down residual-add fused into the GEMM via \texttt{beta}=1 against the
 residual tensor. Each change removes a kernel launch without introducing
 a megakernel.
 
-\subsection{v3 session progression}
+\subsection{v3 session progression (at $N\!=\!128$)}
 
-\begin{tabular}{lrrr}
+\begin{tabular}{lrr}
 \toprule
-\textbf{Step} & \textbf{tok/s} & \textbf{Batch} & $\boldsymbol\Delta$ \\
+\textbf{Step} & \textbf{tok/s} & $\boldsymbol\Delta$ \\
 \midrule
-Eager (no graph)                              & 551     & 128 & --- \\
-+ CUDA graph capture                          & 14{,}745 & 128 & 27$\times$ \\
-+ f16 RoPE tables                             & 15{,}537 & 128 & +5\% \\
-+ q/k/v bias load + fused QKV                  & 15{,}985 & 128 & +3\% \\
-+ cuBLASLt + \texttt{EPILOGUE\_BIAS} (QKV)    & 17{,}562 & 128 & +10\% \\
-+ all 5 linears on cuBLASLt                   & 22{,}496 & 128 & +28\% \\
-+ FP8 E4M3 KV + final RMSnorm                 & 20{,}841 & 128 & $-$7\%, but\ldots \\
-\ldots FP8 KV unlocks $N\!=\!256$            & 31{,}178 & 256 & +\textbf{50}\% \\
-\textbf{\ldots and $N\!=\!512$}              & \textbf{40{,}331} & \textbf{512} & +\textbf{29}\% \\
+Eager (no graph)                              & 551     & --- \\
++ CUDA graph capture                          & 14{,}745 & 27$\times$ \\
++ f16 RoPE tables                             & 15{,}537 & +5\% \\
++ q/k/v bias load + fused QKV                  & 15{,}985 & +3\% \\
++ cuBLASLt + \texttt{EPILOGUE\_BIAS} (QKV)    & 17{,}562 & +10\% \\
++ all 5 linears on cuBLASLt                   & 22{,}496 & +28\% \\
++ FP8 E4M3 KV + final RMSnorm correctness     & 20{,}841 & $-$7\% \\
 \bottomrule
 \end{tabular}
 
-At matched batch $N\!=\!128$ the FP8 KV migration is a small
-regression (FA3 dequant overhead exceeds the HBM bandwidth savings at
-short contexts). The value of FP8 KV is the 2$\times$ memory halving
-that unlocks the larger batches, where GEMM saturation wins dominate.
+At $N\!=\!128$ the FP8 KV migration costs a small amount of per-token
+throughput (FA3 dequant overhead at short contexts slightly outpaces
+the HBM bandwidth savings). The primary value of FP8 KV is the
+2$\times$ memory halving, which at matched per-layer allocation
+leaves headroom for longer context lengths and --- importantly for
+serving --- fewer KV-allocator evictions under load. At $N\!=\!256$
+and $N\!=\!512$ the per-token number scales up cleanly as GEMMs
+approach HBM saturation (31{,}178 and 40{,}331~tok/s respectively).
 
 \subsection{Where the cycles go (v2 baseline reference)}
 
@@ -732,7 +728,7 @@ Python-hosted serving stacks can be written entirely in Rust, with a
 single compute stream per worker, a frozen metadata layout per graph
 bucket, and a kernel catalog in which every variant's workspace and
 schedule are known at engine initialization. The v3 engine achieves
-\textbf{40{,}331~tok/s} at $N\!=\!512$ (and 20{,}841~tok/s at matched $N\!=\!128$) serving Qwen2.5-7B in FP8 on a single H100, with
+\textbf{40{,}331~tok/s} at $N\!=\!512$ (1.12$\times$ vLLM 0.19 at the same batch; 1.07--1.12$\times$ consistently across $N\!=\!128/256/512$) serving Qwen2.5-7B in FP8 on a single H100, with
 339~kernel launches per decode step compressed into one
 \texttt{cuGraphLaunch} replay. The archived v2 stack (commit
 \texttt{eb9e247fd}) reached 19{,}287~tok/s at the same batch on the same
