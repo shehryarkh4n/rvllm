@@ -229,25 +229,53 @@ impl Bringup {
         let qkv_rows = (nh + 2 * nkvh) * head_dim;
         require_multiple(hidden as usize, 8, "hidden")?;
 
-        // --- scratch allocations -----------------------------------------
+        // Optional real-prefill phase: when RVLLM_REAL_PREFILL=1 we run
+        // one multi-query FA3 prefill over `prefill_len` tokens per seq
+        // before the decode loop, instead of 16 eager decode steps.
+        // Scratch must fit max(num_seqs, num_seqs * prefill_len) tokens.
+        let real_prefill: bool =
+            std::env::var("RVLLM_REAL_PREFILL").ok().as_deref() == Some("1");
+        let prefill_len: u32 = std::env::var("RVLLM_PREFILL_LEN")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(16);
+        let max_tokens: u32 = if real_prefill {
+            num_seqs * prefill_len
+        } else {
+            num_seqs
+        };
+
+        // --- scratch allocations (sized for max_tokens) ------------------
         let arena = &self.arena;
-        let hidden_fp8 = arena.region("hidden_fp8", (num_seqs * hidden) as usize, 16)?;
-        let hidden_scale = arena.region("hidden_scale", (num_seqs * 4) as usize, 16)?;
-        // One packed QKV output: [num_tokens, q_dim + 2*kv_dim] f16.
-        let qkv_out_bytes = (num_seqs * qkv_rows * 2) as usize;
+        let hidden_fp8 = arena.region("hidden_fp8", (max_tokens * hidden) as usize, 16)?;
+        let hidden_scale = arena.region("hidden_scale", (max_tokens * 4) as usize, 16)?;
+        // Packed QKV output. cuBLASLt writes in col-major [N, M] which
+        // is physical layout "all Q heads over all M tokens, then all K
+        // heads, then all V heads". So k_base = q_base + (num_tokens *
+        // q_dim * 2 bytes) and v_base = k_base + (num_tokens * kv_dim *
+        // 2 bytes). num_tokens here is max_tokens (the allocation
+        // ceiling); the effective per-call offset depends on the phase
+        // and is computed by the caller.
+        let qkv_out_bytes = (max_tokens * qkv_rows * 2) as usize;
         let qkv_out = arena.region("qkv_out", qkv_out_bytes, 16)?;
         let q_base = qkv_out.device_ptr();
-        let k_base = q_base + (num_seqs as u64) * (q_dim as u64) * 2;
-        let v_base = k_base + (num_seqs as u64) * (kv_dim as u64) * 2;
-        let attn_out = arena.region("attn_out", (num_seqs * q_dim * 2) as usize, 16)?;
-        let attn_out_fp8 = arena.region("attn_out_fp8", (num_seqs * q_dim) as usize, 16)?;
-        let attn_out_scale = arena.region("attn_out_scale", (num_seqs * 4) as usize, 16)?;
+        // For decode and prefill alike, the offsets depend on the
+        // GEMM's M dim (num_tokens). At decode num_tokens = num_seqs;
+        // at prefill num_tokens = num_seqs * prefill_len. We precompute
+        // both sets of offsets so the same scratch region serves both.
+        let k_base_decode = q_base + (num_seqs as u64) * (q_dim as u64) * 2;
+        let v_base_decode = k_base_decode + (num_seqs as u64) * (kv_dim as u64) * 2;
+        let k_base_prefill = q_base + (max_tokens as u64) * (q_dim as u64) * 2;
+        let v_base_prefill = k_base_prefill + (max_tokens as u64) * (kv_dim as u64) * 2;
+        let attn_out = arena.region("attn_out", (max_tokens * q_dim * 2) as usize, 16)?;
+        let attn_out_fp8 = arena.region("attn_out_fp8", (max_tokens * q_dim) as usize, 16)?;
+        let attn_out_scale = arena.region("attn_out_scale", (max_tokens * 4) as usize, 16)?;
         let gate_up_out =
-            arena.region("gate_up_out", (num_seqs * 2 * inter * 2) as usize, 16)?;
-        let gate_up_fp8 = arena.region("gate_up_fp8", (num_seqs * 2 * inter) as usize, 16)?;
-        let gate_up_scale = arena.region("gate_up_scale", (num_seqs * 4) as usize, 16)?;
-        let mlp_out_fp8 = arena.region("mlp_out_fp8", (num_seqs * inter) as usize, 16)?;
-        let mlp_out_scale = arena.region("mlp_out_scale", (num_seqs * 4) as usize, 16)?;
+            arena.region("gate_up_out", (max_tokens * 2 * inter * 2) as usize, 16)?;
+        let gate_up_fp8 = arena.region("gate_up_fp8", (max_tokens * 2 * inter) as usize, 16)?;
+        let gate_up_scale = arena.region("gate_up_scale", (max_tokens * 4) as usize, 16)?;
+        let mlp_out_fp8 = arena.region("mlp_out_fp8", (max_tokens * inter) as usize, 16)?;
+        let mlp_out_scale = arena.region("mlp_out_scale", (max_tokens * 4) as usize, 16)?;
 
         let num_blocks_total: u32 = 1024;
         // FA3 paged_decode block_size (tokens per KV page). Default 64;
@@ -402,7 +430,16 @@ impl Bringup {
         let stream = self.stream.raw();
         let residual_ptr = residual.device_ptr();
 
-        let one_step = || -> Result<()> {
+        let one_step = |phase: layer_exec::LayerPhase| -> Result<()> {
+            let (layer_num_tokens, k_base_phase, v_base_phase) = match phase {
+                layer_exec::LayerPhase::Decode => (num_seqs, k_base_decode, v_base_decode),
+                layer_exec::LayerPhase::Prefill { max_seqlen_q, .. } => {
+                    // total_q = num_seqs * max_seqlen_q (uniform prompt length)
+                    (num_seqs * max_seqlen_q, k_base_prefill, v_base_prefill)
+                }
+            };
+            let mut phase_dims = dims;
+            phase_dims.num_tokens = layer_num_tokens;
             for (layer_idx, layer) in self.model.layers.iter().enumerate() {
                 let layer_kv_base =
                     kv_cache.device_ptr() + (layer_idx as u64) * (kv_per_layer as u64);
@@ -423,8 +460,8 @@ impl Bringup {
                     hidden_fp8: hidden_fp8.device_ptr(),
                     hidden_scale: hidden_scale.device_ptr(),
                     q_out: q_base,
-                    k_out: k_base,
-                    v_out: v_base,
+                    k_out: k_base_phase,
+                    v_out: v_base_phase,
                     q_fp8: q_fp8.device_ptr(),
                     k_cache: layer_kv_base,
                     v_cache: layer_kv_base + (kv_per_layer / 2) as u64,
@@ -450,8 +487,8 @@ impl Bringup {
                     block_tables: block_tables.device_ptr(),
                     context_lens: context_lens.device_ptr(),
                 };
-                layer_exec::forward(
-                    dims,
+                layer_exec::forward_phase(
+                    phase_dims,
                     &kernels,
                     &w,
                     &scratch,
@@ -462,9 +499,14 @@ impl Bringup {
                     &self.fa3,
                     residual_ptr,
                     stream,
+                    phase,
                 )?;
             }
-            if !skip_lm_head {
+            // Skip LM head during prefill — we only care about first-token
+            // sampling after the LAST token of each seq, which is a
+            // separate post-prefill step the caller handles.
+            let is_prefill = matches!(phase, layer_exec::LayerPhase::Prefill { .. });
+            if !skip_lm_head && !is_prefill {
                 // LM head tail: fused_rmsnorm_fp8_quant applies the
                 // model.norm weight AND produces FP8 hidden in one kernel.
                 // Same kernel count as the previous quantize-only step,
@@ -512,7 +554,7 @@ impl Bringup {
 
         // Eager warmup so any first-run kernel setup lands outside the graph.
         for _ in 0..warmup {
-            one_step()?;
+            one_step(layer_exec::LayerPhase::Decode)?;
         }
         self.stream.fence()?;
 
@@ -548,6 +590,57 @@ impl Bringup {
             Ok(())
         };
 
+        // Real-prefill metadata setup: when RVLLM_REAL_PREFILL=1, we run
+        // ONE multi-query FA3 prefill over `prefill_len` tokens per seq
+        // (total_q = num_seqs * prefill_len). Populate cu_seqlens_q +
+        // per-token positions + per-token slot_mapping + per-seq
+        // context_lens = prefill_len.
+        let cu_seqlens_q_region = if real_prefill {
+            Some(arena.region(
+                "cu_seqlens_q",
+                ((num_seqs as usize + 1) * 4) as usize,
+                16,
+            )?)
+        } else {
+            None
+        };
+
+        let run_real_prefill = |ttft_host: &mut rvllm_mem::PinnedBuf<i32>| -> Result<()> {
+            let l = prefill_len as i32;
+            let total = n * l as usize;
+            let pos_host: Vec<i32> = (0..n as i32)
+                .flat_map(|_seq| (0..l).collect::<Vec<_>>())
+                .collect();
+            let slot_host: Vec<i32> = (0..n as i32)
+                .flat_map(|seq| {
+                    (0..l)
+                        .map(|t| seq * max_blocks_per_seq as i32 * block_size as i32 + t)
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            let ctx_host: Vec<i32> = vec![l; n];
+            let cu_host: Vec<i32> = (0..=n as i32).map(|i| i * l).collect();
+            positions.copy_from_host(bytemuck_cast_i32(&pos_host[..total]))?;
+            slot_mapping.copy_from_host(bytemuck_cast_i32(&slot_host[..total]))?;
+            context_lens.copy_from_host(bytemuck_cast_i32(&ctx_host))?;
+            if let Some(r) = &cu_seqlens_q_region {
+                r.copy_from_host(bytemuck_cast_i32(&cu_host))?;
+            }
+            // One prefill forward pass (all 28 layers).
+            let phase = layer_exec::LayerPhase::Prefill {
+                cu_seqlens_q: cu_seqlens_q_region
+                    .as_ref()
+                    .map(|r| r.device_ptr())
+                    .unwrap_or(0),
+                max_seqlen_q: prefill_len,
+            };
+            one_step(phase)?;
+            // Reset metadata to decode shape for the follow-on decode loop
+            // (sequences now have prefill_len tokens cached).
+            let _ = ttft_host; // silence on non-ttft path
+            Ok(())
+        };
+
         // Faux-prefill loop: when not measuring TTFT just run it normally;
         // when measuring TTFT, wrap the whole "prompt ingest -> first token
         // on host" sequence in a timer.
@@ -555,9 +648,13 @@ impl Bringup {
         let ttft_ns: Option<u128> = if measure_ttft {
             self.stream.fence()?;
             let t_ttft_start = std::time::Instant::now();
-            for step in 0..FAUX_PREFILL_STEPS {
-                set_step_meta(step)?;
-                one_step()?;
+            if real_prefill {
+                run_real_prefill(&mut ttft_host_buf)?;
+            } else {
+                for step in 0..FAUX_PREFILL_STEPS {
+                    set_step_meta(step)?;
+                    one_step(layer_exec::LayerPhase::Decode)?;
+                }
             }
             // Fence to ensure prefill's sampled_tokens are written before DtoH.
             self.stream.fence()?;
@@ -565,15 +662,19 @@ impl Bringup {
             self.stream.fence()?;
             Some(t_ttft_start.elapsed().as_nanos())
         } else {
-            for step in 0..FAUX_PREFILL_STEPS {
-                set_step_meta(step)?;
-                one_step()?;
+            if real_prefill {
+                run_real_prefill(&mut ttft_host_buf)?;
+            } else {
+                for step in 0..FAUX_PREFILL_STEPS {
+                    set_step_meta(step)?;
+                    one_step(layer_exec::LayerPhase::Decode)?;
+                }
             }
             self.stream.fence()?;
             None
         };
 
-        // Capture one step into a CUDA graph then replay for the bench.
+        // Capture one decode step into a CUDA graph then replay for the bench.
         let mut one_step = one_step;
         let graph = rvllm_graph::CapturedGraph::capture(
             num_seqs,
@@ -581,7 +682,7 @@ impl Bringup {
             rvllm_metadata::MetadataLayout::compute(num_seqs, max_blocks_per_seq).hash(),
             rvllm_graph::GraphFingerprint([0u8; 32]),
             stream,
-            || one_step(),
+            || one_step(layer_exec::LayerPhase::Decode),
         )?;
 
         let t0 = std::time::Instant::now();
