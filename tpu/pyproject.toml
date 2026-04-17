@@ -1,0 +1,18 @@
+[project]
+name = "rvllm-tpu"
+version = "0.0.1"
+description = "StableHLO port suite for rvLLM CUDA kernels."
+requires-python = ">=3.11"
+dependencies = [
+  "jax>=0.4.34",
+  "jaxlib>=0.4.34",
+  "numpy>=1.26",
+  "tomli>=2.0; python_version < '3.11'",
+]
+
+[project.optional-dependencies]
+tpu = ["jax[tpu]>=0.4.34"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["ports*", "harness*"]

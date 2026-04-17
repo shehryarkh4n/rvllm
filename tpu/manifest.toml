@@ -1,0 +1,368 @@
+# rvLLM kernel → StableHLO port manifest.
+# status:    stub | impl | todo   (stub = empty signature, impl = JAX reference
+#                                  matching CUDA semantics, todo = documented
+#                                  gap that the emitter will refuse to emit)
+# port:      "ports.<module>:<symbol>"
+# family:    logical group — informational only
+# dtypes:    input/weight compute dtypes the port accepts
+# shapes:    representative shape template for tracing (used by emitter)
+
+[[kernel]]
+name   = "rms_norm"
+cu     = ["rms_norm.cu", "rms_norm_f16.cu"]
+port   = "ports.rms_norm:rms_norm"
+family = "norm"
+status = "impl"
+dtypes = ["f32", "f16", "bf16"]
+shapes = { num_tokens = 128, hidden = 4096 }
+
+[[kernel]]
+name   = "fused_residual_rmsnorm"
+cu     = ["fused_residual_rmsnorm.cu", "fused_residual_rmsnorm_f16.cu"]
+port   = "ports.rms_norm:fused_residual_rms_norm"
+family = "norm"
+status = "impl"
+dtypes = ["f32", "f16", "bf16"]
+shapes = { num_tokens = 128, hidden = 4096 }
+
+[[kernel]]
+name   = "fused_rmsnorm_fp8_quant"
+cu     = ["fused_rmsnorm_fp8_quant.cu"]
+port   = "ports.rms_norm:fused_rmsnorm_fp8_quant"
+family = "norm"
+status = "todo"
+dtypes = ["bf16-in", "f8e4m3-out"]
+shapes = { num_tokens = 128, hidden = 4096 }
+
+[[kernel]]
+name   = "rotary_embedding"
+cu     = ["rotary_embedding.cu", "rotary_embedding_f16.cu"]
+port   = "ports.rope:rotary_embedding"
+family = "rope"
+status = "impl"
+dtypes = ["f32", "f16", "bf16"]
+shapes = { num_tokens = 128, num_heads = 32, num_kv_heads = 8, head_dim = 128, max_pos = 4096 }
+
+[[kernel]]
+name   = "fused_rope_cache"
+cu     = ["fused_rope_cache.cu"]
+port   = "ports.rope:fused_rope_cache"
+family = "rope"
+status = "impl"
+dtypes = ["bf16"]
+shapes = { num_tokens = 128, num_heads = 32, num_kv_heads = 8, head_dim = 128, max_pos = 4096, num_blocks = 1024, block_size = 16 }
+
+[[kernel]]
+name   = "softmax"
+cu     = ["softmax.cu", "softmax_f16.cu"]
+port   = "ports.softmax:softmax"
+family = "softmax"
+status = "impl"
+dtypes = ["f32", "f16", "bf16"]
+shapes = { rows = 128, cols = 32000 }
+
+[[kernel]]
+name   = "activation_silu"
+cu     = ["activation.cu", "activation_f16.cu"]
+port   = "ports.activation:silu"
+family = "elementwise"
+status = "impl"
+dtypes = ["f32", "f16", "bf16"]
+shapes = { n = 524288 }
+
+[[kernel]]
+name   = "activation_gelu"
+cu     = ["activation.cu", "activation_f16.cu"]
+port   = "ports.activation:gelu"
+family = "elementwise"
+status = "impl"
+dtypes = ["f32", "f16", "bf16"]
+shapes = { n = 524288 }
+
+[[kernel]]
+name   = "fused_silu_mul"
+cu     = ["activation.cu", "activation_f16.cu", "silu_mul_interleaved.cu"]
+port   = "ports.activation:fused_silu_mul"
+family = "elementwise"
+status = "impl"
+dtypes = ["f32", "f16", "bf16"]
+shapes = { num_tokens = 128, intermediate = 14336 }
+
+[[kernel]]
+name   = "add_bias"
+cu     = ["add_bias.cu", "add_bias_f16.cu", "add_bias_broadcast.cu"]
+port   = "ports.bias:add_bias"
+family = "elementwise"
+status = "impl"
+dtypes = ["f32", "f16", "bf16"]
+shapes = { rows = 128, cols = 4096 }
+
+[[kernel]]
+name   = "cast_fp"
+cu     = ["cast_fp.cu"]
+port   = "ports.cast:cast_fp"
+family = "elementwise"
+status = "impl"
+dtypes = ["f32->f16", "f32->bf16", "f16->f32", "bf16->f32"]
+shapes = { n = 524288 }
+
+[[kernel]]
+name   = "argmax"
+cu     = ["argmax.cu", "argmax_f16.cu"]
+port   = "ports.reduce:argmax"
+family = "reduction"
+status = "impl"
+dtypes = ["f32", "f16", "bf16"]
+shapes = { rows = 128, cols = 32000 }
+
+[[kernel]]
+name   = "fused_lm_head_argmax"
+cu     = ["fused_lm_head_argmax.cu", "fused_lm_head_argmax_f16.cu"]
+port   = "ports.reduce:fused_lm_head_argmax"
+family = "reduction"
+status = "impl"
+dtypes = ["f16", "bf16"]
+shapes = { num_tokens = 128, hidden = 4096, vocab = 128256 }
+
+[[kernel]]
+name   = "embedding_gather"
+cu     = ["embedding_gather.cu", "embedding_gather_f16.cu"]
+port   = "ports.embedding:embedding_gather"
+family = "gather"
+status = "impl"
+dtypes = ["f32", "f16", "bf16"]
+shapes = { num_tokens = 128, vocab = 128256, hidden = 4096 }
+
+[[kernel]]
+name   = "copy_blocks"
+cu     = ["copy_blocks.cu", "copy_blocks_f16.cu"]
+port   = "ports.kv:copy_blocks"
+family = "kv-cache"
+status = "impl"
+dtypes = ["f32", "f16", "bf16"]
+shapes = { num_layers = 32, num_blocks = 1024, block_size = 16, num_kv_heads = 8, head_dim = 128, num_pairs = 64 }
+
+[[kernel]]
+name   = "reshape_and_cache"
+cu     = ["reshape_and_cache.cu", "reshape_and_cache_f16.cu"]
+port   = "ports.kv:reshape_and_cache"
+family = "kv-cache"
+status = "impl"
+dtypes = ["f16", "bf16"]
+shapes = { num_tokens = 128, num_kv_heads = 8, head_dim = 128, num_blocks = 1024, block_size = 16 }
+
+[[kernel]]
+name   = "fp8_kv"
+cu     = ["fp8_kv.cu"]
+port   = "ports.kv:fp8_kv"
+family = "kv-cache"
+status = "todo"
+dtypes = ["bf16-in", "f8e4m3-out"]
+shapes = { num_tokens = 128, num_kv_heads = 8, head_dim = 128, num_blocks = 1024, block_size = 16 }
+
+[[kernel]]
+name   = "qkv_transpose"
+cu     = ["qkv_transpose.cu"]
+port   = "ports.shape:qkv_transpose"
+family = "layout"
+status = "impl"
+dtypes = ["f16", "bf16"]
+shapes = { num_tokens = 128, num_heads = 32, head_dim = 128 }
+
+[[kernel]]
+name   = "deinterleave_qkv"
+cu     = ["deinterleave_qkv.cu"]
+port   = "ports.shape:deinterleave_qkv"
+family = "layout"
+status = "impl"
+dtypes = ["f16", "bf16"]
+shapes = { num_tokens = 128, num_heads = 32, num_kv_heads = 8, head_dim = 128 }
+
+[[kernel]]
+name   = "quantize_activation_fp8"
+cu     = ["quantize_activation_fp8.cu"]
+port   = "ports.quant:quantize_activation_fp8"
+family = "quant"
+status = "todo"
+dtypes = ["bf16-in", "f8e4m3-out"]
+shapes = { num_tokens = 128, hidden = 4096 }
+
+[[kernel]]
+name   = "fused_silu_fp8_quant"
+cu     = ["fused_silu_fp8_quant.cu"]
+port   = "ports.quant:fused_silu_fp8_quant"
+family = "quant"
+status = "todo"
+dtypes = ["bf16-in", "f8e4m3-out"]
+shapes = { num_tokens = 128, intermediate = 14336 }
+
+[[kernel]]
+name   = "gemm_bf16"
+cu     = ["cutlass_gemm.cu", "cutlass_hgemm_autotune.cu"]
+port   = "ports.gemm:gemm_bf16"
+family = "gemm"
+status = "impl"
+dtypes = ["bf16"]
+shapes = { m = 128, n = 4096, k = 4096 }
+
+[[kernel]]
+name   = "gemv_f16"
+cu     = ["gemv_f16.cu", "tc_gemv_decode.cu", "tma_gemv_fp16.cu", "wgmma_gemv.cu"]
+port   = "ports.gemm:gemv_bf16"
+family = "gemm"
+status = "impl"
+dtypes = ["bf16"]
+shapes = { m = 1, n = 4096, k = 4096 }
+
+[[kernel]]
+name   = "gemv_fp8"
+cu     = ["gemv_fp8.cu"]
+port   = "ports.gemm:gemv_fp8"
+family = "gemm"
+status = "todo"
+dtypes = ["f8e4m3"]
+shapes = { m = 1, n = 4096, k = 4096 }
+
+[[kernel]]
+name   = "gemv_int4"
+cu     = ["gemv_int4.cu"]
+port   = "ports.gemm:gemv_int4"
+family = "gemm"
+status = "impl"
+dtypes = ["int4-weight", "bf16-act"]
+shapes = { m = 1, n = 4096, k = 4096, group_size = 128 }
+
+[[kernel]]
+name   = "cutlass_fp8_gemm"
+cu     = ["cutlass_fp8_gemm.cu", "cutlass_fp8_gemm_autotune.cu", "cutlass_fp8_gemm_residual.cu"]
+port   = "ports.gemm:gemm_fp8_scaled"
+family = "gemm"
+status = "todo"
+dtypes = ["f8e4m3"]
+shapes = { m = 128, n = 4096, k = 4096 }
+
+[[kernel]]
+name   = "cutlass_qkv_bias"
+cu     = ["cutlass_qkv_bias.cu"]
+port   = "ports.gemm:gemm_qkv_bias"
+family = "gemm"
+status = "impl"
+dtypes = ["bf16"]
+shapes = { m = 128, hidden = 4096, qkv_out = 6144 }
+
+[[kernel]]
+name   = "cutlass_gateup_silu"
+cu     = ["cutlass_gateup_silu.cu", "cutlass_gateup_silu_autotune.cu"]
+port   = "ports.gemm:gemm_gateup_silu"
+family = "gemm"
+status = "impl"
+dtypes = ["bf16"]
+shapes = { m = 128, hidden = 4096, intermediate = 14336 }
+
+[[kernel]]
+name   = "cutlass_oproj_residual"
+cu     = ["cutlass_oproj_residual.cu", "cutlass_oproj_residual_autotune.cu"]
+port   = "ports.gemm:gemm_oproj_residual"
+family = "gemm"
+status = "impl"
+dtypes = ["bf16"]
+shapes = { m = 128, hidden = 4096 }
+
+[[kernel]]
+name   = "fused_silu_down"
+cu     = ["fused_silu_down.cu", "fused_silu_down_gemv.cu"]
+port   = "ports.gemm:fused_silu_down"
+family = "gemm"
+status = "impl"
+dtypes = ["bf16"]
+shapes = { m = 128, hidden = 4096, intermediate = 14336 }
+
+[[kernel]]
+name   = "fused_norm_gemv"
+cu     = ["fused_norm_gemv.cu"]
+port   = "ports.gemm:fused_norm_gemv"
+family = "gemm"
+status = "impl"
+dtypes = ["bf16"]
+shapes = { m = 1, hidden = 4096, out = 4096 }
+
+[[kernel]]
+name   = "fused_add_norm_qkv_gemv"
+cu     = ["fused_add_norm_qkv_gemv.cu"]
+port   = "ports.gemm:fused_add_norm_qkv_gemv"
+family = "gemm"
+status = "impl"
+dtypes = ["bf16"]
+shapes = { m = 1, hidden = 4096, qkv_out = 6144 }
+
+[[kernel]]
+name   = "fused_add_norm_gateup_gemv"
+cu     = ["fused_add_norm_gateup_gemv.cu"]
+port   = "ports.gemm:fused_add_norm_gateup_gemv"
+family = "gemm"
+status = "impl"
+dtypes = ["bf16"]
+shapes = { m = 1, hidden = 4096, intermediate = 14336 }
+
+[[kernel]]
+name   = "fused_oproj_add_norm_gateup_gemv"
+cu     = ["fused_oproj_add_norm_gateup_gemv.cu"]
+port   = "ports.gemm:fused_oproj_add_norm_gateup_gemv"
+family = "gemm"
+status = "impl"
+dtypes = ["bf16"]
+shapes = { m = 1, hidden = 4096, intermediate = 14336 }
+
+[[kernel]]
+name   = "flash_attention"
+cu     = ["flash_attention.cu"]
+port   = "ports.attention:flash_attention"
+family = "attention"
+status = "impl"
+dtypes = ["bf16"]
+shapes = { batch = 1, seq_q = 128, seq_k = 128, num_heads = 32, num_kv_heads = 8, head_dim = 128 }
+
+[[kernel]]
+name   = "flash_attention_3"
+cu     = ["flash_attention_3.cu", "flash_attention_3_prefill.cu", "flash_attention_3_v3.cu", "fa3_sm90_wrapper.cu"]
+port   = "ports.attention:flash_attention"
+family = "attention"
+status = "impl"
+dtypes = ["bf16"]
+shapes = { batch = 1, seq_q = 128, seq_k = 128, num_heads = 32, num_kv_heads = 8, head_dim = 128 }
+
+[[kernel]]
+name   = "paged_attention"
+cu     = ["paged_attention.cu"]
+port   = "ports.attention:paged_attention"
+family = "attention"
+status = "impl"
+dtypes = ["bf16"]
+shapes = { num_seqs = 8, num_heads = 32, num_kv_heads = 8, head_dim = 128, num_blocks = 1024, block_size = 16, max_ctx_blocks = 256 }
+
+[[kernel]]
+name   = "split_kv_attention"
+cu     = ["split_kv_attention.cu"]
+port   = "ports.attention:split_kv_attention"
+family = "attention"
+status = "impl"
+dtypes = ["bf16"]
+shapes = { num_seqs = 8, num_heads = 32, num_kv_heads = 8, head_dim = 128, num_blocks = 1024, block_size = 16, num_splits = 4 }
+
+[[kernel]]
+name   = "persistent_gemm"
+cu     = ["persistent_gemm.cu"]
+port   = "ports.gemm:gemm_bf16"
+family = "gemm"
+status = "impl"
+dtypes = ["bf16"]
+shapes = { m = 128, n = 4096, k = 4096 }
+
+[[kernel]]
+name   = "persistent_layer_decode"
+cu     = ["persistent_layer_decode.cu", "persistent_layer_v3.cu", "megakernel_decode.cu"]
+port   = "ports.megakernel:decode_layer"
+family = "megakernel"
+status = "impl"
+dtypes = ["bf16"]
+shapes = { num_seqs = 8, hidden = 4096, num_heads = 32, num_kv_heads = 8, head_dim = 128, intermediate = 14336, num_blocks = 1024, block_size = 16 }

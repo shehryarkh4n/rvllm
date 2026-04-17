@@ -319,6 +319,95 @@ footer{margin-top:4rem;padding-top:1.5rem;border-top:1px solid #151515;color:#66
   <div id="chart-coldstart" style="height:200px"></div>
 </div>
 
+<h2 class="section">TPU v6e (Trillium) &mdash; StableHLO port <span class="sub">kernel latency, single chip, bf16</span> <span class="badge measured">Measured</span></h2>
+
+<div class="caveat">
+  <strong>Read this before comparing to the H100 numbers.</strong> The TPU run is a <em>port proof</em>, not a head-to-head. Kernel shapes match the H100 bench but dtype is <strong>bf16 on TPU vs fp8 e4m3 on H100</strong> (TPU v6e has no fp8 StableHLO op yet), compute is <strong>dense on TPU vs quantised on H100</strong>, and the device is a <strong>single v6e-1 chip</strong> (918 TFLOPS bf16, 32 GB HBM) vs an H100 SXM 80 GB. 34 of 40 rvLLM CUDA kernels lowered to StableHLO and executed on real TPU silicon in one batch; the 6 skipped are all FP8 paths that require a <code>stablehlo.custom_call</code> fallback we deliberately refused to write.
+</div>
+
+<div class="pill-row">
+  <div class="pill">
+    <div class="label">kernels running on TPU</div>
+    <strong>34/40</strong>
+    <div class="caption">6 FP8 kernels skipped (no silent fallbacks)</div>
+  </div>
+  <div class="pill">
+    <div class="label">full decode layer</div>
+    <strong>2.15&nbsp;ms</strong>
+    <div class="caption">persistent_layer_decode, bs=8, bf16</div>
+  </div>
+  <div class="pill">
+    <div class="label">flash attention</div>
+    <strong>137&nbsp;&mu;s</strong>
+    <div class="caption">B=1 Sq=Sk=128 H=32 HKV=8 D=128 bf16</div>
+  </div>
+  <div class="pill">
+    <div class="label">compile path</div>
+    <strong>JAX &rarr; StableHLO &rarr; XLA</strong>
+    <div class="caption">jax 0.6.2, v6e-1, us-east5-b</div>
+  </div>
+</div>
+
+<h3>Per-kernel latency on v6e-1</h3>
+<div class="chart-box">
+  <div class="chart-title"><strong>TPU v6e-1 kernel latency (&mu;s)</strong> &mdash; warmup&times;3, median of 20 iters, bf16 where applicable
+    <div class="note">Single-chip Trillium. Same logical shapes as the H100 rvLLM bench &mdash; hidden=4096, heads=32, kv_heads=8, head_dim=128, intermediate=14336, block_size=16. FP8 / INT4 kernels tagged as <strong>n/a</strong> are manifest-level TODOs blocked on a StableHLO FP8 op; they do not run.</div>
+  </div>
+  <div id="chart-tpu" style="height:560px"></div>
+</div>
+
+<table>
+<thead><tr><th>kernel</th><th>family</th><th class="r">v6e-1 &mu;s</th><th>notes</th></tr></thead>
+<tbody>
+<tr><td>rms_norm</td><td>norm</td><td class="r">138.1</td><td>128&times;4096 fp32</td></tr>
+<tr><td>fused_residual_rmsnorm</td><td>norm</td><td class="r">193.3</td><td>add + norm, 2 outputs</td></tr>
+<tr><td>fused_rmsnorm_fp8_quant</td><td>norm</td><td class="r">n/a</td><td>FP8 quant, no StableHLO op</td></tr>
+<tr><td>rotary_embedding</td><td>rope</td><td class="r">200.3</td><td>GQA, 32/8 heads</td></tr>
+<tr><td>fused_rope_cache</td><td>rope</td><td class="r">289.9</td><td>RoPE + reshape_and_cache</td></tr>
+<tr><td>softmax</td><td>softmax</td><td class="r">159.3</td><td>128&times;32000 stable</td></tr>
+<tr><td>activation_silu</td><td>elementwise</td><td class="r">132.9</td><td>524k-elem vector</td></tr>
+<tr><td>activation_gelu</td><td>elementwise</td><td class="r">131.3</td><td>exact (non-approx)</td></tr>
+<tr><td>fused_silu_mul</td><td>elementwise</td><td class="r">138.5</td><td>interleaved gate_up split</td></tr>
+<tr><td>add_bias</td><td>elementwise</td><td class="r">128.3</td><td>broadcast over rows</td></tr>
+<tr><td>cast_fp</td><td>elementwise</td><td class="r">128.0</td><td>fp32 &rarr; bf16</td></tr>
+<tr><td>argmax</td><td>reduction</td><td class="r">136.7</td><td>128&times;32000 &rarr; i32</td></tr>
+<tr><td>fused_lm_head_argmax</td><td>reduction</td><td class="r">895.1</td><td>einsum + argmax, vocab=128k</td></tr>
+<tr><td>embedding_gather</td><td>gather</td><td class="r">132.9</td><td>vocab=128k, 128 tokens</td></tr>
+<tr><td>copy_blocks</td><td>kv-cache</td><td class="r">388.9</td><td>64 (src,dst) scatter pairs</td></tr>
+<tr><td>reshape_and_cache</td><td>kv-cache</td><td class="r">273.1</td><td>128 tokens &rarr; paged slots</td></tr>
+<tr><td>fp8_kv</td><td>kv-cache</td><td class="r">n/a</td><td>FP8 E4M3 cache, no op</td></tr>
+<tr><td>qkv_transpose</td><td>layout</td><td class="r">125.6</td><td>[T,H,D] &rarr; [H,T,D]</td></tr>
+<tr><td>deinterleave_qkv</td><td>layout</td><td class="r">196.6</td><td>static-split Q/K/V</td></tr>
+<tr><td>quantize_activation_fp8</td><td>quant</td><td class="r">n/a</td><td>FP8 quant, no op</td></tr>
+<tr><td>fused_silu_fp8_quant</td><td>quant</td><td class="r">n/a</td><td>FP8 quant, no op</td></tr>
+<tr><td>gemm_bf16</td><td>gemm</td><td class="r">137.7</td><td>M=128 N=K=4096</td></tr>
+<tr><td>gemv_f16</td><td>gemm</td><td class="r">150.5</td><td>M=1 N=K=4096</td></tr>
+<tr><td>gemv_fp8</td><td>gemm</td><td class="r">n/a</td><td>FP8 scaled dot, no op</td></tr>
+<tr><td>gemv_int4</td><td>gemm</td><td class="r">257.4</td><td>dequant + dot</td></tr>
+<tr><td>cutlass_fp8_gemm</td><td>gemm</td><td class="r">n/a</td><td>FP8 scaled dot, no op</td></tr>
+<tr><td>cutlass_qkv_bias</td><td>gemm</td><td class="r">136.5</td><td>M=128, qkv_out=6144</td></tr>
+<tr><td>cutlass_gateup_silu</td><td>gemm</td><td class="r">290.1</td><td>M=128 &rarr; 2&times;14336</td></tr>
+<tr><td>cutlass_oproj_residual</td><td>gemm</td><td class="r">137.3</td><td>M=128, hidden=4096</td></tr>
+<tr><td>fused_silu_down</td><td>gemm</td><td class="r">211.6</td><td>silu_mul + down proj</td></tr>
+<tr><td>fused_norm_gemv</td><td>gemm</td><td class="r">152.1</td><td>M=1 decode row</td></tr>
+<tr><td>fused_add_norm_qkv_gemv</td><td>gemm</td><td class="r">221.7</td><td>residual path, M=1</td></tr>
+<tr><td>fused_add_norm_gateup_gemv</td><td>gemm</td><td class="r">347.3</td><td>M=1 MLP up</td></tr>
+<tr><td>fused_oproj_add_norm_gateup_gemv</td><td>gemm</td><td class="r">370.9</td><td>oproj + add + norm + gateup</td></tr>
+<tr><td>flash_attention</td><td>attention</td><td class="r">137.1</td><td>B=1 Sq=Sk=128 H=32 bf16</td></tr>
+<tr><td>flash_attention_3</td><td>attention</td><td class="r">134.2</td><td>same lower, shares HLO</td></tr>
+<tr><td>paged_attention</td><td>attention</td><td class="r">1,811.5</td><td>8 seqs &times; 256 blocks gather</td></tr>
+<tr><td>split_kv_attention</td><td>attention</td><td class="r">1,813.7</td><td>GPU split-KV collapses on XLA</td></tr>
+<tr><td>persistent_gemm</td><td>gemm</td><td class="r">136.0</td><td>XLA already re-fuses</td></tr>
+<tr><td><strong>persistent_layer_decode</strong></td><td>megakernel</td><td class="r"><strong>2,151.2</strong></td><td><strong>full decode layer, bs=8, all fused</strong></td></tr>
+</tbody>
+</table>
+
+<div class="footnote"><strong>What the numbers say.</strong>  Small ops cluster at 125&ndash;200&nbsp;&mu;s &mdash; that's the XLA host-to-device-dispatch floor on a single v6e chip, not the kernel body. Anything bigger (<code>paged_attention</code> at 1.8&nbsp;ms, the full decode layer at 2.15&nbsp;ms) is real compute. The paged-attention cost is dominated by the <code>stablehlo.gather</code> on the block table + 8&times; GQA expansion; this is the same math the H100 FA3 kernel is doing, but implemented in XLA primitives rather than a hand-tuned CUDA kernel. The 6 FP8 rows are the honest gap: TPU v6e has no StableHLO FP8 op yet and we refuse to insert a silent bf16 fallback. Fixing them is a StableHLO spec problem, not a port problem.</div>
+
+<div class="method">
+<strong>TPU suite</strong> (new, under <code>tpu/</code>): JAX traces each CUDA kernel's logical signature via a <code>ShapeDtypeStruct</code> trace-spec, <code>jax.jit(...).lower(...).compiler_ir(dialect="stablehlo")</code> emits one <code>.mlir</code> per kernel (1,138 lines total), and <code>harness/execute_all.py</code> runs them on the active JAX backend with warmup&times;3 + median-of-20 iter timing. On the host (M5) this proves lowering; the above numbers are on a fresh Cloud TPU v6e-1 in <code>us-east5-b</code>, deployed via <code>harness/deploy_to_tpu.sh</code>, then the VM was torn down.
+</div>
+
 <h2>Method &mdash; how these runs were produced</h2>
 <div class="method">
 <strong>rvLLM 0.3.0</strong> (tag <code>v0.3.0</code>, commit <code>82b1f59</code>):<br>
@@ -574,6 +663,59 @@ Reported throughput = tool's <code>Output token throughput (tok/s)</code>. Repor
     );
   }
 
+  // TPU v6e-1 per-kernel latency (µs). Only kernels that executed — FP8
+  // TODOs are omitted from the chart but listed n/a in the table above.
+  const tpuData = [
+    { name: 'persistent_layer_decode (full)', us: 2151.2 },
+    { name: 'split_kv_attention',             us: 1813.7 },
+    { name: 'paged_attention',                us: 1811.5 },
+    { name: 'fused_lm_head_argmax',           us: 895.1 },
+    { name: 'copy_blocks',                    us: 388.9 },
+    { name: 'fused_oproj_add_norm_gateup_gemv', us: 370.9 },
+    { name: 'fused_add_norm_gateup_gemv',     us: 347.3 },
+    { name: 'cutlass_gateup_silu',            us: 290.1 },
+    { name: 'fused_rope_cache',               us: 289.9 },
+    { name: 'reshape_and_cache',              us: 273.1 },
+    { name: 'gemv_int4',                      us: 257.4 },
+    { name: 'fused_add_norm_qkv_gemv',        us: 221.7 },
+    { name: 'fused_silu_down',                us: 211.6 },
+    { name: 'rotary_embedding',               us: 200.3 },
+    { name: 'deinterleave_qkv',               us: 196.6 },
+    { name: 'fused_residual_rmsnorm',         us: 193.3 },
+    { name: 'softmax',                        us: 159.3 },
+    { name: 'fused_norm_gemv',                us: 152.1 },
+    { name: 'gemv_f16',                       us: 150.5 },
+    { name: 'fused_silu_mul',                 us: 138.5 },
+    { name: 'rms_norm',                       us: 138.1 },
+    { name: 'gemm_bf16',                      us: 137.7 },
+    { name: 'cutlass_oproj_residual',         us: 137.3 },
+    { name: 'flash_attention',                us: 137.1 },
+    { name: 'cutlass_qkv_bias',               us: 136.5 },
+    { name: 'argmax',                         us: 136.7 },
+    { name: 'persistent_gemm',                us: 136.0 },
+    { name: 'flash_attention_3',              us: 134.2 },
+    { name: 'activation_silu',                us: 132.9 },
+    { name: 'embedding_gather',               us: 132.9 },
+    { name: 'activation_gelu',                us: 131.3 },
+    { name: 'add_bias',                       us: 128.3 },
+    { name: 'cast_fp',                        us: 128.0 },
+    { name: 'qkv_transpose',                  us: 125.6 }
+  ];
+
+  function Tpu(){
+    return e(R.ResponsiveContainer, { width:'100%', height:'100%' },
+      e(R.BarChart, { data: tpuData, layout: 'vertical', margin: { top: 10, right: 56, left: 10, bottom: 18 } },
+        e(R.CartesianGrid, { stroke: '#1a1f28', strokeDasharray: '3 3' }),
+        e(R.XAxis, { type: 'number', stroke: '#666', scale: 'log', domain: [100, 3000], ticks: [100, 200, 500, 1000, 2000], tickFormatter: v => v.toLocaleString(), label: { value: '\u00b5s per call (log, lower is better)', position: 'insideBottom', offset: -8, fill: '#888', fontSize: 11 } }),
+        e(R.YAxis, { type: 'category', dataKey: 'name', stroke: '#aaa', tick: { fontSize: 10, fill: '#c5c5c5' }, width: 250, interval: 0 }),
+        e(R.Tooltip, { contentStyle: { background:'#0b0f17', border:'1px solid #1f2833', color:'#ddd' }, formatter: v => v.toFixed(1) + ' \u00b5s' }),
+        e(R.Bar, { dataKey: 'us', fill: '#b6a1e5' },
+          e(R.LabelList, { dataKey: 'us', position: 'right', fill: '#d7c8f0', fontSize: 10, formatter: v => v.toFixed(0) })
+        )
+      )
+    );
+  }
+
   function ColdStart(){
     return e(R.ResponsiveContainer, { width:'100%', height:'100%' },
       e(R.BarChart, { data: coldStartData, layout: 'vertical', margin: { top: 10, right: 24, left: 60, bottom: 8 } },
@@ -600,6 +742,7 @@ Reported throughput = tool's <code>Output token throughput (tok/s)</code>. Repor
   ReactDOM.createRoot(document.getElementById('chart-mig')).render(e(Mig));
   ReactDOM.createRoot(document.getElementById('chart-tp-future')).render(e(TpFuture));
   ReactDOM.createRoot(document.getElementById('chart-coldstart')).render(e(ColdStart));
+  ReactDOM.createRoot(document.getElementById('chart-tpu')).render(e(Tpu));
 })();
 </script>
 </body>
