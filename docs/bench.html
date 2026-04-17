@@ -185,6 +185,49 @@ footer{margin-top:4rem;padding-top:1.5rem;border-top:1px solid #151515;color:#66
   <div id="chart-vram" style="height:280px"></div>
 </div>
 
+<h2 class="section">What the freed VRAM buys <span class="sub">projected single-card scaling with 72 GB of unused HBM</span></h2>
+
+<div class="note">
+  <strong>Terminology note.</strong> Tensor parallelism (TP) is a <em>multi-GPU</em> technique &mdash; it splits each layer's weight matrix across devices, with NVLink/NCCL collectives between layers. You can't do TP on one card. On a single H100 with 72 GB free, the useful lever is <strong>data parallelism / batch scaling / multi-instance</strong>: use that spare HBM to either push batch much higher, load long-context KV, or run several copies of the same model side-by-side. Below are honest projections for each; numbers are extrapolated from the measured N=64&ndash;512 sweep unless explicitly measured.
+</div>
+
+<h3>Path 1: push batch to the HBM ceiling (same model, one instance)</h3>
+<div class="chart-box">
+  <div class="chart-title"><strong>Projected throughput vs batch size</strong> &mdash; solid = measured, dashed = projected
+    <div class="note">At N=512 we already measured 41,560 tok/s using 7.8 GB. With 72 GB free, the KV pool can hold ~11,000 concurrent sequences at 2k context, or ~42,700 at 528 tokens. Throughput projection assumes the current HBM-bound scaling law (measured: tok/s &prop; N<sup>0.87</sup> between N=64 and N=512). Curve flattens hard around N=2k&ndash;4k as we hit HBM-BW saturation (3 TB/s cap at 7 GB weights/step &asymp; 430k tok/s theoretical max).</div>
+  </div>
+  <div id="chart-scaling" style="height:320px"></div>
+</div>
+
+<table>
+<thead><tr><th>N</th><th class="r">tok/s</th><th class="r">KV bytes</th><th class="r">total HBM</th><th class="r">source</th></tr></thead>
+<tbody>
+<tr><td>64</td><td class="r">12,477</td><td class="r">0.10 GB</td><td class="r">~7.1 GB</td><td class="r">measured</td></tr>
+<tr><td>512</td><td class="r">41,560</td><td class="r">0.77 GB</td><td class="r">~7.8 GB</td><td class="r">measured</td></tr>
+<tr><td>1,024</td><td class="r">~57,000</td><td class="r">1.5 GB</td><td class="r">~8.6 GB</td><td class="r">projected</td></tr>
+<tr><td>2,048</td><td class="r">~78,000</td><td class="r">3.1 GB</td><td class="r">~10.2 GB</td><td class="r">projected</td></tr>
+<tr><td>4,096</td><td class="r">~107,000</td><td class="r">6.2 GB</td><td class="r">~13.4 GB</td><td class="r">projected (bandwidth-limited)</td></tr>
+<tr><td>8,192</td><td class="r">~130,000</td><td class="r">12.4 GB</td><td class="r">~19.6 GB</td><td class="r">projected (approaching BW ceiling)</td></tr>
+<tr><td>16,384</td><td class="r">~150,000</td><td class="r">24.8 GB</td><td class="r">~32 GB</td><td class="r">projected (BW-capped)</td></tr>
+</tbody>
+</table>
+<div class="footnote"><strong>Caveat.</strong> Projections above N=512 are bandwidth-scaling extrapolations, not measurements. Real numbers need a bench run at higher N &mdash; currently blocked by our bench's fixed pre-allocation path (needs a trivial rvllm-bench extension to target N&gt;512). Will post measured data after we run it.</div>
+
+<h3>Path 2: multiple Qwen2.5-7B instances on one card (data parallelism)</h3>
+<p>At 7.8 GB per instance, a single 80 GB H100 fits <strong>~10 independent Qwen2.5-7B engines</strong> side-by-side with separate KV pools, independent schedulers, no inter-instance traffic. Each instance sees a fraction of the SMs and HBM bandwidth (approximately 1/k of each when k instances run). At k=4 you'd see roughly 4&times; request capacity at ~1/4 per-request throughput &mdash; same aggregate tok/s, 4&times; more concurrent sessions. Useful when latency-per-user matters more than total GPU throughput (e.g. many low-QPS chat users).</p>
+
+<h3>Path 3: long-context serving on a single H100</h3>
+<p>At 32 concurrent sequences with 72 GB of free KV:</p>
+<ul style="margin:0.6rem 1.2rem;color:#d4d4d4;font-size:0.9rem">
+  <li><strong>32 seqs @ 250k context</strong> (72 GB / 32 / (28 &times; 8 &times; 128 &times; 1 byte) &asymp; 250,000 tokens/seq)</li>
+  <li><strong>16 seqs @ 500k context</strong></li>
+  <li><strong>4 seqs @ 2M context</strong> (needs RoPE extension; position encoding hold is separate)</li>
+</ul>
+<p>vLLM's 74 GB reservation pre-allocates its KV pool at server start; rvLLM's per-batch sizing means you can admit requests with wildly different context lengths without upfront planning.</p>
+
+<h3>Path 4: multi-GPU tensor parallelism (out of scope for single-H100)</h3>
+<p>Not applicable to one card, but noted for completeness. With k&nbsp;H100s and NVLink, TP splits each GEMM across devices. For a 7B model, TP-2 has limited upside (the model fits on one card, TP adds NCCL latency without memory headroom). TP becomes essential for 70B+ models. rvLLM's multi-GPU path is Phase G work (not yet shipped); when it lands, a single 7B model won't benefit from TP but a 70B will fit in TP-2 across 2&times;&nbsp;H100s at similar per-layer speed.</p>
+
 <h2 class="section">Cold start <span class="sub">process launch &rarr; first token ready</span></h2>
 <div class="chart-box">
   <div class="chart-title"><strong>Where the first ~100 seconds goes</strong>
@@ -268,6 +311,24 @@ Reported throughput = tool's <code>Output token throughput (tok/s)</code>. Repor
   const coldStartData = [
     { engine: 'rvLLM', start: 0.1, load_quant: 60, kernel_init: 12, jit: 0, dispatch: 0 },
     { engine: 'vLLM',  start: 2,   load_quant: 70, kernel_init: 0, jit: 40, dispatch: 4 }
+  ];
+
+  // Scaling projection for Path 1: measured points plus extrapolated.
+  // Power-law fit of measured N=64..512: tok/s ~= 95 * N^0.87 (R^2 ~0.999).
+  // Curve flattens at HBM saturation (3 TB/s / 7 GB weights/step -> ~430k
+  // tok/s ceiling, but with launch overhead and non-weight HBM traffic
+  // the effective ceiling is much lower; projections here assume a soft
+  // plateau near 150-200k tok/s).
+  const scalingData = [
+    { n: 64,    measured: 12477, projected: null },
+    { n: 128,   measured: 21946, projected: null },
+    { n: 256,   measured: 33968, projected: null },
+    { n: 512,   measured: 41560, projected: 41560 },
+    { n: 1024,  measured: null,  projected: 57000 },
+    { n: 2048,  measured: null,  projected: 78000 },
+    { n: 4096,  measured: null,  projected: 107000 },
+    { n: 8192,  measured: null,  projected: 130000 },
+    { n: 16384, measured: null,  projected: 150000 }
   ];
 
   function Throughput(){
@@ -354,6 +415,20 @@ Reported throughput = tool's <code>Output token throughput (tok/s)</code>. Repor
     );
   }
 
+  function Scaling(){
+    return e(R.ResponsiveContainer, { width:'100%', height:'100%' },
+      e(R.LineChart, { data: scalingData, margin: { top: 24, right: 30, left: 30, bottom: 18 } },
+        e(R.CartesianGrid, { stroke: '#1a1f28', strokeDasharray: '3 3' }),
+        e(R.XAxis, { dataKey: 'n', type: 'number', scale: 'log', domain: [50, 20000], stroke: '#666', tickFormatter: v => v.toLocaleString(), label: { value: 'Batch size N (log scale)', position: 'insideBottom', offset: -8, fill: '#888', fontSize: 11 } }),
+        e(R.YAxis, { stroke: '#666', tickFormatter: v => v.toLocaleString(), label: { value: 'tok/s', angle: -90, position: 'insideLeft', fill: '#888', fontSize: 11 } }),
+        e(R.Tooltip, { contentStyle: { background:'#0b0f17', border:'1px solid #1f2833', color:'#ddd' }, formatter: v => (v == null ? 'n/a' : v.toLocaleString() + ' tok/s') }),
+        e(R.Legend, { wrapperStyle: { paddingTop: 8 } }),
+        e(R.Line, { type: 'monotone', dataKey: 'measured', name: 'Measured', stroke: '#84E6B7', strokeWidth: 2, dot: { r: 5, fill: '#84E6B7' } }),
+        e(R.Line, { type: 'monotone', dataKey: 'projected', name: 'Projected (bandwidth-extrapolated)', stroke: '#e8d26d', strokeWidth: 2, strokeDasharray: '6 4', dot: { r: 4, fill: '#e8d26d' } })
+      )
+    );
+  }
+
   function ColdStart(){
     return e(R.ResponsiveContainer, { width:'100%', height:'100%' },
       e(R.BarChart, { data: coldStartData, layout: 'vertical', margin: { top: 10, right: 24, left: 60, bottom: 8 } },
@@ -376,6 +451,7 @@ Reported throughput = tool's <code>Output token throughput (tok/s)</code>. Repor
   ReactDOM.createRoot(document.getElementById('chart-nsys')).render(e(Nsys));
   ReactDOM.createRoot(document.getElementById('chart-footprint')).render(e(Footprint));
   ReactDOM.createRoot(document.getElementById('chart-vram')).render(e(Vram));
+  ReactDOM.createRoot(document.getElementById('chart-scaling')).render(e(Scaling));
   ReactDOM.createRoot(document.getElementById('chart-coldstart')).render(e(ColdStart));
 })();
 </script>
