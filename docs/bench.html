@@ -527,7 +527,7 @@ Reported throughput = tool's <code>Output token throughput (tok/s)</code>. Repor
         e(R.CartesianGrid, { stroke: '#1a1f28', strokeDasharray: '3 3' }),
         e(R.XAxis,    { dataKey: 'n', stroke: '#666', label: { value: 'Batch size (concurrent prompts)', position: 'insideBottom', offset: -4, fill: '#888', fontSize: 11 } }),
         e(R.YAxis,    { stroke: '#666', domain: [0, 46000], tickFormatter: v => v.toLocaleString(), label: { value: 'tokens / second', angle: -90, position: 'insideLeft', fill: '#888', fontSize: 11 } }),
-        e(R.Tooltip,  { contentStyle: { background:'#0b0f17', border:'1px solid #1f2833', color:'#ddd' }, formatter: v => v.toLocaleString() + ' tok/s' }),
+        e(R.Tooltip,  { contentStyle: { background:'#0b0f17', border:'1px solid #1f2833', color:'#f5f5f5' }, formatter: v => v.toLocaleString() + ' tok/s' }),
         e(R.Legend,   { wrapperStyle: { paddingTop: 8 } }),
         e(R.Bar, { dataKey: 'rvllm', name: 'rvLLM 0.3.0', fill: '#84E6B7' },
           e(R.LabelList, { dataKey: 'rvllm', position: 'top', fill: '#b5f3d2', fontSize: 10, formatter: v => v.toLocaleString() })
@@ -545,7 +545,7 @@ Reported throughput = tool's <code>Output token throughput (tok/s)</code>. Repor
         e(R.CartesianGrid, { stroke: '#1a1f28', strokeDasharray: '3 3' }),
         e(R.XAxis, { dataKey: 'n', stroke: '#666', label: { value: 'Batch size', position: 'insideBottom', offset: -4, fill: '#888', fontSize: 11 } }),
         e(R.YAxis, { stroke: '#666', label: { value: 'TTFT (ms, lower is better)', angle: -90, position: 'insideLeft', fill: '#888', fontSize: 11 } }),
-        e(R.Tooltip, { contentStyle: { background:'#0b0f17', border:'1px solid #1f2833', color:'#ddd' }, formatter: v => v.toFixed(1) + ' ms' }),
+        e(R.Tooltip, { contentStyle: { background:'#0b0f17', border:'1px solid #1f2833', color:'#f5f5f5' }, formatter: v => v.toFixed(1) + ' ms' }),
         e(R.Legend, { wrapperStyle: { paddingTop: 8 } }),
         e(R.Bar, { dataKey: 'rvllm', name: 'rvLLM 0.3.0 (hot)', fill: '#84E6B7' },
           e(R.LabelList, { dataKey: 'rvllm', position: 'top', fill: '#b5f3d2', fontSize: 10, formatter: v => v.toFixed(0) })
@@ -563,7 +563,7 @@ Reported throughput = tool's <code>Output token throughput (tok/s)</code>. Repor
         e(R.CartesianGrid, { stroke: '#1a1f28', strokeDasharray: '3 3' }),
         e(R.XAxis, { type: 'number', stroke: '#666', label: { value: 'ms per step', position: 'insideBottom', offset: -8, fill: '#888', fontSize: 11 } }),
         e(R.YAxis, { type: 'category', dataKey: 'name', stroke: '#aaa', tick: { fontSize: 11, fill: '#c5c5c5' }, width: 220, interval: 0 }),
-        e(R.Tooltip, { contentStyle: { background:'#0b0f17', border:'1px solid #1f2833', color:'#ddd' }, formatter: v => v.toFixed(3) + ' ms' }),
+        e(R.Tooltip, { contentStyle: { background:'#0b0f17', border:'1px solid #1f2833', color:'#f5f5f5' }, formatter: v => v.toFixed(3) + ' ms' }),
         e(R.Bar, { dataKey: 'ms', fill: '#84E6B7' },
           e(R.LabelList, { dataKey: 'ms', position: 'right', fill: '#b5f3d2', fontSize: 11, formatter: v => v.toFixed(2) + ' ms' })
         )
@@ -579,7 +579,7 @@ Reported throughput = tool's <code>Output token throughput (tok/s)</code>. Repor
         e(R.CartesianGrid, { stroke: '#1a1f28', strokeDasharray: '3 3' }),
         e(R.XAxis, { dataKey: 'engine', stroke: '#ccc', tick: { fill: '#ddd', fontSize: 12 } }),
         e(R.YAxis, { stroke: '#666', scale: 'log', domain: [10, 30000], ticks: [10, 100, 1000, 10000], tickFormatter: v => v.toLocaleString(), label: { value: 'MB (log scale)', angle: -90, position: 'insideLeft', fill: '#888', fontSize: 11 } }),
-        e(R.Tooltip, { contentStyle: { background:'#0b0f17', border:'1px solid #1f2833', color:'#ddd' }, formatter: v => v.toLocaleString() + ' MB' }),
+        e(R.Tooltip, { contentStyle: { background:'#0b0f17', border:'1px solid #1f2833', color:'#f5f5f5' }, formatter: v => v.toLocaleString() + ' MB' }),
         e(R.Bar, { dataKey: 'total', name: 'Total footprint',
           shape: (p) => {
             const fill = p.payload.engine === 'rvLLM 0.3.0' ? '#84E6B7' : '#ff9977';
@@ -597,7 +597,7 @@ Reported throughput = tool's <code>Output token throughput (tok/s)</code>. Repor
         e(R.CartesianGrid, { stroke: '#1a1f28', strokeDasharray: '3 3' }),
         e(R.XAxis, { type: 'number', stroke: '#666', domain: [0, 80], label: { value: 'GB (of 80 on H100)', position: 'insideBottom', offset: -4, fill: '#888', fontSize: 11 } }),
         e(R.YAxis, { type: 'category', dataKey: 'engine', stroke: '#aaa', tick: { fontSize: 12, fill: '#c5c5c5' }, width: 70 }),
-        e(R.Tooltip, { contentStyle: { background:'#0b0f17', border:'1px solid #1f2833', color:'#ddd' }, formatter: v => v.toFixed(1) + ' GB' }),
+        e(R.Tooltip, { contentStyle: { background:'#0b0f17', border:'1px solid #1f2833', color:'#f5f5f5' }, formatter: v => v.toFixed(1) + ' GB' }),
         e(R.Legend, { wrapperStyle: { paddingTop: 8 } }),
         e(R.Bar, { dataKey: 'reserved', name: 'Reserved / held', stackId: 'a', fill: '#ff9977' },
           e(R.LabelList, { dataKey: 'reserved', position: 'insideLeft', fill: '#3d1810', fontSize: 11, fontWeight: 700, formatter: v => v.toFixed(1) + ' GB' })
@@ -615,7 +615,7 @@ Reported throughput = tool's <code>Output token throughput (tok/s)</code>. Repor
         e(R.CartesianGrid, { stroke: '#1a1f28', strokeDasharray: '3 3' }),
         e(R.XAxis, { type: 'number', stroke: '#666', label: { value: 'step time (ms, lower is better)', position: 'insideBottom', offset: -4, fill: '#888', fontSize: 11 } }),
         e(R.YAxis, { type: 'category', dataKey: 'label', stroke: '#c5c5c5', tick: { fontSize: 11, fill: '#c5c5c5' }, width: 160 }),
-        e(R.Tooltip, { contentStyle: { background:'#0b0f17', border:'1px solid #1f2833', color:'#ddd' }, formatter: v => v.toFixed(2) + ' ms' }),
+        e(R.Tooltip, { contentStyle: { background:'#0b0f17', border:'1px solid #1f2833', color:'#f5f5f5' }, formatter: v => v.toFixed(2) + ' ms' }),
         e(R.Legend, { wrapperStyle: { paddingTop: 8 } }),
         e(R.Bar, { dataKey: 'compute', name: 'GEMM / compute', stackId: 'a', fill: '#84E6B7' }),
         e(R.Bar, { dataKey: 'comm',    name: 'Inter-MIG all-reduce (PCIe)', stackId: 'a', fill: '#ff9977' },
@@ -631,7 +631,7 @@ Reported throughput = tool's <code>Output token throughput (tok/s)</code>. Repor
         e(R.CartesianGrid, { stroke: '#1a1f28', strokeDasharray: '3 3' }),
         e(R.XAxis, { dataKey: 'model', stroke: '#ccc', label: { value: 'Model (dense parameter count, FP8)', position: 'insideBottom', offset: -8, fill: '#888', fontSize: 11 } }),
         e(R.YAxis, { stroke: '#666', tickFormatter: v => v.toLocaleString(), label: { value: 'projected tok/s @ N=128', angle: -90, position: 'insideLeft', fill: '#888', fontSize: 11 } }),
-        e(R.Tooltip, { contentStyle: { background:'#0b0f17', border:'1px solid #1f2833', color:'#ddd' },
+        e(R.Tooltip, { contentStyle: { background:'#0b0f17', border:'1px solid #1f2833', color:'#f5f5f5' },
           formatter: (v, name, props) => {
             const d = props && props.payload;
             const tag = d && (d.meas ? 'Measured' : 'Projected');
@@ -655,7 +655,7 @@ Reported throughput = tool's <code>Output token throughput (tok/s)</code>. Repor
         e(R.CartesianGrid, { stroke: '#1a1f28', strokeDasharray: '3 3' }),
         e(R.XAxis, { dataKey: 'n', type: 'number', scale: 'log', domain: [50, 20000], stroke: '#666', tickFormatter: v => v.toLocaleString(), label: { value: 'Batch size N (log scale)', position: 'insideBottom', offset: -8, fill: '#888', fontSize: 11 } }),
         e(R.YAxis, { stroke: '#666', tickFormatter: v => v.toLocaleString(), label: { value: 'tok/s', angle: -90, position: 'insideLeft', fill: '#888', fontSize: 11 } }),
-        e(R.Tooltip, { contentStyle: { background:'#0b0f17', border:'1px solid #1f2833', color:'#ddd' }, formatter: v => (v == null ? 'n/a' : v.toLocaleString() + ' tok/s') }),
+        e(R.Tooltip, { contentStyle: { background:'#0b0f17', border:'1px solid #1f2833', color:'#f5f5f5' }, formatter: v => (v == null ? 'n/a' : v.toLocaleString() + ' tok/s') }),
         e(R.Legend, { wrapperStyle: { paddingTop: 8 } }),
         e(R.Line, { type: 'monotone', dataKey: 'measured', name: 'Measured', stroke: '#84E6B7', strokeWidth: 2, dot: { r: 5, fill: '#84E6B7' } }),
         e(R.Line, { type: 'monotone', dataKey: 'projected', name: 'Projected (bandwidth-extrapolated)', stroke: '#e8d26d', strokeWidth: 2, strokeDasharray: '6 4', dot: { r: 4, fill: '#e8d26d' } })
@@ -708,7 +708,7 @@ Reported throughput = tool's <code>Output token throughput (tok/s)</code>. Repor
         e(R.CartesianGrid, { stroke: '#1a1f28', strokeDasharray: '3 3' }),
         e(R.XAxis, { type: 'number', stroke: '#666', scale: 'log', domain: [100, 3000], ticks: [100, 200, 500, 1000, 2000], tickFormatter: v => v.toLocaleString(), label: { value: '\u00b5s per call (log, lower is better)', position: 'insideBottom', offset: -8, fill: '#888', fontSize: 11 } }),
         e(R.YAxis, { type: 'category', dataKey: 'name', stroke: '#aaa', tick: { fontSize: 10, fill: '#c5c5c5' }, width: 250, interval: 0 }),
-        e(R.Tooltip, { contentStyle: { background:'#0b0f17', border:'1px solid #1f2833', color:'#ddd' }, formatter: v => v.toFixed(1) + ' \u00b5s' }),
+        e(R.Tooltip, { contentStyle: { background:'#0b0f17', border:'1px solid #1f2833', color:'#f5f5f5' }, formatter: v => v.toFixed(1) + ' \u00b5s' }),
         e(R.Bar, { dataKey: 'us', fill: '#b6a1e5' },
           e(R.LabelList, { dataKey: 'us', position: 'right', fill: '#d7c8f0', fontSize: 10, formatter: v => v.toFixed(0) })
         )
@@ -722,7 +722,7 @@ Reported throughput = tool's <code>Output token throughput (tok/s)</code>. Repor
         e(R.CartesianGrid, { stroke: '#1a1f28', strokeDasharray: '3 3' }),
         e(R.XAxis, { type: 'number', stroke: '#666', label: { value: 'seconds (cold start, first launch)', position: 'insideBottom', offset: -4, fill: '#888', fontSize: 11 } }),
         e(R.YAxis, { type: 'category', dataKey: 'engine', stroke: '#aaa', tick: { fontSize: 12, fill: '#c5c5c5' }, width: 50 }),
-        e(R.Tooltip, { contentStyle: { background:'#0b0f17', border:'1px solid #1f2833', color:'#ddd' }, formatter: v => v.toFixed(1) + ' s' }),
+        e(R.Tooltip, { contentStyle: { background:'#0b0f17', border:'1px solid #1f2833', color:'#f5f5f5' }, formatter: v => v.toFixed(1) + ' s' }),
         e(R.Legend, { wrapperStyle: { paddingTop: 8 } }),
         e(R.Bar, { dataKey: 'start',       name: 'Binary / interpreter start',  stackId: 'a', fill: '#c5c5c5' }),
         e(R.Bar, { dataKey: 'load_quant',  name: 'Weight load + FP8 quant',     stackId: 'a', fill: '#84E6B7' }),
