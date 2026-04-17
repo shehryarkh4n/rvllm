@@ -17,3 +17,5 @@ cuda = ["rvllm-mem/cuda"]
 rvllm-core = { workspace = true }
 rvllm-mem = { workspace = true }
 half = { workspace = true }
+serde_json = { workspace = true }
+memmap2 = "0.9"

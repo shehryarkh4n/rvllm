@@ -10,7 +10,9 @@
 //! - Full weight set resident before first forward; no lazy loading.
 
 pub mod fp8_quant;
+pub mod safetensors;
 pub mod weights;
 
 pub use fp8_quant::{check_clamp_gate, quantize_per_tensor_ref, QuantResult, FP8_E4M3_MAX};
+pub use safetensors::{ShardHeader, ShardIndex, TensorEntry};
 pub use weights::{F16Weight, Fp8Weight, LayerWeights, LoadedModel};
