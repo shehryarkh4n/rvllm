@@ -22,9 +22,13 @@ SHAPES = {
 
 def main():
     if len(sys.argv) < 3:
-        sys.exit(f"usage: {sys.argv[0]} <out_path> <revision>")
+        sys.exit(
+            f"usage: {sys.argv[0]} <out_path> <revision> [nonres_variant=0] [res_variant=100]"
+        )
     out_path = sys.argv[1]
     revision = sys.argv[2]
+    nonres_variant = int(sys.argv[3]) if len(sys.argv) >= 4 else 0
+    res_variant = int(sys.argv[4]) if len(sys.argv) >= 5 else 100
 
     hidden = SHAPES["hidden"]
     q_dim = SHAPES["q_dim"]
@@ -44,7 +48,7 @@ def main():
             (SHAPES["vocab"], hidden),  # lm_head
         ]:
             key = f"{m}_{n}_{k}_Fp8E4M3"
-            entries[key] = {"variant": 0, "workspace_bytes": ws}
+            entries[key] = {"variant": nonres_variant, "workspace_bytes": ws}
         # Residual: O, down — keyed with _res suffix so they don't
         # collide with a same-shape non-residual entry (e.g. Q vs O
         # both = hidden x hidden for Qwen).
@@ -53,26 +57,20 @@ def main():
             (hidden, inter),        # down
         ]:
             key = f"{m}_{n}_{k}_Fp8E4M3_res"
-            entries[key] = {"variant": 100, "workspace_bytes": ws}
+            entries[key] = {"variant": res_variant, "workspace_bytes": ws}
 
     # Two variants in the catalog: non-residual id=0, residual id=100.
     # Schedule pairing Coop/Coop (matched).
-    variants = [
-        {
-            "id": 0,
+    def v(id):
+        return {
+            "id": id,
             "tile": {"m": 128, "n": 128, "k": 128},
             "cluster": {"m": 1, "n": 1, "k": 1},
             "mainloop": "Coop",
             "epilogue": "Coop",
-        },
-        {
-            "id": 100,
-            "tile": {"m": 128, "n": 128, "k": 128},
-            "cluster": {"m": 1, "n": 1, "k": 1},
-            "mainloop": "Coop",
-            "epilogue": "Coop",
-        },
-    ]
+        }
+
+    variants = [v(nonres_variant), v(res_variant)]
 
     policy = {
         "revision": revision,
