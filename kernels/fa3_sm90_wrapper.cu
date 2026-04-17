@@ -117,11 +117,13 @@ static int fa3_sm90_paged_decode_impl(
     int arch = props.major * 10 + props.minor;
     int num_sm = props.multiProcessorCount;
 
-    // Compute workspace layout
+    // Compute workspace layout. For varlen-Q (prefill), LSE is sized
+    // [total_q, num_heads]; for decode total_q == batch_size.
     int b_rounded = round_multiple(batch_size, 4);
     int metadata_ints = b_rounded * 4 + 1;
     int metadata_bytes = round_multiple(metadata_ints * (int)sizeof(int), 256);
-    int lse_bytes = round_multiple(batch_size * num_heads * (int)sizeof(float), 256);
+    int lse_rows = cu_seqlens_q_ptr != nullptr ? total_q : batch_size;
+    int lse_bytes = round_multiple(lse_rows * num_heads * (int)sizeof(float), 256);
 
     char* ws = (char*)workspace_ptr;
     int* metadata_ptr = (int*)ws;
