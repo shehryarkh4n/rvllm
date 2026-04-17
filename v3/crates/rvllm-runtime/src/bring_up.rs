@@ -187,6 +187,7 @@ impl Bringup {
         nonres_override: Option<u32>,
         res_override: Option<u32>,
     ) -> Result<BenchResult> {
+        let skip_lm_head = std::env::var("RVLLM_SKIP_LM_HEAD").ok().as_deref() == Some("1");
         use crate::layer_exec;
         use rvllm_cutlass::Fp8GemmPlan;
         use rvllm_fused::require_multiple;
@@ -424,41 +425,43 @@ impl Bringup {
                     stream,
                 )?;
             }
-            // LM head: quantize residual -> fp8, GEMM -> logits (f16),
-            // argmax over vocab -> sampled_tokens[i32].
-            rvllm_fused::QuantizeFp8PerTokenLaunch {
-                num_tokens: num_seqs,
-                dim: hidden,
+            if !skip_lm_head {
+                // LM head: quantize residual -> fp8, GEMM -> logits (f16),
+                // argmax over vocab -> sampled_tokens[i32].
+                rvllm_fused::QuantizeFp8PerTokenLaunch {
+                    num_tokens: num_seqs,
+                    dim: hidden,
+                }
+                .launch(
+                    self.fused_modules.fn_quantize,
+                    hidden_fp8.device_ptr(),
+                    hidden_scale.device_ptr(),
+                    residual_ptr,
+                    stream,
+                )?;
+                #[cfg(feature = "cuda")]
+                self.cutlass.launch_fp8_gemm(
+                    &plan_lm_head,
+                    logits.device_ptr(),
+                    hidden_fp8.device_ptr(),
+                    self.model.lm_head_fp8.offset_bytes,
+                    hidden_scale.device_ptr(),
+                    self.model.lm_head_fp8.scale_ptr,
+                    cutlass_ws.device_ptr(),
+                    cutlass_ws_bytes,
+                    stream,
+                )?;
+                rvllm_fused::ArgmaxLaunch {
+                    num_tokens: num_seqs,
+                    vocab,
+                }
+                .launch(
+                    self.fused_modules.fn_argmax,
+                    logits.device_ptr(),
+                    sampled_tokens.device_ptr(),
+                    stream,
+                )?;
             }
-            .launch(
-                self.fused_modules.fn_quantize,
-                hidden_fp8.device_ptr(),
-                hidden_scale.device_ptr(),
-                residual_ptr,
-                stream,
-            )?;
-            #[cfg(feature = "cuda")]
-            self.cutlass.launch_fp8_gemm(
-                &plan_lm_head,
-                logits.device_ptr(),
-                hidden_fp8.device_ptr(),
-                self.model.lm_head_fp8.offset_bytes,
-                hidden_scale.device_ptr(),
-                self.model.lm_head_fp8.scale_ptr,
-                cutlass_ws.device_ptr(),
-                cutlass_ws_bytes,
-                stream,
-            )?;
-            rvllm_fused::ArgmaxLaunch {
-                num_tokens: num_seqs,
-                vocab,
-            }
-            .launch(
-                self.fused_modules.fn_argmax,
-                logits.device_ptr(),
-                sampled_tokens.device_ptr(),
-                stream,
-            )?;
             Ok(())
         };
 
