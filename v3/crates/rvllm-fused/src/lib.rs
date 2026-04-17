@@ -16,8 +16,9 @@ pub mod reference;
 
 pub use launch_raw::launch_raw;
 pub use launcher::{
-    require_multiple, ArgmaxLaunch, FusedAddRmsnormFp8QuantLaunch, FusedRopeKvWriteLaunch,
-    FusedSiluMulFp8QuantLaunch, QuantizeFp8PerTokenLaunch,
+    require_multiple, ArgmaxLaunch, EmbeddingGatherLaunch, FusedAddRmsnormFp8QuantLaunch,
+    FusedRmsnormFp8QuantLaunch, FusedRopeKvWriteLaunch, FusedSiluMulFp8QuantLaunch,
+    QuantizeFp8PerTokenLaunch, ResidualAddF16Launch,
 };
 pub use reference::{
     argmax_ref, embedding_gather_ref, fused_add_rmsnorm_fp8_quant_ref,

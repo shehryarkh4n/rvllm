@@ -130,9 +130,12 @@ mod tests {
     }
 
     fn tempdir() -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
         let p = std::env::temp_dir().join(format!(
-            "rvllm-kernels-loader-{}",
-            std::process::id()
+            "rvllm-kernels-loader-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::SeqCst)
         ));
         let _ = fs::remove_dir_all(&p);
         fs::create_dir_all(&p).unwrap();

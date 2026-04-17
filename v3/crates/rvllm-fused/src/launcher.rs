@@ -1,12 +1,14 @@
 //! Launcher descriptors for the fused kernel set.
 //!
-//! Each launcher is a plain-old Rust struct that validates shapes,
-//! alignment, and device-pointer presence before issuing the CUDA
-//! launch. The launch itself is a single `#[cfg(feature = "cuda")]`
-//! function that calls into `cudarc` (pending wiring); the validation
-//! is pure-Rust and runs everywhere.
+//! Each kernel is a (validated-params struct, launch fn) pair. `launch`
+//! builds the kernel argv and calls `launch_raw` with the right
+//! grid/block/smem. The argv holds local bindings so every arg address
+//! survives until `cuLaunchKernel` returns.
 
-use rvllm_core::{Result, RvllmError, SamplingError, SampleCtx};
+use rvllm_core::{Result, RvllmError, SampleCtx, SamplingError};
+use rvllm_kernels::KernelFn;
+
+use crate::launch_raw::launch_raw;
 
 /// Common alignment rule: FP8 and f16 kernels using uint4 loads require
 /// the last dim to be a multiple of 8 halves (for f16) or 16 bytes (for
@@ -14,17 +16,68 @@ use rvllm_core::{Result, RvllmError, SamplingError, SampleCtx};
 /// crash under graph replay.
 pub fn require_multiple(got: usize, of: usize, what: &'static str) -> Result<()> {
     if of == 0 || got % of != 0 {
-        return Err(RvllmError::Sampling {
-            err: SamplingError::InvalidParams {
-                reason: format!("{what} must be multiple of {of}, got {got}"),
-            },
-            ctx: SampleCtx {
-                op: "require_multiple",
-                stream: 0,
-            },
-        });
+        return Err(invalid(what, "must be multiple"));
     }
     Ok(())
+}
+
+fn invalid(field: &'static str, reason: &'static str) -> RvllmError {
+    RvllmError::Sampling {
+        err: SamplingError::InvalidParams {
+            reason: format!("{field}: {reason}"),
+        },
+        ctx: SampleCtx {
+            op: "validate",
+            stream: 0,
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// embedding_gather
+// ---------------------------------------------------------------------------
+
+pub struct EmbeddingGatherLaunch {
+    pub num_tokens: u32,
+    pub hidden: u32,
+    pub vocab: u32,
+}
+
+impl EmbeddingGatherLaunch {
+    pub fn validate(&self) -> Result<()> {
+        if self.num_tokens == 0 || self.hidden == 0 || self.vocab == 0 {
+            return Err(invalid("embedding_gather", "zero dim"));
+        }
+        Ok(())
+    }
+
+    /// # Safety
+    /// Caller owns the device pointers for the kernel's duration.
+    pub unsafe fn launch(
+        &self,
+        kernel: KernelFn,
+        out_ptr: u64,
+        weight_ptr: u64,
+        token_ids_ptr: u64,
+        stream: u64,
+    ) -> Result<()> {
+        self.validate()?;
+        let mut out_ptr = out_ptr;
+        let mut weight_ptr = weight_ptr;
+        let mut token_ids_ptr = token_ids_ptr;
+        let mut hidden = self.hidden as i32;
+        let mut vocab = self.vocab as i32;
+        let args = [
+            (&mut out_ptr) as *mut u64 as *mut core::ffi::c_void,
+            (&mut weight_ptr) as *mut u64 as *mut core::ffi::c_void,
+            (&mut token_ids_ptr) as *mut u64 as *mut core::ffi::c_void,
+            (&mut hidden) as *mut i32 as *mut core::ffi::c_void,
+            (&mut vocab) as *mut i32 as *mut core::ffi::c_void,
+        ];
+        let block = (self.hidden.min(1024), 1, 1);
+        let grid = (self.num_tokens, 1, 1);
+        launch_raw(kernel, grid, block, 0, stream, &args)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -45,6 +98,102 @@ impl FusedAddRmsnormFp8QuantLaunch {
         }
         Ok(())
     }
+
+    /// Kernel sig: `(out_fp8, scale, residual_out, in_hidden,
+    /// residual_in, gamma, eps, hidden)`.
+    ///
+    /// # Safety
+    /// Caller owns pointers for the call's duration.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch(
+        &self,
+        kernel: KernelFn,
+        out_fp8: u64,
+        scale: u64,
+        residual_out: u64,
+        in_hidden: u64,
+        residual_in: u64,
+        gamma: u64,
+        stream: u64,
+    ) -> Result<()> {
+        self.validate()?;
+        let mut out_fp8 = out_fp8;
+        let mut scale = scale;
+        let mut residual_out = residual_out;
+        let mut in_hidden = in_hidden;
+        let mut residual_in = residual_in;
+        let mut gamma = gamma;
+        let mut eps = self.eps;
+        let mut hidden = self.hidden as i32;
+        let args = [
+            (&mut out_fp8) as *mut u64 as *mut core::ffi::c_void,
+            (&mut scale) as *mut u64 as *mut core::ffi::c_void,
+            (&mut residual_out) as *mut u64 as *mut core::ffi::c_void,
+            (&mut in_hidden) as *mut u64 as *mut core::ffi::c_void,
+            (&mut residual_in) as *mut u64 as *mut core::ffi::c_void,
+            (&mut gamma) as *mut u64 as *mut core::ffi::c_void,
+            (&mut eps) as *mut f32 as *mut core::ffi::c_void,
+            (&mut hidden) as *mut i32 as *mut core::ffi::c_void,
+        ];
+        const SMEM: u32 = 32 * 4; // WARPS_MAX * sizeof(float)
+        let block = (self.hidden.min(1024), 1, 1);
+        let grid = (self.num_tokens, 1, 1);
+        launch_raw(kernel, grid, block, SMEM, stream, &args)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// fused_rmsnorm_fp8_quant (no residual variant — first layer input path)
+// ---------------------------------------------------------------------------
+
+pub struct FusedRmsnormFp8QuantLaunch {
+    pub num_tokens: u32,
+    pub hidden: u32,
+    pub eps: f32,
+}
+
+impl FusedRmsnormFp8QuantLaunch {
+    pub fn validate(&self) -> Result<()> {
+        require_multiple(self.hidden as usize, 8, "hidden")?;
+        if self.num_tokens == 0 {
+            return Err(invalid("num_tokens", "must be > 0"));
+        }
+        Ok(())
+    }
+
+    /// Kernel sig: `(out_fp8, scale, in_hidden, gamma, eps, hidden)`.
+    ///
+    /// # Safety
+    /// Device pointers must outlive the call.
+    pub unsafe fn launch(
+        &self,
+        kernel: KernelFn,
+        out_fp8: u64,
+        scale: u64,
+        in_hidden: u64,
+        gamma: u64,
+        stream: u64,
+    ) -> Result<()> {
+        self.validate()?;
+        let mut out_fp8 = out_fp8;
+        let mut scale = scale;
+        let mut in_hidden = in_hidden;
+        let mut gamma = gamma;
+        let mut eps = self.eps;
+        let mut hidden = self.hidden as i32;
+        let args = [
+            (&mut out_fp8) as *mut u64 as *mut core::ffi::c_void,
+            (&mut scale) as *mut u64 as *mut core::ffi::c_void,
+            (&mut in_hidden) as *mut u64 as *mut core::ffi::c_void,
+            (&mut gamma) as *mut u64 as *mut core::ffi::c_void,
+            (&mut eps) as *mut f32 as *mut core::ffi::c_void,
+            (&mut hidden) as *mut i32 as *mut core::ffi::c_void,
+        ];
+        const SMEM: u32 = 32 * 4;
+        let block = (self.hidden.min(1024), 1, 1);
+        let grid = (self.num_tokens, 1, 1);
+        launch_raw(kernel, grid, block, SMEM, stream, &args)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -58,18 +207,47 @@ pub struct QuantizeFp8PerTokenLaunch {
 
 impl QuantizeFp8PerTokenLaunch {
     pub fn validate(&self) -> Result<()> {
-        // Vectorized uint4/uint2 path requires dim % 8 == 0 (8 halves per
-        // uint4 load, 8 fp8 per uint2 store). This was the alignment
-        // guard whose absence caused the April 16 ILLEGAL_ADDRESS hunt.
         require_multiple(self.dim as usize, 8, "dim")?;
         if self.num_tokens == 0 {
             return Err(invalid("num_tokens", "must be > 0"));
         }
-        // Upper bound matches the MAX_VEC_PER_THREAD=8 x block=1024 cache.
         if self.dim > 65536 {
             return Err(invalid("dim", "must be <= 65536"));
         }
         Ok(())
+    }
+
+    /// Kernel sig: `(out_fp8, scale, in_f16, dim)`.
+    ///
+    /// # Safety
+    /// Caller owns pointers for the call's duration.
+    pub unsafe fn launch(
+        &self,
+        kernel: KernelFn,
+        out_fp8: u64,
+        scale: u64,
+        in_f16: u64,
+        stream: u64,
+    ) -> Result<()> {
+        self.validate()?;
+        let mut out_fp8 = out_fp8;
+        let mut scale = scale;
+        let mut in_f16 = in_f16;
+        let mut dim = self.dim as i32;
+        let args = [
+            (&mut out_fp8) as *mut u64 as *mut core::ffi::c_void,
+            (&mut scale) as *mut u64 as *mut core::ffi::c_void,
+            (&mut in_f16) as *mut u64 as *mut core::ffi::c_void,
+            (&mut dim) as *mut i32 as *mut core::ffi::c_void,
+        ];
+        const SMEM: u32 = 32 * 4;
+        // Vector path: 8 halves per uint4; tie block to vec_per_row/8.
+        let vec_per_row = (self.dim / 8).max(1);
+        let min_threads = (vec_per_row + 7) / 8;
+        let block_threads = ((min_threads.max(32) + 31) / 32 * 32).min(1024);
+        let block = (block_threads, 1, 1);
+        let grid = (self.num_tokens, 1, 1);
+        launch_raw(kernel, grid, block, SMEM, stream, &args)
     }
 }
 
@@ -89,6 +267,37 @@ impl FusedSiluMulFp8QuantLaunch {
             return Err(invalid("num_tokens", "must be > 0"));
         }
         Ok(())
+    }
+
+    /// Kernel sig: `(out_fp8, scale, gate_up_f16, num_tokens, intermediate)`.
+    ///
+    /// # Safety
+    /// Caller owns pointers for the call's duration.
+    pub unsafe fn launch(
+        &self,
+        kernel: KernelFn,
+        out_fp8: u64,
+        scale: u64,
+        gate_up: u64,
+        stream: u64,
+    ) -> Result<()> {
+        self.validate()?;
+        let mut out_fp8 = out_fp8;
+        let mut scale = scale;
+        let mut gate_up = gate_up;
+        let mut num_tokens = self.num_tokens as i32;
+        let mut intermediate = self.intermediate as i32;
+        let args = [
+            (&mut out_fp8) as *mut u64 as *mut core::ffi::c_void,
+            (&mut scale) as *mut u64 as *mut core::ffi::c_void,
+            (&mut gate_up) as *mut u64 as *mut core::ffi::c_void,
+            (&mut num_tokens) as *mut i32 as *mut core::ffi::c_void,
+            (&mut intermediate) as *mut i32 as *mut core::ffi::c_void,
+        ];
+        const SMEM: u32 = 32 * 4;
+        let block = (self.intermediate.min(1024), 1, 1);
+        let grid = (self.num_tokens, 1, 1);
+        launch_raw(kernel, grid, block, SMEM, stream, &args)
     }
 }
 
@@ -112,36 +321,29 @@ impl ArgmaxLaunch {
         Ok(())
     }
 
-    /// Issue the `argmax_kernel` launch.
-    ///
-    /// Kernel sig (from spec 12 and v2's argmax.cu):
-    ///   `argmax_kernel(logits: *const f32, out: *mut i32, vocab: i32)`
-    /// grid = (num_tokens, 1, 1); block = (min(vocab, 1024), 1, 1).
+    /// Kernel sig: `(logits_f32, out_i32, vocab)`.
     ///
     /// # Safety
-    /// Caller must ensure `logits_ptr` / `out_ptr` are live device
-    /// pointers for the kernel's duration (graph capture or eager).
+    /// Caller owns pointers for the call's duration.
     pub unsafe fn launch(
         &self,
-        kernel: rvllm_kernels::KernelFn,
+        kernel: KernelFn,
         logits_ptr: u64,
         out_ptr: u64,
         stream: u64,
     ) -> Result<()> {
         self.validate()?;
-        let vocab = self.vocab as i32;
-        // Kernel args must outlive the launch call — keep bindings alive.
         let mut logits_ptr = logits_ptr;
         let mut out_ptr = out_ptr;
-        let mut vocab_arg = vocab;
+        let mut vocab = self.vocab as i32;
         let args = [
             (&mut logits_ptr) as *mut u64 as *mut core::ffi::c_void,
             (&mut out_ptr) as *mut u64 as *mut core::ffi::c_void,
-            (&mut vocab_arg) as *mut i32 as *mut core::ffi::c_void,
+            (&mut vocab) as *mut i32 as *mut core::ffi::c_void,
         ];
-        let block_dim = (self.vocab.min(1024), 1, 1);
+        let block = (self.vocab.min(1024), 1, 1);
         let grid = (self.num_tokens, 1, 1);
-        crate::launch_raw::launch_raw(kernel, grid, block_dim, 0, stream, &args)
+        launch_raw(kernel, grid, block, 0, stream, &args)
     }
 }
 
@@ -169,17 +371,94 @@ impl FusedRopeKvWriteLaunch {
         }
         Ok(())
     }
+
+    /// Kernel sig:
+    /// `(qkv, k_cache, v_cache, positions, cos, sin, slot_mapping,
+    ///   q_dim, kv_dim, num_tokens)`.
+    ///
+    /// # Safety
+    /// Caller owns pointers for the call's duration.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch(
+        &self,
+        kernel: KernelFn,
+        qkv: u64,
+        k_cache: u64,
+        v_cache: u64,
+        positions: u64,
+        cos: u64,
+        sin: u64,
+        slot_mapping: u64,
+        stream: u64,
+    ) -> Result<()> {
+        self.validate()?;
+        let mut qkv = qkv;
+        let mut k_cache = k_cache;
+        let mut v_cache = v_cache;
+        let mut positions = positions;
+        let mut cos = cos;
+        let mut sin = sin;
+        let mut slot_mapping = slot_mapping;
+        let mut q_dim = self.q_dim as i32;
+        let mut kv_dim = self.kv_dim as i32;
+        let mut num_tokens = self.num_tokens as i32;
+        let args = [
+            (&mut qkv) as *mut u64 as *mut core::ffi::c_void,
+            (&mut k_cache) as *mut u64 as *mut core::ffi::c_void,
+            (&mut v_cache) as *mut u64 as *mut core::ffi::c_void,
+            (&mut positions) as *mut u64 as *mut core::ffi::c_void,
+            (&mut cos) as *mut u64 as *mut core::ffi::c_void,
+            (&mut sin) as *mut u64 as *mut core::ffi::c_void,
+            (&mut slot_mapping) as *mut u64 as *mut core::ffi::c_void,
+            (&mut q_dim) as *mut i32 as *mut core::ffi::c_void,
+            (&mut kv_dim) as *mut i32 as *mut core::ffi::c_void,
+            (&mut num_tokens) as *mut i32 as *mut core::ffi::c_void,
+        ];
+        let block = (512, 1, 1);
+        let grid = (self.num_tokens, 1, 1);
+        launch_raw(kernel, grid, block, 0, stream, &args)
+    }
 }
 
-fn invalid(field: &'static str, reason: &'static str) -> RvllmError {
-    RvllmError::Sampling {
-        err: SamplingError::InvalidParams {
-            reason: format!("{field}: {reason}"),
-        },
-        ctx: SampleCtx {
-            op: "validate",
-            stream: 0,
-        },
+// ---------------------------------------------------------------------------
+// residual_add_f16
+// ---------------------------------------------------------------------------
+
+pub struct ResidualAddF16Launch {
+    pub n: u32,
+}
+
+impl ResidualAddF16Launch {
+    pub fn validate(&self) -> Result<()> {
+        if self.n == 0 {
+            return Err(invalid("n", "must be > 0"));
+        }
+        Ok(())
+    }
+
+    /// Kernel sig: `(x_inout, y, n)`.
+    ///
+    /// # Safety
+    /// Caller owns pointers for the call's duration.
+    pub unsafe fn launch(
+        &self,
+        kernel: KernelFn,
+        x: u64,
+        y: u64,
+        stream: u64,
+    ) -> Result<()> {
+        self.validate()?;
+        let mut x = x;
+        let mut y = y;
+        let mut n = self.n as i32;
+        let args = [
+            (&mut x) as *mut u64 as *mut core::ffi::c_void,
+            (&mut y) as *mut u64 as *mut core::ffi::c_void,
+            (&mut n) as *mut i32 as *mut core::ffi::c_void,
+        ];
+        let block = (256, 1, 1);
+        let grid = ((self.n + 255) / 256, 1, 1);
+        launch_raw(kernel, grid, block, 0, stream, &args)
     }
 }
 
@@ -223,5 +502,20 @@ mod tests {
             vocab: 0,
         };
         assert!(l.validate().is_err());
+    }
+
+    #[test]
+    fn embedding_rejects_zero_dims() {
+        let l = EmbeddingGatherLaunch {
+            num_tokens: 1,
+            hidden: 0,
+            vocab: 128,
+        };
+        assert!(l.validate().is_err());
+    }
+
+    #[test]
+    fn residual_add_rejects_zero_n() {
+        assert!(ResidualAddF16Launch { n: 0 }.validate().is_err());
     }
 }

@@ -269,6 +269,7 @@ dependencies = [
 name = "rvllm-fused"
 version = "0.1.0"
 dependencies = [
+ "cudarc",
  "half",
  "rvllm-core",
  "rvllm-kernels",
