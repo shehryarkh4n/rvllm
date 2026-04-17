@@ -301,16 +301,35 @@ impl Bringup {
         // still lives at q_out (2 bytes/elem). Sized by max_tokens so
         // prefill (num_tokens = num_seqs * prefill_len) doesn't overflow.
         let q_fp8 = arena.region("q_fp8", (max_tokens * q_dim) as usize, 16)?;
-        // Per-tensor FP8 scales shared across the whole engine. Placeholder
-        // values (1.0 / 448.0 = ~0.00223) give a clean identity-ish scaling
-        // for the garbage-data faux-prefill regime; a real calibration pass
-        // computes these once post-load.
+        // Per-tensor FP8 E4M3 scales for Q and KV quantization in the
+        // fused_rope_cache_fp8kv kernel. Convention:
+        //   scale = absmax / 448  (the E4M3 representable max)
+        //   kernel quantizes:  fp8 = float * (1/scale) = float * (448/absmax)
+        //   FA3 dequantizes:   float = fp8 * scale     = fp8 * (absmax/448)
+        //
+        // The previous placeholder (1/448 = assuming absmax=1.0) clipped any
+        // activation outside [-1, 1] — destroying ~80% of dynamic range for
+        // typical post-RoPE K/V values (which are in [-8, 8] for Qwen2.5-7B).
+        //
+        // Calibrated from a real forward pass on Qwen2.5-7B-Instruct (28
+        // layers, 128-token prompt). Worst-case per-layer absmax:
+        //   K: 418.0 (layer 27)  ->  kv_scale = 418/448 = 0.933
+        //   V:  73.5 (layer 27)  ->  v_scale  = 73.5/448 = 0.164
+        // Using the K max as the shared scale (the rope kernel quantizes
+        // both K and V with the same scale pointer). V loses ~2.5 bits of
+        // effective precision but nothing clips. Per-layer or split K/V
+        // scales are future work.
+        // Override via RVLLM_KV_SCALE_ABSMAX for other models.
+        let kv_absmax: f32 = std::env::var("RVLLM_KV_SCALE_ABSMAX")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(418.0f32);
         let q_scale_region = arena.region("q_scale", 4, 4)?;
         let kv_scale_region = arena.region("kv_scale", 4, 4)?;
         {
-            let seed: f32 = 1.0f32 / 448.0f32;
-            q_scale_region.copy_from_host(&seed.to_le_bytes())?;
-            kv_scale_region.copy_from_host(&seed.to_le_bytes())?;
+            let scale: f32 = kv_absmax / 448.0f32;
+            q_scale_region.copy_from_host(&scale.to_le_bytes())?;
+            kv_scale_region.copy_from_host(&scale.to_le_bytes())?;
         }
 
         let cutlass_ws_bytes: usize = 16 * 1024 * 1024;
@@ -722,6 +741,16 @@ impl Bringup {
         }
         self.stream.fence()?;
         let elapsed = t0.elapsed();
+
+        // Debug: dump sampled token IDs to stderr for quality sanity check.
+        if std::env::var("RVLLM_DUMP_TOKENS").ok().as_deref() == Some("1") {
+            dtoh_async_sync(sampled_d_ptr, ttft_host_buf.as_mut_ptr(), n * 4, stream)?;
+            self.stream.fence()?;
+            let ids: &[i32] = ttft_host_buf.as_slice();
+            let show = ids.len().min(16);
+            eprintln!("[TOKENS] sampled_ids[0..{show}] = {:?}", &ids[..show]);
+        }
+
         Ok(BenchResult {
             ns_per_step: elapsed.as_nanos() / iters.max(1) as u128,
             total_ns: elapsed.as_nanos(),
