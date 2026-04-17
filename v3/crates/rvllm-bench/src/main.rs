@@ -77,16 +77,23 @@ fn run() -> Result<(), String> {
     );
     eprintln!("arena used = {} MiB", br.arena.used() / (1024 * 1024));
 
-    // No forward-loop integration yet; bringup timing is the initial
-    // signal. Remaining work: wire scratch allocation, per-bucket
-    // graph capture, decode step loop that replays the captured graph
-    // + samples argmax. Exits 2 to signal partial success.
-    println!(
-        "{{\"bringup_ms\":{},\"arena_used_bytes\":{},\"layers\":{},\"hidden\":{}}}",
-        t0.elapsed().as_millis(),
-        br.arena.used(),
-        br.arch.num_hidden_layers,
-        br.arch.hidden_size
+    let result = unsafe { br.run_bench(batch, iters, warmup) }
+        .map_err(|e| format!("run_bench: {e}"))?;
+
+    let tok_per_sec = if result.total_ns > 0 {
+        (result.iters as f64 * result.num_seqs as f64) * 1.0e9 / result.total_ns as f64
+    } else {
+        0.0
+    };
+    let ms_per_step = result.ns_per_step as f64 / 1.0e6;
+
+    eprintln!(
+        "bench: batch={} iters={} -> {:.0} tok/s ({:.3} ms/step)",
+        batch, iters, tok_per_sec, ms_per_step
     );
-    std::process::exit(2);
+    println!(
+        "{{\"batch\":{},\"iters\":{},\"tok_per_sec\":{:.1},\"ms_per_step\":{:.4}}}",
+        batch, iters, tok_per_sec, ms_per_step
+    );
+    Ok(())
 }
