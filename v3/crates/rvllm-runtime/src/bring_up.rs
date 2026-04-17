@@ -197,8 +197,12 @@ impl Bringup {
 
         let residual = arena.region("residual", (num_seqs * hidden * 2) as usize, 16)?;
 
-        // Metadata (zero-filled; decode step with all ctxlen=1 works for
-        // timing — FA3 will still read stale but valid KV pages).
+        // Metadata: populate with valid decode-step values so FA3 walks
+        // real KV pages instead of reading garbage.
+        //   positions[i]   = i % max_pos
+        //   slot_mapping[i]= i                 (writes into first slot)
+        //   context_lens[i]= 1                 (one live token)
+        //   block_tables[i][b] = i * max_blocks_per_seq + b
         let positions = arena.region("positions", (num_seqs * 4) as usize, 16)?;
         let slot_mapping = arena.region("slot_mapping", (num_seqs * 4) as usize, 16)?;
         let context_lens = arena.region("context_lens", (num_seqs * 4) as usize, 16)?;
@@ -207,6 +211,22 @@ impl Bringup {
             (num_seqs * max_blocks_per_seq * 4) as usize,
             16,
         )?;
+        {
+            let n = num_seqs as usize;
+            let pos_host: Vec<i32> = (0..n as i32).collect();
+            let slot_host: Vec<i32> = (0..n as i32).collect();
+            let ctx_host: Vec<i32> = vec![1; n];
+            let mut bt_host: Vec<i32> = Vec::with_capacity(n * max_blocks_per_seq as usize);
+            for i in 0..n as i32 {
+                for b in 0..max_blocks_per_seq as i32 {
+                    bt_host.push(i * max_blocks_per_seq as i32 + b);
+                }
+            }
+            positions.copy_from_host(bytemuck_cast_i32(&pos_host))?;
+            slot_mapping.copy_from_host(bytemuck_cast_i32(&slot_host))?;
+            context_lens.copy_from_host(bytemuck_cast_i32(&ctx_host))?;
+            block_tables.copy_from_host(bytemuck_cast_i32(&bt_host))?;
+        }
 
         // Plans (from policy) for this specific bucket. Q, K, V each get
         // their own plan since they have different N dimensions.
@@ -392,6 +412,13 @@ pub struct BenchResult {
     pub total_ns: u128,
     pub iters: u32,
     pub num_seqs: u32,
+}
+
+#[cfg(feature = "cuda")]
+fn bytemuck_cast_i32(v: &[i32]) -> &[u8] {
+    // SAFETY: i32 has a defined bit layout; we only read these bytes,
+    // and the output slice is the same length/alignment.
+    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) }
 }
 
 fn load_fused(loader: &KernelLoader) -> Result<FusedModules> {
