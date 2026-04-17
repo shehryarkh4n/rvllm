@@ -1,0 +1,287 @@
+{
+  "jax": "0.6.2",
+  "backend": "tpu",
+  "device": "TPU_0(process=0,(0,0,0,0))",
+  "results": [
+    {
+      "name": "rms_norm",
+      "family": "norm",
+      "status": "OK",
+      "us": 123.7,
+      "output": "(128, 4096):float32"
+    },
+    {
+      "name": "fused_residual_rmsnorm",
+      "family": "norm",
+      "status": "OK",
+      "us": 182.7,
+      "output": "(128, 4096):float32, (128, 4096):float32"
+    },
+    {
+      "name": "fused_rmsnorm_fp8_quant",
+      "family": "norm",
+      "status": "SKIP-todo",
+      "us": null,
+      "output": ""
+    },
+    {
+      "name": "rotary_embedding",
+      "family": "rope",
+      "status": "OK",
+      "us": 185.2,
+      "output": "(128, 32, 128):float32, (128, 8, 128):float32"
+    },
+    {
+      "name": "fused_rope_cache",
+      "family": "rope",
+      "status": "OK",
+      "us": 290.1,
+      "output": "(128, 32, 128):bfloat16, (1024, 16, 8, 128):bfloat16, (1024, 16, 8, 128):bfloat16"
+    },
+    {
+      "name": "softmax",
+      "family": "softmax",
+      "status": "OK",
+      "us": 161.8,
+      "output": "(128, 32000):float32"
+    },
+    {
+      "name": "activation_silu",
+      "family": "elementwise",
+      "status": "OK",
+      "us": 134.3,
+      "output": "(524288,):float32"
+    },
+    {
+      "name": "activation_gelu",
+      "family": "elementwise",
+      "status": "OK",
+      "us": 134.6,
+      "output": "(524288,):float32"
+    },
+    {
+      "name": "fused_silu_mul",
+      "family": "elementwise",
+      "status": "OK",
+      "us": 141.4,
+      "output": "(128, 14336):float32"
+    },
+    {
+      "name": "add_bias",
+      "family": "elementwise",
+      "status": "OK",
+      "us": 134.4,
+      "output": "(128, 4096):float32"
+    },
+    {
+      "name": "cast_fp",
+      "family": "elementwise",
+      "status": "OK",
+      "us": 134.3,
+      "output": "(524288,):bfloat16"
+    },
+    {
+      "name": "argmax",
+      "family": "reduction",
+      "status": "OK",
+      "us": 136.0,
+      "output": "(128,):int32"
+    },
+    {
+      "name": "fused_lm_head_argmax",
+      "family": "reduction",
+      "status": "OK",
+      "us": 897.2,
+      "output": "(128,):int32"
+    },
+    {
+      "name": "embedding_gather",
+      "family": "gather",
+      "status": "OK",
+      "us": 131.9,
+      "output": "(128, 4096):float32"
+    },
+    {
+      "name": "copy_blocks",
+      "family": "kv-cache",
+      "status": "OK",
+      "us": 377.6,
+      "output": "(1024, 16, 8, 128):float32, (1024, 16, 8, 128):float32"
+    },
+    {
+      "name": "reshape_and_cache",
+      "family": "kv-cache",
+      "status": "OK",
+      "us": 266.6,
+      "output": "(1024, 16, 8, 128):float16, (1024, 16, 8, 128):float16"
+    },
+    {
+      "name": "fp8_kv",
+      "family": "kv-cache",
+      "status": "SKIP-todo",
+      "us": null,
+      "output": ""
+    },
+    {
+      "name": "qkv_transpose",
+      "family": "layout",
+      "status": "OK",
+      "us": 126.7,
+      "output": "(32, 128, 128):float16"
+    },
+    {
+      "name": "deinterleave_qkv",
+      "family": "layout",
+      "status": "OK",
+      "us": 189.9,
+      "output": "(128, 32, 128):float16, (128, 8, 128):float16, (128, 8, 128):float16"
+    },
+    {
+      "name": "quantize_activation_fp8",
+      "family": "quant",
+      "status": "SKIP-todo",
+      "us": null,
+      "output": ""
+    },
+    {
+      "name": "fused_silu_fp8_quant",
+      "family": "quant",
+      "status": "SKIP-todo",
+      "us": null,
+      "output": ""
+    },
+    {
+      "name": "gemm_bf16",
+      "family": "gemm",
+      "status": "OK",
+      "us": 133.4,
+      "output": "(128, 4096):bfloat16"
+    },
+    {
+      "name": "gemv_f16",
+      "family": "gemm",
+      "status": "OK",
+      "us": 145.5,
+      "output": "(1, 4096):bfloat16"
+    },
+    {
+      "name": "gemv_fp8",
+      "family": "gemm",
+      "status": "SKIP-todo",
+      "us": null,
+      "output": ""
+    },
+    {
+      "name": "gemv_int4",
+      "family": "gemm",
+      "status": "OK",
+      "us": 254.9,
+      "output": "(1, 4096):bfloat16"
+    },
+    {
+      "name": "cutlass_fp8_gemm",
+      "family": "gemm",
+      "status": "SKIP-todo",
+      "us": null,
+      "output": ""
+    },
+    {
+      "name": "cutlass_qkv_bias",
+      "family": "gemm",
+      "status": "OK",
+      "us": 135.6,
+      "output": "(128, 6144):bfloat16"
+    },
+    {
+      "name": "cutlass_gateup_silu",
+      "family": "gemm",
+      "status": "OK",
+      "us": 291.5,
+      "output": "(128, 14336):bfloat16"
+    },
+    {
+      "name": "cutlass_oproj_residual",
+      "family": "gemm",
+      "status": "OK",
+      "us": 134.2,
+      "output": "(128, 4096):bfloat16"
+    },
+    {
+      "name": "fused_silu_down",
+      "family": "gemm",
+      "status": "OK",
+      "us": 211.1,
+      "output": "(128, 4096):bfloat16"
+    },
+    {
+      "name": "fused_norm_gemv",
+      "family": "gemm",
+      "status": "OK",
+      "us": 149.0,
+      "output": "(1, 4096):bfloat16"
+    },
+    {
+      "name": "fused_add_norm_qkv_gemv",
+      "family": "gemm",
+      "status": "OK",
+      "us": 213.6,
+      "output": "(1, 6144):bfloat16, (1, 4096):bfloat16"
+    },
+    {
+      "name": "fused_add_norm_gateup_gemv",
+      "family": "gemm",
+      "status": "OK",
+      "us": 344.7,
+      "output": "(1, 14336):bfloat16, (1, 4096):bfloat16"
+    },
+    {
+      "name": "fused_oproj_add_norm_gateup_gemv",
+      "family": "gemm",
+      "status": "OK",
+      "us": 366.5,
+      "output": "(1, 14336):bfloat16, (1, 4096):bfloat16"
+    },
+    {
+      "name": "flash_attention",
+      "family": "attention",
+      "status": "OK",
+      "us": 145.2,
+      "output": "(1, 128, 32, 128):bfloat16"
+    },
+    {
+      "name": "flash_attention_3",
+      "family": "attention",
+      "status": "OK",
+      "us": 146.9,
+      "output": "(1, 128, 32, 128):bfloat16"
+    },
+    {
+      "name": "paged_attention",
+      "family": "attention",
+      "status": "OK",
+      "us": 1814.7,
+      "output": "(8, 32, 128):bfloat16"
+    },
+    {
+      "name": "split_kv_attention",
+      "family": "attention",
+      "status": "OK",
+      "us": 1815.6,
+      "output": "(8, 32, 128):bfloat16"
+    },
+    {
+      "name": "persistent_gemm",
+      "family": "gemm",
+      "status": "OK",
+      "us": 135.7,
+      "output": "(128, 4096):bfloat16"
+    },
+    {
+      "name": "persistent_layer_decode",
+      "family": "megakernel",
+      "status": "OK",
+      "us": 2160.7,
+      "output": "(8, 4096):bfloat16, (8, 4096):bfloat16, (1024, 16, 8, 128):bfloat16, (1024, 16, 8, 128):bfloat16"
+    }
+  ]
+}

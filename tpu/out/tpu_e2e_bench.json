@@ -1,0 +1,41 @@
+{
+  "model": "facebook/opt-1.3b",
+  "device": "TPU_0(process=0,(0,0,0,0))",
+  "runs": [
+    {
+      "n": 1,
+      "toks": 7.23,
+      "ttft_ms": 12454.03,
+      "wall_s": 17.69,
+      "out_tokens": 128
+    },
+    {
+      "n": 8,
+      "toks": 37.75,
+      "ttft_ms": 14246.44,
+      "wall_s": 27.13,
+      "out_tokens": 1024
+    },
+    {
+      "n": 16,
+      "toks": 65.38,
+      "ttft_ms": 16163.72,
+      "wall_s": 31.32,
+      "out_tokens": 2048
+    },
+    {
+      "n": 64,
+      "toks": 229.48,
+      "ttft_ms": 24815.91,
+      "wall_s": 35.7,
+      "out_tokens": 8192
+    },
+    {
+      "n": 128,
+      "toks": 515.46,
+      "ttft_ms": 26512.0,
+      "wall_s": 31.78,
+      "out_tokens": 16384
+    }
+  ]
+}
