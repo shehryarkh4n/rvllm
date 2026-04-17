@@ -320,8 +320,8 @@ impl Bringup {
         //   slot_mapping[i]= i                 (writes into first slot)
         //   context_lens[i]= 1                 (one live token)
         //   block_tables[i][b] = i * max_blocks_per_seq + b
-        let positions = arena.region("positions", (num_seqs * 4) as usize, 16)?;
-        let slot_mapping = arena.region("slot_mapping", (num_seqs * 4) as usize, 16)?;
+        let positions = arena.region("positions", (max_tokens * 4) as usize, 16)?;
+        let slot_mapping = arena.region("slot_mapping", (max_tokens * 4) as usize, 16)?;
         let context_lens = arena.region("context_lens", (num_seqs * 4) as usize, 16)?;
         let block_tables = arena.region(
             "block_tables",
