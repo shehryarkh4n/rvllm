@@ -62,43 +62,84 @@ impl PagedDecodeParams {
 /// Launcher. Construction from `&Fa3Kernels` guarantees the .so is
 /// loaded and head_dim is 128.
 pub struct PagedDecodeLauncher<'a> {
-    _fa3: &'a super::Fa3Kernels,
+    fa3: &'a super::Fa3Kernels,
 }
 
 impl<'a> PagedDecodeLauncher<'a> {
     pub fn new(fa3: &'a super::Fa3Kernels) -> Self {
-        Self { _fa3: fa3 }
+        Self { fa3 }
     }
 
-    /// Validate params + issue the launch. Under `feature = "cuda"`,
-    /// this calls into the FA3 .so; under no-cuda it returns Ok without
-    /// launching (so tests on Mac can exercise validation).
+    /// Validate params + issue the launch.
+    ///
+    /// # Safety
+    /// Under `feature = "cuda"` this dispatches the fa3_sm90 kernel via
+    /// an opaque C fn ptr. All device pointers must be valid for the
+    /// kernel's duration and the workspace must be >= what
+    /// `fn_workspace_size(batch, num_heads, max_splits=1)` returned.
     #[allow(clippy::too_many_arguments)]
-    pub fn launch(
+    pub unsafe fn launch(
         &self,
         params: PagedDecodeParams,
-        _out_ptr: u64,
-        _q_ptr: u64,
-        _k_cache_ptr: u64,
-        _v_cache_ptr: u64,
-        _block_tables_ptr: u64,
-        _context_lens_ptr: u64,
-        _workspace_ptr: u64,
-        _stream: u64,
+        out_ptr: u64,
+        q_ptr: u64,
+        k_cache_ptr: u64,
+        v_cache_ptr: u64,
+        block_tables_ptr: u64,
+        context_lens_ptr: u64,
+        workspace_ptr: u64,
+        stream: u64,
     ) -> Result<()> {
         params.validate()?;
         #[cfg(feature = "cuda")]
         {
-            // Pending: dlsym("paged_decode") + call with the args above.
-            // For the scaffolding commit we return Ok so callers can
-            // plug in. The actual launch is added when rvllm-runtime is
-            // wired up in Phase C.
-            Ok(())
+            let rc = (self.fa3.fn_paged_decode)(
+                q_ptr as *mut std::ffi::c_void,
+                k_cache_ptr as *mut std::ffi::c_void,
+                v_cache_ptr as *mut std::ffi::c_void,
+                out_ptr as *mut std::ffi::c_void,
+                block_tables_ptr as *mut std::ffi::c_void,
+                context_lens_ptr as *mut std::ffi::c_void,
+                workspace_ptr as *mut std::ffi::c_void,
+                params.scale,
+                params.num_seqs as i32,
+                params.num_heads as i32,
+                params.num_kv_heads as i32,
+                params.head_dim as i32,
+                params.block_size as i32,
+                params.max_blocks_per_seq as i32,
+                params.num_blocks_total as i32,
+                stream as *mut std::ffi::c_void,
+            );
+            if rc != 0 {
+                return Err(RvllmError::Attention {
+                    err: AttentionError::KernelLaunchFailed {
+                        cuda: rvllm_core::CudaErrorKind::LaunchFailed,
+                    },
+                    ctx: AttnCtx {
+                        op: "paged_decode",
+                        stream,
+                        num_seqs: params.num_seqs,
+                        head_dim: params.head_dim,
+                    },
+                    bt: std::backtrace::Backtrace::capture(),
+                });
+            }
         }
         #[cfg(not(feature = "cuda"))]
         {
-            Ok(())
+            let _ = (
+                out_ptr,
+                q_ptr,
+                k_cache_ptr,
+                v_cache_ptr,
+                block_tables_ptr,
+                context_lens_ptr,
+                workspace_ptr,
+                stream,
+            );
         }
+        Ok(())
     }
 }
 

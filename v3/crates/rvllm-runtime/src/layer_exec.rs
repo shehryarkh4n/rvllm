@@ -1,17 +1,32 @@
 //! Layer forward as a pure function per spec 09.
 //!
-//! The full v3 `forward` signature is:
-//!   `fn forward(input, weights, kv, scratch, meta, out, scope)`
-//! where every argument is borrowed (no hidden state mutation on a
-//! long-lived `&mut self`).
+//! The kernel sequence for one Llama-style decoder layer (GQA + FP8 W +
+//! fused residual add + rmsnorm + silu-mul):
+//!   1. fused_add_rmsnorm_fp8_quant   (attn_norm)
+//!   2. fp8_gemm                      (QKV fused proj)
+//!   3. fused_rope_kv_write           (apply RoPE + write K/V pages)
+//!   4. paged_decode                  (FA3 SM90)
+//!   5. fp8_gemm_residual             (O proj, epilogue adds residual)
+//!   6. fused_add_rmsnorm_fp8_quant   (mlp_norm)
+//!   7. fp8_gemm                      (gate||up fused proj)
+//!   8. fused_silu_mul_fp8_quant      (SiLU(gate) * up, quantize)
+//!   9. fp8_gemm_residual             (Down proj, epilogue adds residual)
 //!
-//! This module holds the public signature. The body (11 kernel launches
-//! per layer) is wired when rvllm-runtime gains an actual GPU-backed
-//! implementation.
+//! That is nine kernel launches per layer in the fused path. Split-QKV
+//! grows this to eleven; keep the fused variant as the default.
+//!
+//! No hidden mutable state — every buffer is passed by ptr.
 
 use rvllm_core::Result;
+use rvllm_cutlass::{CutlassLib, Fp8GemmPlan};
+use rvllm_fused::{
+    ArgmaxLaunch, FusedAddRmsnormFp8QuantLaunch, FusedRopeKvWriteLaunch,
+    FusedSiluMulFp8QuantLaunch,
+};
+use rvllm_kernels::KernelFn;
 
-/// Shape for the per-layer input / output tensor.
+use rvllm_attention::{Fa3Kernels, PagedDecodeLauncher, PagedDecodeParams};
+
 #[derive(Copy, Clone, Debug)]
 pub struct LayerDims {
     pub num_tokens: u32,
@@ -20,20 +35,283 @@ pub struct LayerDims {
     pub num_kv_heads: u32,
     pub head_dim: u32,
     pub intermediate: u32,
+    pub block_size: u32,
+    pub max_blocks_per_seq: u32,
+    pub num_blocks_total: u32,
+    pub attn_scale: f32,
+    pub rms_eps: f32,
 }
 
-/// Pure-function layer forward. `input` → `out` via 11 kernel launches.
-/// Implementation pending Phase D wiring; this stub defines the
-/// signature so downstream crates compile against it.
+/// Per-layer device pointers: weights + fused norm gammas.
+#[derive(Copy, Clone, Debug)]
+pub struct LayerWeights {
+    pub attn_norm_gamma: u64,
+    pub qkv_fp8: u64,
+    pub qkv_scale: u64,
+    pub o_fp8: u64,
+    pub o_scale: u64,
+    pub mlp_norm_gamma: u64,
+    pub gate_up_fp8: u64,
+    pub gate_up_scale: u64,
+    pub down_fp8: u64,
+    pub down_scale: u64,
+}
+
+/// Per-step scratch device pointers (shared across layers).
+#[derive(Copy, Clone, Debug)]
+pub struct LayerScratch {
+    pub hidden_fp8: u64,
+    pub hidden_scale: u64,
+    pub qkv_out: u64,
+    pub k_cache: u64,
+    pub v_cache: u64,
+    pub attn_out: u64,
+    pub attn_out_fp8: u64,
+    pub attn_out_scale: u64,
+    pub gate_up_out: u64,
+    pub gate_up_fp8: u64,
+    pub gate_up_scale: u64,
+    pub mlp_out_fp8: u64,
+    pub mlp_out_scale: u64,
+    pub cutlass_workspace: u64,
+    pub cutlass_workspace_bytes: usize,
+    pub fa3_workspace: u64,
+}
+
+/// Metadata device pointers: positions, slot_mapping, cos, sin, block
+/// tables, context_lens. These are filled once per step by metadata
+/// upload and stay stable through graph replay.
+#[derive(Copy, Clone, Debug)]
+pub struct MetadataPtrs {
+    pub positions: u64,
+    pub slot_mapping: u64,
+    pub cos: u64,
+    pub sin: u64,
+    pub block_tables: u64,
+    pub context_lens: u64,
+}
+
+/// Kernel handles (pre-resolved at engine init from the kernel loader).
+#[derive(Copy, Clone, Debug)]
+pub struct LayerKernels {
+    pub fused_add_rmsnorm: KernelFn,
+    pub fused_rope_kv_write: KernelFn,
+    pub fused_silu_mul: KernelFn,
+    pub quantize_fp8_per_token: KernelFn,
+}
+
+/// Plans for the four GEMMs in a layer (resolved once per bucket from
+/// the autotune policy).
+#[derive(Clone, Debug)]
+pub struct LayerGemmPlans {
+    pub qkv: Fp8GemmPlan,       // non-residual
+    pub o: Fp8GemmPlan,         // residual-fused
+    pub gate_up: Fp8GemmPlan,   // non-residual
+    pub down: Fp8GemmPlan,      // residual-fused
+}
+
+/// One decoder layer forward. `residual` is read and written in place.
+///
+/// # Safety
+/// Caller owns every pointer. No internal bounds checks on the scratch
+/// pointers — they must be sized per `LayerDims`.
 #[allow(clippy::too_many_arguments)]
-pub fn forward(
-    _layer_index: u32,
-    _dims: LayerDims,
-    // &Tensor<...> for input, &LayerWeights, &mut KvSlab, &mut LayerScratch,
-    // &Metadata, &mut Tensor<...> for out, &CaptureScope — to be added
-    // when the GPU types are wired up.
+pub unsafe fn forward(
+    dims: LayerDims,
+    kernels: &LayerKernels,
+    weights: &LayerWeights,
+    scratch: &LayerScratch,
+    meta: &MetadataPtrs,
+    plans: &LayerGemmPlans,
+    cutlass: &CutlassLib,
+    fa3: &Fa3Kernels,
+    residual: u64,
+    stream: u64,
 ) -> Result<()> {
+    // 1. hidden_fp8 = fp8_quant(rmsnorm(residual + 0)) with eps; write
+    //    residual <- residual (no prior add on layer 0 caller's responsibility).
+    FusedAddRmsnormFp8QuantLaunch {
+        num_tokens: dims.num_tokens,
+        hidden: dims.hidden,
+        eps: dims.rms_eps,
+    }
+    .launch(
+        kernels.fused_add_rmsnorm,
+        scratch.hidden_fp8,
+        scratch.hidden_scale,
+        residual,                 // residual_out (in-place)
+        residual,                 // in_hidden == residual
+        residual,                 // residual_in == residual (op is idempotent here)
+        weights.attn_norm_gamma,
+        stream,
+    )?;
+
+    // 2. QKV fused proj: hidden_fp8 @ qkv_fp8 -> qkv_out (f16).
+    #[cfg(feature = "cuda")]
+    cutlass.launch_fp8_gemm(
+        &plans.qkv,
+        scratch.qkv_out,
+        scratch.hidden_fp8,
+        weights.qkv_fp8,
+        scratch.hidden_scale,
+        weights.qkv_scale,
+        scratch.cutlass_workspace,
+        scratch.cutlass_workspace_bytes,
+        stream,
+    )?;
+
+    // 3. RoPE + write K/V into paged cache.
+    let q_dim = dims.num_heads * dims.head_dim;
+    let kv_dim = dims.num_kv_heads * dims.head_dim;
+    FusedRopeKvWriteLaunch {
+        num_tokens: dims.num_tokens,
+        q_dim,
+        kv_dim,
+        head_dim: dims.head_dim,
+    }
+    .launch(
+        kernels.fused_rope_kv_write,
+        scratch.qkv_out,
+        scratch.k_cache,
+        scratch.v_cache,
+        meta.positions,
+        meta.cos,
+        meta.sin,
+        meta.slot_mapping,
+        stream,
+    )?;
+
+    // 4. FA3 paged decode.
+    let decode = PagedDecodeLauncher::new(fa3);
+    let decode_params = PagedDecodeParams {
+        num_seqs: dims.num_tokens,
+        num_heads: dims.num_heads,
+        num_kv_heads: dims.num_kv_heads,
+        head_dim: dims.head_dim,
+        block_size: dims.block_size,
+        max_blocks_per_seq: dims.max_blocks_per_seq,
+        num_blocks_total: dims.num_blocks_total,
+        scale: dims.attn_scale,
+    };
+    decode.launch(
+        decode_params,
+        scratch.attn_out,
+        scratch.qkv_out,    // Q view into QKV packed
+        scratch.k_cache,
+        scratch.v_cache,
+        meta.block_tables,
+        meta.context_lens,
+        scratch.fa3_workspace,
+        stream,
+    )?;
+
+    // 5. O proj with residual-fused epilogue: residual += o_proj(attn_out).
+    //    First quantize attn_out to fp8 (per-token), then GEMM_residual.
+    rvllm_fused::QuantizeFp8PerTokenLaunch {
+        num_tokens: dims.num_tokens,
+        dim: q_dim,
+    }
+    .launch(
+        kernels.quantize_fp8_per_token,
+        scratch.attn_out_fp8,
+        scratch.attn_out_scale,
+        scratch.attn_out,
+        stream,
+    )?;
+    #[cfg(feature = "cuda")]
+    cutlass.launch_fp8_gemm_residual(
+        &plans.o,
+        residual,
+        scratch.attn_out_fp8,
+        weights.o_fp8,
+        scratch.attn_out_scale,
+        weights.o_scale,
+        residual,
+        scratch.cutlass_workspace,
+        scratch.cutlass_workspace_bytes,
+        stream,
+    )?;
+
+    // 6. pre-MLP norm + fp8 quant.
+    FusedAddRmsnormFp8QuantLaunch {
+        num_tokens: dims.num_tokens,
+        hidden: dims.hidden,
+        eps: dims.rms_eps,
+    }
+    .launch(
+        kernels.fused_add_rmsnorm,
+        scratch.hidden_fp8,
+        scratch.hidden_scale,
+        residual,
+        residual,
+        residual,
+        weights.mlp_norm_gamma,
+        stream,
+    )?;
+
+    // 7. gate||up fused proj.
+    #[cfg(feature = "cuda")]
+    cutlass.launch_fp8_gemm(
+        &plans.gate_up,
+        scratch.gate_up_out,
+        scratch.hidden_fp8,
+        weights.gate_up_fp8,
+        scratch.hidden_scale,
+        weights.gate_up_scale,
+        scratch.cutlass_workspace,
+        scratch.cutlass_workspace_bytes,
+        stream,
+    )?;
+
+    // 8. silu(gate) * up -> mlp_out_fp8.
+    FusedSiluMulFp8QuantLaunch {
+        num_tokens: dims.num_tokens,
+        intermediate: dims.intermediate,
+    }
+    .launch(
+        kernels.fused_silu_mul,
+        scratch.mlp_out_fp8,
+        scratch.mlp_out_scale,
+        scratch.gate_up_out,
+        stream,
+    )?;
+
+    // 9. Down proj with residual epilogue.
+    #[cfg(feature = "cuda")]
+    cutlass.launch_fp8_gemm_residual(
+        &plans.down,
+        residual,
+        scratch.mlp_out_fp8,
+        weights.down_fp8,
+        scratch.mlp_out_scale,
+        weights.down_scale,
+        residual,
+        scratch.cutlass_workspace,
+        scratch.cutlass_workspace_bytes,
+        stream,
+    )?;
+
+    // Suppress unused under no-cuda (cutlass/fa3 dispatch is cuda-gated).
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (cutlass, plans, stream);
+    }
     Ok(())
+}
+
+/// Sampling tail (post-LM-head). Given logits, argmax into an i32 slot.
+///
+/// # Safety
+/// Caller owns pointers.
+pub unsafe fn argmax_sample(
+    num_tokens: u32,
+    vocab: u32,
+    kernel: KernelFn,
+    logits_ptr: u64,
+    out_ptr: u64,
+    stream: u64,
+) -> Result<()> {
+    ArgmaxLaunch { num_tokens, vocab }.launch(kernel, logits_ptr, out_ptr, stream)
 }
 
 #[cfg(test)]
@@ -41,15 +319,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn stub_forward_compiles() {
-        let dims = LayerDims {
+    fn layer_dims_are_plausible() {
+        let d = LayerDims {
             num_tokens: 128,
             hidden: 3584,
             num_heads: 28,
             num_kv_heads: 4,
             head_dim: 128,
             intermediate: 18944,
+            block_size: 64,
+            max_blocks_per_seq: 33,
+            num_blocks_total: 1024,
+            attn_scale: 1.0 / 11.313708,
+            rms_eps: 1e-6,
         };
-        assert!(forward(0, dims).is_ok());
+        assert_eq!(d.num_heads * d.head_dim, 3584);
+        assert_eq!(d.num_kv_heads * d.head_dim, 512);
     }
 }

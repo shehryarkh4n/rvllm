@@ -140,6 +140,115 @@ impl CutlassLib {
         }
         Ok(Self { so_path: path })
     }
+
+    /// Dispatch a non-residual FP8 GEMM. `workspace` may be null if the
+    /// plan's `workspace_bytes == 0`; otherwise it must point at >=
+    /// `plan.workspace_bytes` of device memory.
+    ///
+    /// # Safety
+    /// All pointers must be valid device memory for the kernel's duration.
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch_fp8_gemm(
+        &self,
+        plan: &crate::plan::Fp8GemmPlan,
+        output: u64,
+        a: u64,
+        b: u64,
+        a_scales: u64,
+        b_scale: u64,
+        workspace: u64,
+        workspace_size: usize,
+        stream: u64,
+    ) -> Result<()> {
+        plan.check_workspace(workspace_size)?;
+        let f = self.fp8_gemm.get(&plan.variant).ok_or_else(|| {
+            variant_missing(&self.so_path, plan.variant, "fp8_gemm (runtime lookup)")
+        })?;
+        let rc = f(
+            output as *mut c_void,
+            a as *const c_void,
+            b as *const c_void,
+            a_scales as *const c_void,
+            b_scale as *const c_void,
+            plan.m as i32,
+            plan.n as i32,
+            plan.k as i32,
+            workspace as *mut c_void,
+            workspace_size,
+            stream as *mut c_void,
+        );
+        if rc != 0 {
+            return Err(RvllmError::cutlass(
+                CutlassError::KernelLaunchFailed {
+                    variant: plan.variant.0,
+                    cuda: rvllm_core::CudaErrorKind::LaunchFailed,
+                },
+                CutlassCtx {
+                    kernel: "fp8_gemm",
+                    stream,
+                },
+            ));
+        }
+        Ok(())
+    }
+
+    /// Same, residual-fused variant. `residual` is the C-tensor the
+    /// epilogue adds into `output`.
+    ///
+    /// # Safety
+    /// All pointers valid for the call.
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch_fp8_gemm_residual(
+        &self,
+        plan: &crate::plan::Fp8GemmPlan,
+        output: u64,
+        a: u64,
+        b: u64,
+        a_scales: u64,
+        b_scale: u64,
+        residual: u64,
+        workspace: u64,
+        workspace_size: usize,
+        stream: u64,
+    ) -> Result<()> {
+        plan.check_workspace(workspace_size)?;
+        let f = self.fp8_gemm_residual.get(&plan.variant).ok_or_else(|| {
+            variant_missing(
+                &self.so_path,
+                plan.variant,
+                "fp8_gemm_residual (runtime lookup)",
+            )
+        })?;
+        let rc = f(
+            output as *mut c_void,
+            a as *const c_void,
+            b as *const c_void,
+            a_scales as *const c_void,
+            b_scale as *const c_void,
+            residual as *const c_void,
+            plan.m as i32,
+            plan.n as i32,
+            plan.k as i32,
+            workspace as *mut c_void,
+            workspace_size,
+            stream as *mut c_void,
+        );
+        if rc != 0 {
+            return Err(RvllmError::cutlass(
+                CutlassError::KernelLaunchFailed {
+                    variant: plan.variant.0,
+                    cuda: rvllm_core::CudaErrorKind::LaunchFailed,
+                },
+                CutlassCtx {
+                    kernel: "fp8_gemm_residual",
+                    stream,
+                },
+            ));
+        }
+        Ok(())
+    }
 }
 
 fn cutlass_miss(path: &std::path::Path) -> RvllmError {
