@@ -106,13 +106,22 @@ impl Bringup {
                 "policy.json",
             )
         })?;
-        let variants: Vec<_> = policy
+        // Pre-resolve a generous universe of variants so a bench sweep
+        // can try any of them without re-bringup. If a symbol is
+        // missing from the .so the load path returns typed err — that's
+        // expected for a sweep run against a .so without some variant.
+        let mut variants: std::collections::BTreeSet<_> = policy
             .entries
             .values()
             .map(|e| e.variant)
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
             .collect();
+        for v in 0..16u32 {
+            variants.insert(rvllm_cutlass::VariantId(v));
+        }
+        for v in 100..110u32 {
+            variants.insert(rvllm_cutlass::VariantId(v));
+        }
+        let variants: Vec<_> = variants.into_iter().collect();
         let cutlass = CutlassLib::load(paths.cutlass_so.clone(), &variants)?;
 
         Ok(Self {
@@ -148,6 +157,36 @@ impl Bringup {
     /// valid.
     #[cfg(feature = "cuda")]
     pub unsafe fn run_bench(&self, num_seqs: u32, iters: u32, warmup: u32) -> Result<BenchResult> {
+        self.run_bench_with_variants(num_seqs, iters, warmup, None, None)
+    }
+
+    /// Same as run_bench but with optional variant overrides. When
+    /// `nonres_override` is `Some(v)`, every non-residual plan uses
+    /// variant v regardless of the policy; same for `res_override` and
+    /// residual plans. Lets a caller sweep variants without reloading
+    /// weights.
+    #[cfg(feature = "cuda")]
+    pub unsafe fn run_bench_with_variants(
+        &self,
+        num_seqs: u32,
+        iters: u32,
+        warmup: u32,
+        nonres_override: Option<u32>,
+        res_override: Option<u32>,
+    ) -> Result<BenchResult> {
+        let _ = (nonres_override, res_override);
+        self.run_bench_internal(num_seqs, iters, warmup, nonres_override, res_override)
+    }
+
+    #[cfg(feature = "cuda")]
+    unsafe fn run_bench_internal(
+        &self,
+        num_seqs: u32,
+        iters: u32,
+        warmup: u32,
+        nonres_override: Option<u32>,
+        res_override: Option<u32>,
+    ) -> Result<BenchResult> {
         use crate::layer_exec;
         use rvllm_cutlass::Fp8GemmPlan;
         use rvllm_fused::require_multiple;
@@ -230,56 +269,68 @@ impl Bringup {
 
         // Plans (from policy) for this specific bucket. Q, K, V each get
         // their own plan since they have different N dimensions.
-        let plan_q = Fp8GemmPlan::from_policy(
+        let override_nonres = |mut p: Fp8GemmPlan| -> Fp8GemmPlan {
+            if let Some(v) = nonres_override {
+                p.variant = rvllm_cutlass::VariantId(v);
+            }
+            p
+        };
+        let override_res = |mut p: Fp8GemmPlan| -> Fp8GemmPlan {
+            if let Some(v) = res_override {
+                p.variant = rvllm_cutlass::VariantId(v);
+            }
+            p
+        };
+        let plan_q = override_nonres(Fp8GemmPlan::from_policy(
             &self.policy,
             num_seqs,
             q_dim,
             hidden,
             rvllm_core::DType::Fp8E4M3,
-        )?;
-        let plan_k = Fp8GemmPlan::from_policy(
+        )?);
+        let plan_k = override_nonres(Fp8GemmPlan::from_policy(
             &self.policy,
             num_seqs,
             kv_dim,
             hidden,
             rvllm_core::DType::Fp8E4M3,
-        )?;
-        let plan_v = Fp8GemmPlan::from_policy(
+        )?);
+        let plan_v = override_nonres(Fp8GemmPlan::from_policy(
             &self.policy,
             num_seqs,
             kv_dim,
             hidden,
             rvllm_core::DType::Fp8E4M3,
-        )?;
-        let plan_o = Fp8GemmPlan::from_policy_residual(
+        )?);
+        let plan_o = override_res(Fp8GemmPlan::from_policy_residual(
             &self.policy,
             num_seqs,
             hidden,
             q_dim,
             rvllm_core::DType::Fp8E4M3,
-        )?;
-        let plan_gate_up = Fp8GemmPlan::from_policy(
+        )?);
+        let plan_gate_up = override_nonres(Fp8GemmPlan::from_policy(
             &self.policy,
             num_seqs,
             2 * inter,
             hidden,
             rvllm_core::DType::Fp8E4M3,
-        )?;
-        let plan_down = Fp8GemmPlan::from_policy_residual(
+        )?);
+        let plan_down = override_res(Fp8GemmPlan::from_policy_residual(
             &self.policy,
             num_seqs,
             hidden,
             inter,
             rvllm_core::DType::Fp8E4M3,
-        )?;
+        )?);
         let vocab = arch.vocab_size as u32;
-        let plan_lm_head = Fp8GemmPlan::from_policy(
+        let plan_lm_head = override_nonres(Fp8GemmPlan::from_policy(
             &self.policy,
             num_seqs,
             vocab,
             hidden,
             rvllm_core::DType::Fp8E4M3,
-        )?;
+        )?);
 
         // LM head scratch: batch x vocab f16 logits + batch sampled tokens.
         let logits = arena.region("logits", (num_seqs * vocab * 2) as usize, 16)?;
