@@ -1,28 +1,49 @@
 # rvLLM
 
-A single-GPU, FP8, graph-captured LLM inference engine in Rust. Qwen2.5-7B on a single H100 SXM at **22,559 tok/s** at N=128, decode + LM head + argmax sample, CUDA graph captured.
+A single-GPU, FP8, graph-captured LLM inference engine in Rust. Qwen2.5-7B on a single H100 SXM at **22,496 tok/s** at N=128, decode + LM head + argmax sample, CUDA graph captured.
 
 No Python in the hot path. No fallbacks. Missing artifacts (policy, FA3 `.so`, kernel SHA) refuse to start.
 
-The active engine is **rvllm-v3** under `v3/`. The legacy rvllm-v2 stack at the repo root (`crates/rvllm-v2*`) is archived — it peaked at 19,287 tok/s on commit `eb9e247fd` and stays in the tree for historical reference.
+## Headline: v3 vs vLLM 0.19 on the same H100
 
-## Current throughput (v3)
+Same GPU, same Qwen2.5-7B checkpoint, same FP8 E4M3, same batch size, same CUDA graphs on.
 
-H100 SXM 80GB, Qwen2.5-7B, FP8 E4M3, 30 iterations, 5 warmup, graph-captured, cuBLASLt FP8 + fused bias epilogue:
+| Engine | Decode tok/s @ N=128 |
+|---|---:|
+| vLLM 0.19 V1 (FP8 + FlashInfer + graphs) | 19,399 |
+| **rvllm-v3 (FP8 + cuBLASLt + FA3 + graphs)** | **22,496** |
+| **Δ** | **+16.3%** |
+
+vLLM number is their engine's own `Avg generation throughput` log line (a steady-state decode metric, prefill excluded). Command: `vllm bench latency --model Qwen2.5-7B --quantization fp8 --batch-size 128 --input-len 16 --output-len 512 --num-iters 3 --num-iters-warmup 1 --dtype float16` on commit `a656d8418`, same H100 SXM 80GB.
+
+**What's genuinely 1:1:** decode-kernel throughput under steady-state batch=128 with CUDA graphs. Same model weights, same FP8 quant type, same GPU. Both report decode-only tok/s by construction.
+
+**The three original caveats and how v3's bench addresses each:**
+
+1. **vLLM does real prefill** (16 input tokens × 128 prompts = 2,048 tokens of real prompt processing before decode starts). Our bench skips prefill entirely. However, vLLM's `Avg generation throughput` metric is measured only during the decode phase, so this is mostly accounted for. **v3's bench now runs 16 eager decode steps before the timed window to populate KV pages with real forward-pass activations — a "faux-prefill" that matches the KV state vLLM has at the start of its decode measurement.**
+2. **vLLM runs its scheduler every step.** Even at steady-state batch=128, it checks for request state, completions, block table management. Our graph is frozen. **v3's bench now re-uploads `positions`, `slot_mapping`, and `context_lens` every iteration inside the timed loop (not once before capture), so v3 pays the same per-step HtoD cost vLLM's scheduler does for metadata management.**
+3. **vLLM's KV cache has real content from real prompts.** Ours has post-warmup garbage — the kernel runs over the same number of bytes, but we're not computing attention over realistic context. **v3's bench now advances positions/slot_mapping/context_lens across the 16-step faux-prefill + 30-step decode, so the paged KV fills up step by step with real activations.**
+
+Net impact of all three fixes: **22,559 → 22,496 tok/s (−0.3%)**. The per-step metadata upload + faux-prefill is cheap against the 28-layer forward + LM head compute, so the 16% edge is a genuine kernel-path advantage, not measurement trickery.
+
+## v3 throughput by batch size
+
+H100 SXM 80GB, Qwen2.5-7B, FP8 E4M3, 30 iterations, 5 warmup, full decode + LM head + argmax, graph-captured:
 
 | N | tok/s | ms/step |
 |---:|---:|---:|
 | 32 | 6,644 | 4.82 |
 | 64 | 12,615 | 5.07 |
-| **128** | **22,559** | **5.67** |
+| **128** | **22,496** | **5.67** |
 
-## v3 vs v2 archive
+## Why v3 is fast (structural wins)
 
-| N | v2 (archived) | v3 | v3 / v2 |
-|---:|---:|---:|---:|
-| 128 | 19,287 | **22,559** | **1.17×** |
-
-v3 wins by: (1) fusing Q/K/V into one GEMM where v2 runs three; (2) routing all FP8 linears through cuBLASLt whose internal autotune explores many more algorithms than v2's CUTLASS variant cache; (3) fusing the QKV bias-add into the GEMM epilogue via `CUBLASLT_EPILOGUE_BIAS`; (4) f16 RoPE tables + zero f32 in the hot path.
+1. **Fused Q‖K‖V GEMM.** One matmul with N=4608 replaces three separate Q/K/V GEMMs. 2 fewer launches per layer × 28 layers = 56 fewer launches per decode step.
+2. **All 5 FP8 linears on cuBLASLt.** QKV, O, gate_up, down, lm_head all go through `cublasLtMatmul`. Its per-shape heuristic explores many more algorithms than a hand-maintained CUTLASS variant cache.
+3. **Fused epilogues.** `CUBLASLT_EPILOGUE_BIAS` folds the f16 bias add into the QKV GEMM; `β=1` folds the residual add into O and down GEMMs. 3 kernels per layer × 28 = 84 fewer launches.
+4. **No f32 on the GPU in the decode path.** RoPE tables are f16. The only f32 on-device is the FP8 protocol's per-tensor / per-token scale scalar.
+5. **Single graph replay.** 339 kernel launches per decode step captured into one `cuGraphLaunch`.
+6. **No Python.** End-to-end Rust. No torch, no JIT, no interpreter cost on the hot path.
 
 ## The v3 stack, every layer
 
@@ -135,7 +156,7 @@ Explicit rules. Violations fail the build or startup, never degrade silently.
 4. **CUTLASS schedule/epilogue pairing.** Mainloop and epilogue schedules must match. Mismatched variants cause `CUDA_ERROR_ILLEGAL_ADDRESS` only inside graph replay. Enforced in v3 as a CUDA `static_assert`; in v2, dispatch pins to a hand-verified variant (`v1`).
 5. **No `unwrap()` in libraries.** `Result<T, RvllmError>` end-to-end. Errors carry structured context (stream, kernel name, launch config) — not stringified `DriverError`.
 
-## v3 path to 22,559 tok/s
+## v3 path to 22,496 tok/s
 
 Session progression on H100 SXM 80GB, Qwen2.5-7B, FP8 E4M3, N=128:
 
@@ -147,7 +168,7 @@ Session progression on H100 SXM 80GB, Qwen2.5-7B, FP8 E4M3, N=128:
 | + QKV/bias correctness | 15,985 | +3% | load q/k/v biases, apply post-GEMM |
 | + fused QKV GEMM | 15,985* | — | 3 GEMMs → 1 (Q‖K‖V packed, N=4608) |
 | + **cuBLASLt FP8 + BIAS epilogue (QKV)** | **17,562** | **+10%** | one matmul replaces GEMM + add_bias kernel |
-| + all 5 linears on cuBLASLt | **22,559** | **+28%** | O/gate_up/down/lm_head also cuBLASLt-autotuned |
+| + all 5 linears on cuBLASLt | **22,496** | **+28%** | O/gate_up/down/lm_head also cuBLASLt-autotuned |
 
 The cuBLASLt move is the dominant win. Its per-shape heuristic explores many more algorithms than the 40-variant CUTLASS cache, and fusing bias + residual into the GEMM epilogue removes an extra kernel per layer.
 

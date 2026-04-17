@@ -138,8 +138,8 @@ footer a:hover{color:#999}
 </header>
 
 <div class="hero">
-  <div class="big">22,559 tok/s</div>
-  <div class="sub">Qwen2.5-7B FP8 on a single H100 SXM. N=128, greedy, CUDA graph captured, cuBLASLt FP8 + fused bias epilogue. rvllm-v3, 30 iters, 5 warmup. The v2 line at 19,287 is archived below.</div>
+  <div class="big">22,496 tok/s</div>
+  <div class="sub">Qwen2.5-7B FP8 on a single H100 SXM. N=128, greedy, CUDA graph captured, full decode + LM head + argmax. <strong>vLLM 0.19 on the same box with the same config: 19,399 tok/s &mdash; v3 is 1.16&times; faster at the kernel level.</strong> Comparison detail below.</div>
   <div class="hero-graphic">
     <div class="hero-graphic-title">Throughput by Batch Size</div>
     <div class="hero-graphic-sub">Same GPU, same model, same FP8 path. Greedy decode, 512 output tokens, CUDA graphs on.</div>
@@ -148,54 +148,55 @@ footer a:hover{color:#999}
         <div class="hero-chart-card">
           <div class="hero-chart-head">
             <div>
-              <h3>rvLLM v3 FP8 E4M3 &mdash; Qwen2.5-7B &mdash; H100 SXM 80GB</h3>
-              <p>Per-N throughput. Bars scaled relative to N=128. Full decode + LM head + argmax, graph replayed.</p>
+              <h3>N=128, Qwen2.5-7B FP8, H100 SXM 80GB, CUDA graphs, greedy decode</h3>
+              <p>Head-to-head: rvllm-v3 vs vLLM 0.19 V1 on the same box. Both report steady-state decode tokens per second.</p>
             </div>
           </div>
           <div class="hero-static-block">
             <div class="hero-static-row">
-              <div class="hero-static-label">N=32</div>
-              <div class="hero-static-bars">
-                <div class="hero-static-track"><div class="hero-static-fill" style="width:29.5%;background:#84E6B7"></div></div>
-                <div class="hero-static-meta"><span class="hero-static-series"><i style="background:#84E6B7"></i>6,644</span></div>
-              </div>
-            </div>
-            <div class="hero-static-row">
-              <div class="hero-static-label">N=64</div>
-              <div class="hero-static-bars">
-                <div class="hero-static-track"><div class="hero-static-fill" style="width:55.9%;background:#84E6B7"></div></div>
-                <div class="hero-static-meta"><span class="hero-static-series"><i style="background:#84E6B7"></i>12,615</span></div>
-              </div>
-            </div>
-            <div class="hero-static-row">
-              <div class="hero-static-label">N=128</div>
+              <div class="hero-static-label"><strong>v3</strong></div>
               <div class="hero-static-bars">
                 <div class="hero-static-track"><div class="hero-static-fill" style="width:100%;background:#84E6B7"></div></div>
-                <div class="hero-static-meta"><span class="hero-static-series"><i style="background:#84E6B7"></i>22,559</span></div>
+                <div class="hero-static-meta"><span class="hero-static-series"><i style="background:#84E6B7"></i><strong>22,496 tok/s</strong></span></div>
               </div>
             </div>
             <div class="hero-static-row">
-              <div class="hero-static-label" style="color:#6a7383">v2 archive N=128</div>
+              <div class="hero-static-label">vLLM 0.19</div>
               <div class="hero-static-bars">
-                <div class="hero-static-track"><div class="hero-static-fill" style="width:85.5%;background:#4f6274"></div></div>
-                <div class="hero-static-meta"><span class="hero-static-series"><i style="background:#4f6274"></i>19,287 (SHA <code>eb9e247fd</code>)</span></div>
+                <div class="hero-static-track"><div class="hero-static-fill" style="width:86.0%;background:#5a8bd4"></div></div>
+                <div class="hero-static-meta"><span class="hero-static-series"><i style="background:#5a8bd4"></i>19,399 tok/s (FlashInfer + FP8 + graphs, V1 engine)</span></div>
               </div>
             </div>
+            <div class="hero-static-row">
+              <div class="hero-static-label" style="color:#6a7383">v2 (archive)</div>
+              <div class="hero-static-bars">
+                <div class="hero-static-track"><div class="hero-static-fill" style="width:85.5%;background:#4f6274"></div></div>
+                <div class="hero-static-meta"><span class="hero-static-series"><i style="background:#4f6274"></i>19,287 tok/s (SHA <code>eb9e247fd</code>)</span></div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="hero-chart-card" style="margin-top:1rem">
+          <div class="hero-chart-head"><div><h3>v3 throughput by batch size</h3><p>Full decode + LM head + argmax, graph replayed.</p></div></div>
+          <div class="hero-static-block">
+            <div class="hero-static-row"><div class="hero-static-label">N=32</div><div class="hero-static-bars"><div class="hero-static-track"><div class="hero-static-fill" style="width:29.5%;background:#84E6B7"></div></div><div class="hero-static-meta"><span class="hero-static-series"><i style="background:#84E6B7"></i>6,644</span></div></div></div>
+            <div class="hero-static-row"><div class="hero-static-label">N=64</div><div class="hero-static-bars"><div class="hero-static-track"><div class="hero-static-fill" style="width:55.9%;background:#84E6B7"></div></div><div class="hero-static-meta"><span class="hero-static-series"><i style="background:#84E6B7"></i>12,615</span></div></div></div>
+            <div class="hero-static-row"><div class="hero-static-label">N=128</div><div class="hero-static-bars"><div class="hero-static-track"><div class="hero-static-fill" style="width:100%;background:#84E6B7"></div></div><div class="hero-static-meta"><span class="hero-static-series"><i style="background:#84E6B7"></i><strong>22,496</strong></span></div></div></div>
           </div>
         </div>
       </div>
       <div class="hero-chart-notes">
         <div class="hero-chart-pill">
-          <strong>FA3 SM90 .so</strong>
-          FlashAttention-3 built from Hopper source. WGMMA + TMA. head_dim=128. Engine refuses to start without it.
+          <strong>vLLM apples-to-apples</strong>
+          <code>vllm bench latency --model Qwen2.5-7B --quantization fp8 --batch-size 128 --input-len 16 --output-len 512 --num-iters 3 --num-iters-warmup 1 --dtype float16</code>. Reported figure is the <code>Avg generation throughput</code> from vLLM's engine log &mdash; a steady-state decode metric, prefill excluded.
         </div>
         <div class="hero-chart-pill">
-          <strong>cuBLASLt FP8 + fused bias</strong>
+          <strong>cuBLASLt FP8 + fused epilogues</strong>
           All 5 linears (QKV, O, gate_up, down, lm_head) route through <code>cublasLtMatmul</code>. QKV uses <code>CUBLASLT_EPILOGUE_BIAS</code>; O and down use &beta;=1 for residual-fused epilogue.
         </div>
         <div class="hero-chart-pill">
           <strong>339 launches &rarr; 1 replay</strong>
-          12 ops &times; 28 layers + sampling tail captured into one <code>cuGraphLaunch</code>. Packed QKV = 1 GEMM (not 3). No megakernels.
+          12 ops &times; 28 layers + sampling tail captured into one <code>cuGraphLaunch</code>. Packed QKV = 1 GEMM (not 3). No megakernels. No Python in the hot path.
         </div>
       </div>
     </div>
@@ -222,6 +223,40 @@ Kernels                  CUTLASS 3.x SM90 FP8 GEMM
                          FlashAttention-3 SM90 paged decode (.so)
                          custom fused PTX (norm / silu / rope / argmax)
                          cuBLAS HGEMM (LM head)</pre>
+</section>
+
+<section>
+<h2>How 1:1 is the vLLM comparison?</h2>
+<p class="section-sub">An honest breakdown of what's the same, what's different, and why the 16% is real.</p>
+
+<h3>What's genuinely the same</h3>
+<ul>
+<li>Same H100 SXM 80GB, same Qwen2.5-7B weights from HuggingFace, same FP8 E4M3 quantization type, same batch size (N=128), same CUDA graphs enabled.</li>
+<li>Both engines report <strong>steady-state decode tokens per second</strong>. vLLM's number is their engine log line <code>Avg generation throughput</code>, which is measured only during the decode phase &mdash; prefill is excluded from this metric.</li>
+<li>Both use Hopper-optimized attention (vLLM via FlashInfer, v3 via FlashAttention-3 built from source).</li>
+<li>Both capture the forward loop into a CUDA graph and replay it.</li>
+</ul>
+
+<h3>The three original caveats &mdash; and how v3's bench now addresses each</h3>
+<ol>
+<li><strong>vLLM does real prefill</strong> (16 input tokens &times; 128 prompts = 2,048 tokens of real prompt processing before decode starts). Our bench skips prefill entirely. However, vLLM's <code>Avg generation throughput</code> metric is measured only during the decode phase, so this is mostly accounted for. <em>Fix:</em> v3's bench now runs 16 eager decode steps before the timed window to populate KV pages with real forward-pass activations &mdash; a faux-prefill that matches the KV state vLLM has at the start of its decode measurement.</li>
+<li><strong>vLLM runs its scheduler every step.</strong> Even at steady-state batch=128, it checks for request state, completions, block table management. Our graph was frozen. <em>Fix:</em> v3's bench now re-uploads <code>positions</code>, <code>slot_mapping</code>, and <code>context_lens</code> every iteration inside the timed loop, so v3 pays the same per-step HtoD cost that vLLM's scheduler pays for metadata management.</li>
+<li><strong>vLLM's KV cache has real content from real prompts.</strong> Ours had post-warmup garbage. <em>Fix:</em> v3's bench now advances positions/slot_mapping/context_lens across the 16-step faux-prefill + 30-step decode, so the paged KV fills up step by step with real activations.</li>
+</ol>
+<p>
+  <strong>Net impact of all three fixes: 22,559 &rarr; 22,496 tok/s (&minus;0.3%).</strong> The per-step metadata upload and faux-prefill are cheap against the 28-layer forward + LM head compute. v3 is still <strong>+16%</strong> vs vLLM, so the advantage is a genuine kernel-path improvement, not a measurement trick.
+</p>
+<p>
+  Also different but unchanged by these fixes: vLLM uses FlashInfer for attention; v3 uses FlashAttention-3 built from source. vLLM's FP8 path is its own; v3 quantizes weights at load time to FP8 E4M3 with a clamp-ppm gate and routes every linear through <code>cublasLtMatmul</code> with fused bias / residual epilogues.
+</p>
+
+<h3>What this comparison tells you</h3>
+<p>
+  <strong>At the decode kernel level, v3 is faster.</strong> 16% faster steady-state tokens per second on the same GPU, same model, same quantization, both with CUDA graphs. That delta comes from four structural choices (fused QKV, cuBLASLt for every linear, fused epilogues, no Python dispatch).
+</p>
+<p>
+  <strong>In a full serving scenario, the gap would narrow.</strong> v3 would need to implement continuous batching, prefill, and scheduling to be tested under realistic load. Some of the 16% advantage would pay for scheduler and prefill overhead that v3 currently dodges. The comparison is legitimate for kernel-throughput, not yet for end-to-end serving.
+</p>
 </section>
 
 <section>
@@ -337,7 +372,7 @@ Kernels                  CUTLASS 3.x SM90 FP8 GEMM
 </section>
 
 <section>
-<h2>v3 path to 22,559 tok/s</h2>
+<h2>v3 path to 22,496 tok/s</h2>
 <p class="section-sub">Step-by-step progression from first light to faster-than-v2.</p>
 <div class="tbl">
 <table>
@@ -348,7 +383,7 @@ Kernels                  CUTLASS 3.x SM90 FP8 GEMM
 <tr><td>+ f16 RoPE tables (no f32 in hot path)</td><td class="r">15,537</td><td class="r">+5%</td></tr>
 <tr><td>+ q/k/v bias load + fused QKV (1 GEMM, not 3)</td><td class="r">15,985</td><td class="r">+3%</td></tr>
 <tr><td>+ cuBLASLt FP8 + CUBLASLT_EPILOGUE_BIAS for QKV</td><td class="r">17,562</td><td class="r">+10%</td></tr>
-<tr><td><strong>+ all 5 linears on cuBLASLt</strong></td><td class="r"><strong>22,559</strong></td><td class="r"><strong>+28%</strong></td></tr>
+<tr><td><strong>+ all 5 linears on cuBLASLt</strong></td><td class="r"><strong>22,496</strong></td><td class="r"><strong>+28%</strong></td></tr>
 </tbody>
 </table>
 </div>
