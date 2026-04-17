@@ -11,7 +11,7 @@ import sys
 SHAPES = {
     # Qwen2.5-7B: hidden=3584, heads=28, kv_heads=4, head_dim=128, intermediate=18944
     # For each bucket M, emit the 6 plans a layer needs + lm_head.
-    "buckets": [1, 4, 8, 16, 32, 64, 128],
+    "buckets": [1, 4, 8, 16, 32, 64, 128, 256, 512],
     "hidden": 3584,
     "q_dim": 3584,  # 28 * 128
     "kv_dim": 512,  # 4 * 128
