@@ -109,6 +109,19 @@ static int fa3_sm90_paged_decode_impl(
         return -1;
     }
 
+    // CRITICAL: if a prior kernel left an error on the context, the
+    // next <<<>>> launch will fail with that error. Surface it now so
+    // we know WHICH prior kernel is the culprit, not just that FA3
+    // "crashed".
+    {
+        cudaError_t pre = cudaGetLastError();
+        if (pre != cudaSuccess) {
+            fprintf(stderr, "fa3: ENTRY cudaGetLastError=%s(%d) -- a PRIOR kernel failed, not FA3\n",
+                    cudaGetErrorString(pre), (int)pre);
+            return -2;
+        }
+    }
+
     // Get device properties
     int device;
     cudaGetDevice(&device);
