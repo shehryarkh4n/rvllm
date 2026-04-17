@@ -109,6 +109,7 @@ pub struct MetadataPtrs {
 
 #[derive(Copy, Clone, Debug)]
 pub struct LayerKernels {
+    pub fused_rmsnorm: KernelFn,
     pub fused_add_rmsnorm: KernelFn,
     pub fused_rope_cache_fp8kv: KernelFn,
     pub fused_silu_mul: KernelFn,
@@ -173,18 +174,19 @@ pub unsafe fn forward_phase(
     let q_dim = dims.num_heads * dims.head_dim;
     let kv_dim = dims.num_kv_heads * dims.head_dim;
 
-    // 1. rmsnorm(residual) + fp8 quant, residual updated in-place.
-    FusedAddRmsnormFp8QuantLaunch {
+    // 1. rmsnorm(residual) + fp8 quant. The residual add was already
+    //    done by the prior layer's down-proj cuBLASLt epilogue (beta=1).
+    //    Using norm-only (not fused_add) avoids a double-add that caused
+    //    residual to 2× per layer → f16 overflow → NaN by layer 16.
+    rvllm_fused::FusedRmsnormFp8QuantLaunch {
         num_tokens: dims.num_tokens,
         hidden: dims.hidden,
         eps: dims.rms_eps,
     }
     .launch(
-        kernels.fused_add_rmsnorm,
+        kernels.fused_rmsnorm,
         scratch.hidden_fp8,
         scratch.hidden_scale,
-        residual,
-        residual,
         residual,
         weights.attn_norm_gamma,
         stream,
@@ -336,18 +338,17 @@ pub unsafe fn forward_phase(
         stream,
     )?;
 
-    // 9. pre-MLP norm + fp8 quant.
-    FusedAddRmsnormFp8QuantLaunch {
+    // 9. pre-MLP norm + fp8 quant (norm-only, O-proj epilogue already
+    //    added to residual).
+    rvllm_fused::FusedRmsnormFp8QuantLaunch {
         num_tokens: dims.num_tokens,
         hidden: dims.hidden,
         eps: dims.rms_eps,
     }
     .launch(
-        kernels.fused_add_rmsnorm,
+        kernels.fused_rmsnorm,
         scratch.hidden_fp8,
         scratch.hidden_scale,
-        residual,
-        residual,
         residual,
         weights.mlp_norm_gamma,
         stream,

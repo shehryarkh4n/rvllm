@@ -438,6 +438,7 @@ impl Bringup {
             rms_eps: 1e-6,
         };
         let kernels = layer_exec::LayerKernels {
+            fused_rmsnorm: self.fused_modules.fn_rmsnorm,
             fused_add_rmsnorm: self.fused_modules.fn_add_rmsnorm,
             fused_rope_cache_fp8kv: self.fused_modules.fn_rope_cache_fp8kv,
             fused_silu_mul: self.fused_modules.fn_silu_mul,
@@ -750,6 +751,22 @@ impl Bringup {
             let show = ids.len().min(16);
             eprintln!("[TOKENS] sampled_ids[0..{show}] = {:?}", &ids[..show]);
         }
+        // Debug: dump logits values.
+        if std::env::var("RVLLM_DUMP_LOGITS").ok().as_deref() == Some("1") {
+            let logits_elems = (num_seqs * vocab) as usize;
+            let logits_bytes = logits_elems * 2;
+            let mut logits_host: Vec<u16> = vec![0u16; logits_elems];
+            dtoh_async_sync(
+                logits.device_ptr(),
+                logits_host.as_mut_ptr() as *mut i32,
+                logits_bytes,
+                stream,
+            )?;
+            self.stream.fence()?;
+            let first5: Vec<f32> = logits_host[..5].iter().map(|&b| f16_to_f32(b)).collect();
+            let nan_count = logits_host.iter().filter(|&&b| f16_to_f32(b).is_nan()).count();
+            eprintln!("[LOGITS] nan={}/{} first5={:?}", nan_count, logits_elems, &first5);
+        }
 
         Ok(BenchResult {
             ns_per_step: elapsed.as_nanos() / iters.max(1) as u128,
@@ -791,6 +808,349 @@ impl Bringup {
             ttft_hot_ns: None,
         })
     }
+
+    /// Run perplexity evaluation over `token_ids` in decode mode.
+    /// Processes one token at a time, runs LM head to get logits,
+    /// DtoH one row of logits (vocab x f16) per step, computes
+    /// cross-entropy on host. Returns (total_nll, num_evaluated_tokens).
+    ///
+    /// Uses the same arena allocation order as `run_bench_internal`
+    /// so all FA3 pointers land at proven-good addresses.
+    #[cfg(feature = "cuda")]
+    pub unsafe fn run_ppl(
+        &self,
+        fn_embed: rvllm_kernels::KernelFn,
+        token_ids: &[u32],
+    ) -> Result<PplResult> {
+        use crate::layer_exec;
+        use rvllm_cutlass::Fp8GemmPlan;
+        use rvllm_fused::require_multiple;
+
+        let arch = &self.arch;
+        let hidden = arch.hidden_size as u32;
+        let head_dim = arch.head_dim as u32;
+        let nh = arch.num_attention_heads as u32;
+        let nkvh = arch.num_key_value_heads as u32;
+        let inter = arch.intermediate_size as u32;
+        let q_dim = nh * head_dim;
+        let kv_dim = nkvh * head_dim;
+        let qkv_rows = (nh + 2 * nkvh) * head_dim;
+        require_multiple(hidden as usize, 8, "hidden")?;
+
+        let num_seqs: u32 = 1;
+        let max_tokens: u32 = num_seqs;
+        let block_size: u32 = std::env::var("RVLLM_BLOCK_SIZE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(64);
+        let num_blocks_total: u32 = 1024;
+        let max_blocks_per_seq: u32 = (num_blocks_total / num_seqs).max(1);
+        let kv_per_layer = 2 * num_blocks_total * block_size * nkvh * head_dim;
+
+        // --- scratch allocations (SAME ORDER as run_bench_internal) ---
+        let arena = &self.arena;
+        let hidden_fp8 = arena.region("hidden_fp8", (max_tokens * hidden) as usize, 16)?;
+        let hidden_scale = arena.region("hidden_scale", (max_tokens * 4) as usize, 16)?;
+        let qkv_out_bytes = (max_tokens * qkv_rows * 2) as usize;
+        let qkv_out = arena.region("qkv_out", qkv_out_bytes, 16)?;
+        let q_base = qkv_out.device_ptr();
+        let k_base_decode = q_base + (num_seqs as u64) * (q_dim as u64) * 2;
+        let v_base_decode = k_base_decode + (num_seqs as u64) * (kv_dim as u64) * 2;
+        let attn_out = arena.region("attn_out", (max_tokens * q_dim * 2) as usize, 16)?;
+        let attn_out_fp8 = arena.region("attn_out_fp8", (max_tokens * q_dim) as usize, 16)?;
+        let attn_out_scale = arena.region("attn_out_scale", (max_tokens * 4) as usize, 16)?;
+        let gate_up_out =
+            arena.region("gate_up_out", (max_tokens * 2 * inter * 2) as usize, 16)?;
+        let gate_up_fp8 = arena.region("gate_up_fp8", (max_tokens * 2 * inter) as usize, 16)?;
+        let gate_up_scale = arena.region("gate_up_scale", (max_tokens * 4) as usize, 16)?;
+        let mlp_out_fp8 = arena.region("mlp_out_fp8", (max_tokens * inter) as usize, 16)?;
+        let mlp_out_scale = arena.region("mlp_out_scale", (max_tokens * 4) as usize, 16)?;
+
+        let kv_cache = arena.region(
+            "kv_cache",
+            (arch.num_hidden_layers as u64 * kv_per_layer as u64) as usize,
+            256,
+        )?;
+        let q_fp8 = arena.region("q_fp8", (max_tokens * q_dim) as usize, 16)?;
+        let kv_absmax: f32 = std::env::var("RVLLM_KV_SCALE_ABSMAX")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(418.0f32);
+        let q_scale_region = arena.region("q_scale", 4, 4)?;
+        let kv_scale_region = arena.region("kv_scale", 4, 4)?;
+        {
+            let scale: f32 = kv_absmax / 448.0f32;
+            q_scale_region.copy_from_host(&scale.to_le_bytes())?;
+            kv_scale_region.copy_from_host(&scale.to_le_bytes())?;
+        }
+
+        let cutlass_ws_bytes: usize = 16 * 1024 * 1024;
+        let cutlass_ws = arena.region("cutlass_ws", cutlass_ws_bytes, 256)?;
+        let fa3_ws = arena.region("fa3_ws", 64 * 1024 * 1024, 256)?;
+
+        // Metadata BEFORE residual so embedding_gather can't corrupt them.
+        let positions = arena.region("positions", (max_tokens * 4) as usize, 16)?;
+        let slot_mapping = arena.region("slot_mapping", (max_tokens * 4) as usize, 16)?;
+        let context_lens = arena.region("context_lens", (num_seqs * 4) as usize, 16)?;
+        let block_tables = arena.region(
+            "block_tables",
+            (num_seqs * max_blocks_per_seq * 4) as usize,
+            16,
+        )?;
+
+        let residual = arena.region("residual", (max_tokens * hidden * 2) as usize, 16)?;
+        {
+            let n = num_seqs as usize;
+            let pos_host: Vec<i32> = (0..n as i32).collect();
+            let slot_host: Vec<i32> = (0..n as i32).collect();
+            let ctx_host: Vec<i32> = vec![1; n];
+            let mut bt_host: Vec<i32> = Vec::with_capacity(n * max_blocks_per_seq as usize);
+            for i in 0..n as i32 {
+                for b in 0..max_blocks_per_seq as i32 {
+                    bt_host.push(i * max_blocks_per_seq as i32 + b);
+                }
+            }
+            positions.copy_from_host(bytemuck_cast_i32(&pos_host))?;
+            slot_mapping.copy_from_host(bytemuck_cast_i32(&slot_host))?;
+            context_lens.copy_from_host(bytemuck_cast_i32(&ctx_host))?;
+            block_tables.copy_from_host(bytemuck_cast_i32(&bt_host))?;
+        }
+
+        let plan_qkv = Fp8GemmPlan::from_policy(
+            &self.policy, num_seqs, qkv_rows, hidden, rvllm_core::DType::Fp8E4M3,
+        )?;
+        let plan_o = Fp8GemmPlan::from_policy_residual(
+            &self.policy, num_seqs, hidden, q_dim, rvllm_core::DType::Fp8E4M3,
+        )?;
+        let plan_gate_up = Fp8GemmPlan::from_policy(
+            &self.policy, num_seqs, 2 * inter, hidden, rvllm_core::DType::Fp8E4M3,
+        )?;
+        let plan_down = Fp8GemmPlan::from_policy_residual(
+            &self.policy, num_seqs, hidden, inter, rvllm_core::DType::Fp8E4M3,
+        )?;
+        let vocab = arch.vocab_size as u32;
+
+        let logits = arena.region("logits", (num_seqs * vocab * 2) as usize, 16)?;
+        // token_ids upload region
+        let token_ids_region = arena.region("token_ids_ppl", (num_seqs * 4) as usize, 16)?;
+
+        let dims = layer_exec::LayerDims {
+            num_tokens: num_seqs,
+            hidden,
+            num_heads: nh,
+            num_kv_heads: nkvh,
+            head_dim,
+            intermediate: inter,
+            block_size,
+            max_blocks_per_seq,
+            num_blocks_total,
+            attn_scale: 1.0 / (head_dim as f32).sqrt(),
+            rms_eps: 1e-6,
+        };
+        let kernels = layer_exec::LayerKernels {
+            fused_rmsnorm: self.fused_modules.fn_rmsnorm,
+            fused_add_rmsnorm: self.fused_modules.fn_add_rmsnorm,
+            fused_rope_cache_fp8kv: self.fused_modules.fn_rope_cache_fp8kv,
+            fused_silu_mul: self.fused_modules.fn_silu_mul,
+            quantize_fp8_per_token: self.fused_modules.fn_quantize,
+            add_bias_f16: self.fused_modules.fn_add_bias_f16,
+        };
+        let plans = layer_exec::LayerGemmPlans {
+            qkv: plan_qkv,
+            o: plan_o,
+            gate_up: plan_gate_up,
+            down: plan_down,
+        };
+
+        let stream = self.stream.raw();
+        let residual_ptr = residual.device_ptr();
+
+        let one_step = |_phase: layer_exec::LayerPhase| -> Result<()> {
+            for (layer_idx, layer) in self.model.layers.iter().enumerate() {
+                let layer_kv_base =
+                    kv_cache.device_ptr() + (layer_idx as u64) * (kv_per_layer as u64);
+                let w = layer_exec::LayerWeights {
+                    attn_norm_gamma: layer.input_layernorm.offset_bytes,
+                    qkv_fp8: layer.qkv.offset_bytes,
+                    qkv_scale: layer.qkv.scale_ptr,
+                    qkv_bias: layer.qkv_bias.offset_bytes,
+                    o_fp8: layer.o_proj.offset_bytes,
+                    o_scale: layer.o_proj.scale_ptr,
+                    mlp_norm_gamma: layer.post_attention_layernorm.offset_bytes,
+                    gate_up_fp8: layer.gate_up.offset_bytes,
+                    gate_up_scale: layer.gate_up.scale_ptr,
+                    down_fp8: layer.down_proj.offset_bytes,
+                    down_scale: layer.down_proj.scale_ptr,
+                };
+                let scratch = layer_exec::LayerScratch {
+                    hidden_fp8: hidden_fp8.device_ptr(),
+                    hidden_scale: hidden_scale.device_ptr(),
+                    q_out: q_base,
+                    k_out: k_base_decode,
+                    v_out: v_base_decode,
+                    q_fp8: q_fp8.device_ptr(),
+                    k_cache: layer_kv_base,
+                    v_cache: layer_kv_base + (kv_per_layer / 2) as u64,
+                    q_scale_ptr: q_scale_region.device_ptr(),
+                    kv_scale_ptr: kv_scale_region.device_ptr(),
+                    attn_out: attn_out.device_ptr(),
+                    attn_out_fp8: attn_out_fp8.device_ptr(),
+                    attn_out_scale: attn_out_scale.device_ptr(),
+                    gate_up_out: gate_up_out.device_ptr(),
+                    gate_up_fp8: gate_up_fp8.device_ptr(),
+                    gate_up_scale: gate_up_scale.device_ptr(),
+                    mlp_out_fp8: mlp_out_fp8.device_ptr(),
+                    mlp_out_scale: mlp_out_scale.device_ptr(),
+                    cutlass_workspace: cutlass_ws.device_ptr(),
+                    cutlass_workspace_bytes: cutlass_ws_bytes,
+                    fa3_workspace: fa3_ws.device_ptr(),
+                };
+                let meta = layer_exec::MetadataPtrs {
+                    positions: positions.device_ptr(),
+                    slot_mapping: slot_mapping.device_ptr(),
+                    cos: self.model.rope_cos.offset_bytes,
+                    sin: self.model.rope_sin.offset_bytes,
+                    block_tables: block_tables.device_ptr(),
+                    context_lens: context_lens.device_ptr(),
+                };
+                layer_exec::forward_phase(
+                    dims, &kernels, &w, &scratch, &meta, &plans,
+                    &self.cutlass, &self.cublaslt, &self.fa3,
+                    residual_ptr, stream,
+                    layer_exec::LayerPhase::Decode,
+                )?;
+            }
+            // LM head (no argmax).
+            rvllm_fused::FusedRmsnormFp8QuantLaunch {
+                num_tokens: num_seqs,
+                hidden,
+                eps: 1e-6,
+            }
+            .launch(
+                self.fused_modules.fn_rmsnorm,
+                hidden_fp8.device_ptr(),
+                hidden_scale.device_ptr(),
+                residual_ptr,
+                self.model.final_norm.offset_bytes,
+                stream,
+            )?;
+            #[cfg(feature = "cuda")]
+            self.cublaslt.fp8_gemm(
+                hidden_fp8.device_ptr(),
+                self.model.lm_head_fp8.offset_bytes,
+                logits.device_ptr(),
+                num_seqs as i32,
+                vocab as i32,
+                hidden as i32,
+                hidden_scale.device_ptr(),
+                self.model.lm_head_fp8.scale_ptr,
+                stream,
+            )?;
+            Ok(())
+        };
+
+        let set_step_meta = |step: i32| -> Result<()> {
+            let n = num_seqs as usize;
+            let pos_host: Vec<i32> = (0..n as i32).map(|i| step + i * 32).collect();
+            let slot_host: Vec<i32> = (0..n as i32)
+                .map(|i| step + i * max_blocks_per_seq as i32 * block_size as i32)
+                .collect();
+            let ctx_host: Vec<i32> = vec![step + 1; n];
+            positions.copy_from_host(bytemuck_cast_i32(&pos_host))?;
+            slot_mapping.copy_from_host(bytemuck_cast_i32(&slot_host))?;
+            context_lens.copy_from_host(bytemuck_cast_i32(&ctx_host))?;
+            Ok(())
+        };
+
+        // Process token IDs starting at position 0.
+        let logits_row_elems = vocab as usize;
+        let logits_row_bytes = logits_row_elems * 2;
+        let mut logits_host: Vec<u16> = vec![0u16; logits_row_elems];
+
+        let mut total_nll: f64 = 0.0;
+        let mut n_evaluated: usize = 0;
+
+        for (t, &tok_id) in token_ids.iter().enumerate() {
+            // Embed token.
+            let tok_i32 = [tok_id as i32];
+            token_ids_region.copy_from_host(bytemuck_cast_i32(&tok_i32))?;
+            rvllm_fused::EmbeddingGatherLaunch {
+                num_tokens: 1,
+                hidden,
+                vocab,
+            }
+            .launch(
+                fn_embed,
+                residual_ptr,
+                self.model.embedding.offset_bytes,
+                token_ids_region.device_ptr(),
+                stream,
+            )?;
+
+            // Forward + LM head.
+            set_step_meta(t as i32)?;
+            one_step(layer_exec::LayerPhase::Decode)?;
+
+            // DtoH logits and compute loss against next token.
+            if t + 1 < token_ids.len() {
+                dtoh_async_sync(
+                    logits.device_ptr(),
+                    logits_host.as_mut_ptr() as *mut i32,
+                    logits_row_bytes,
+                    stream,
+                )?;
+                self.stream.fence()?;
+
+                let target = token_ids[t + 1] as usize;
+                if t == 0 {
+                                let first5: Vec<f32> = logits_host[..5].iter().map(|&b| f16_to_f32(b)).collect();
+                    let nan_count = logits_host.iter().filter(|&&b| f16_to_f32(b).is_nan()).count();
+                    if nan_count > 0 {
+                        eprintln!(
+                            "  WARNING: {}/{} logits are NaN (first5={:?}). FP8 precision issue.",
+                            nan_count, logits_row_elems, &first5
+                        );
+                    }
+                }
+                let nll = compute_nll_f16(&logits_host, target);
+                total_nll += nll;
+                n_evaluated += 1;
+
+                if (t + 1) % 100 == 0 || t + 1 == token_ids.len() - 1 {
+                    let running_ppl = (total_nll / n_evaluated as f64).exp();
+                    eprintln!(
+                        "  step {}/{}: running_ppl={:.4}",
+                        t + 1, token_ids.len(), running_ppl
+                    );
+                }
+            } else {
+                self.stream.fence()?;
+            }
+        }
+
+        let ppl = if n_evaluated > 0 {
+            (total_nll / n_evaluated as f64).exp()
+        } else {
+            0.0
+        };
+        Ok(PplResult { ppl, total_nll, n_evaluated })
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    pub unsafe fn run_ppl(
+        &self,
+        _fn_embed: rvllm_kernels::KernelFn,
+        _token_ids: &[u32],
+    ) -> Result<PplResult> {
+        Ok(PplResult { ppl: 0.0, total_nll: 0.0, n_evaluated: 0 })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct PplResult {
+    pub ppl: f64,
+    pub total_nll: f64,
+    pub n_evaluated: usize,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -833,6 +1193,44 @@ fn dtoh_async_sync(src: u64, dst: *mut i32, bytes: usize, stream: u64) -> Result
         ));
     }
     Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn compute_nll_f16(logits_f16: &[u16], target: usize) -> f64 {
+    let mut max_val: f32 = f32::NEG_INFINITY;
+    for &bits in logits_f16.iter() {
+        let v = f16_to_f32(bits);
+        if v > max_val { max_val = v; }
+    }
+    let mut sum_exp: f64 = 0.0;
+    for &bits in logits_f16.iter() {
+        sum_exp += ((f16_to_f32(bits) - max_val) as f64).exp();
+    }
+    let log_sum_exp = sum_exp.ln() + max_val as f64;
+    let target_logit = f16_to_f32(logits_f16[target]) as f64;
+    log_sum_exp - target_logit
+}
+
+#[cfg(feature = "cuda")]
+#[inline(always)]
+fn f16_to_f32(bits: u16) -> f32 {
+    let sign = ((bits >> 15) & 1) as u32;
+    let exp = ((bits >> 10) & 0x1f) as u32;
+    let mant = (bits & 0x3ff) as u32;
+    if exp == 0 {
+        if mant == 0 { return f32::from_bits(sign << 31); }
+        let mut m = mant;
+        let mut e: i32 = 1;
+        while (m & 0x400) == 0 { m <<= 1; e -= 1; }
+        m &= 0x3ff;
+        let f32_exp = (127 - 15 + e) as u32;
+        return f32::from_bits((sign << 31) | (f32_exp << 23) | (m << 13));
+    }
+    if exp == 31 {
+        return f32::from_bits((sign << 31) | (0xff_u32 << 23) | (mant << 13));
+    }
+    let f32_exp = (exp as i32 - 15 + 127) as u32;
+    f32::from_bits((sign << 31) | (f32_exp << 23) | (mant << 13))
 }
 
 fn load_fused(loader: &KernelLoader) -> Result<FusedModules> {
