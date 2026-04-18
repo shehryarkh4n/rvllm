@@ -256,20 +256,14 @@ pub fn load_model(model_dir: &Path, arena: &HbmArena, arch: &ModelArch) -> Resul
         }
     };
 
-    // --- per-layer (FP8 only) ------------------------------------------------
-    let q_proj_entry = get_tensor(&format!("{wprefix}.layers.0.self_attn.q_proj.weight"));
-    if let Some((_, ref e)) = q_proj_entry {
-        if e.dtype != DType::Fp8E4M3 {
-            return Err(RvllmError::Loader {
-                err: LoaderError::Corrupt {
-                    detail: format!("FP8-only loader requires F8_E4M3 weights, got {:?} for q_proj.weight", e.dtype),
-                },
-                ctx: LoaderCtx { path: model_dir.to_path_buf(), tensor: Some("q_proj.weight".into()) },
-                bt: std::backtrace::Backtrace::capture(),
-            });
-        }
+    // --- per-layer --------------------------------------------------------
+    // Detect pre-quantized FP8 models (e.g. neuralmagic) by checking
+    // the dtype of the first q_proj weight tensor.
+    let weights_are_fp8 = get_tensor(&format!("{wprefix}.layers.0.self_attn.q_proj.weight"))
+        .map_or(false, |(_, e)| e.dtype == DType::Fp8E4M3);
+    if weights_are_fp8 {
+        eprintln!("[loader] detected pre-quantized FP8 weights, using direct upload");
     }
-    eprintln!("[loader] FP8-only mode: loading pre-quantized weights directly");
 
     let mut layers = Vec::with_capacity(arch.num_hidden_layers);
     for l in 0..arch.num_hidden_layers {
@@ -277,53 +271,104 @@ pub fn load_model(model_dir: &Path, arena: &HbmArena, arch: &ModelArch) -> Resul
 
         let qkv_rows = (arch.num_attention_heads + 2 * arch.num_key_value_heads) * arch.head_dim;
         let qkv_cols = arch.hidden_size;
-        let qkv = upload_fp8_fused_direct(
-            arena, "qkv",
-            &[
-                must_get(&ln("self_attn.q_proj.weight"))?,
-                must_get(&ln("self_attn.k_proj.weight"))?,
-                must_get(&ln("self_attn.v_proj.weight"))?,
-            ],
-            &[
-                get_tensor(&ln("self_attn.q_proj.weight_scale")),
-                get_tensor(&ln("self_attn.k_proj.weight_scale")),
-                get_tensor(&ln("self_attn.v_proj.weight_scale")),
-            ],
-            &shards,
-            &[qkv_rows, qkv_cols],
-        )?;
+        let qkv = if weights_are_fp8 {
+            upload_fp8_fused_direct(
+                arena, "qkv",
+                &[
+                    must_get(&ln("self_attn.q_proj.weight"))?,
+                    must_get(&ln("self_attn.k_proj.weight"))?,
+                    must_get(&ln("self_attn.v_proj.weight"))?,
+                ],
+                &[
+                    get_tensor(&ln("self_attn.q_proj.weight_scale")),
+                    get_tensor(&ln("self_attn.k_proj.weight_scale")),
+                    get_tensor(&ln("self_attn.v_proj.weight_scale")),
+                ],
+                &shards,
+                &[qkv_rows, qkv_cols],
+            )?
+        } else {
+            let qkv_f16_bytes = concat_qkv(
+                &must_get(&ln("self_attn.q_proj.weight"))?,
+                &must_get(&ln("self_attn.k_proj.weight"))?,
+                &must_get(&ln("self_attn.v_proj.weight"))?,
+                &shards,
+                model_dir,
+            )?;
+            upload_fp8(
+                arena, "qkv", &qkv_f16_bytes,
+                &[qkv_rows, qkv_cols],
+                &ln("self_attn.qkv.weight"), model_dir,
+            )?
+        };
 
-        let qkv_bias: Option<F16Weight> = None;
+        let qkv_bias = if arch.attention_bias {
+            let qkv_bias_bytes = concat_qkv_bias(
+                &must_get(&ln("self_attn.q_proj.bias"))?,
+                &must_get(&ln("self_attn.k_proj.bias"))?,
+                &must_get(&ln("self_attn.v_proj.bias"))?,
+                &shards,
+                model_dir,
+            )?;
+            let r = arena.region("qkv_bias", qkv_bias_bytes.len(), 16)?;
+            unsafe { r.copy_from_host(&qkv_bias_bytes)? };
+            Some(F16Weight {
+                offset_bytes: r.device_ptr() - arena_base(arena),
+                shape: vec![qkv_rows],
+            })
+        } else {
+            None
+        };
 
-        let o_proj = upload_fp8_direct(
-            arena, "o_proj",
-            &must_get(&ln("self_attn.o_proj.weight"))?,
-            get_tensor(&ln("self_attn.o_proj.weight_scale")),
-            &shards,
-        )?;
+        let o_proj = if weights_are_fp8 {
+            upload_fp8_direct(
+                arena, "o_proj",
+                &must_get(&ln("self_attn.o_proj.weight"))?,
+                get_tensor(&ln("self_attn.o_proj.weight_scale")),
+                &shards,
+            )?
+        } else {
+            upload_fp8_from(arena, "o_proj",
+                &must_get(&ln("self_attn.o_proj.weight"))?, &shards, model_dir)?
+        };
 
         let gate_up_rows = 2 * arch.intermediate_size;
         let gate_up_cols = arch.hidden_size;
-        let gate_up = upload_fp8_fused_direct(
-            arena, "gate_up",
-            &[
-                must_get(&ln("mlp.gate_proj.weight"))?,
-                must_get(&ln("mlp.up_proj.weight"))?,
-            ],
-            &[
-                get_tensor(&ln("mlp.gate_proj.weight_scale")),
-                get_tensor(&ln("mlp.up_proj.weight_scale")),
-            ],
-            &shards,
-            &[gate_up_rows, gate_up_cols],
-        )?;
+        let gate_up = if weights_are_fp8 {
+            upload_fp8_fused_direct(
+                arena, "gate_up",
+                &[
+                    must_get(&ln("mlp.gate_proj.weight"))?,
+                    must_get(&ln("mlp.up_proj.weight"))?,
+                ],
+                &[
+                    get_tensor(&ln("mlp.gate_proj.weight_scale")),
+                    get_tensor(&ln("mlp.up_proj.weight_scale")),
+                ],
+                &shards,
+                &[gate_up_rows, gate_up_cols],
+            )?
+        } else {
+            let gate_up_f16 = concat_gate_up(
+                &must_get(&ln("mlp.gate_proj.weight"))?,
+                &must_get(&ln("mlp.up_proj.weight"))?,
+                &shards, model_dir,
+            )?;
+            upload_fp8(arena, "gate_up", &gate_up_f16,
+                &[gate_up_rows, gate_up_cols], &ln("mlp.gate_up.weight"), model_dir)?
+        };
 
-        let down_proj = upload_fp8_direct(
-            arena, "down_proj",
-            &must_get(&ln("mlp.down_proj.weight"))?,
-            get_tensor(&ln("mlp.down_proj.weight_scale")),
-            &shards,
-        )?;
+        let down_proj = if weights_are_fp8 {
+            upload_fp8_direct(
+                arena, "down_proj",
+                &must_get(&ln("mlp.down_proj.weight"))?,
+                get_tensor(&ln("mlp.down_proj.weight_scale")),
+                &shards,
+            )?
+        } else {
+            upload_fp8_from(arena, "down_proj",
+                &must_get(&ln("mlp.down_proj.weight"))?, &shards, model_dir)?
+        };
 
         let input_layernorm = {
             let (si, e) = must_get(&ln("input_layernorm.weight"))?;
