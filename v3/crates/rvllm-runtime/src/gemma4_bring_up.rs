@@ -720,33 +720,27 @@ impl Gemma4Bringup {
                 }
             }
 
-            // LM head: final norm + FP8 quant + GEMM + softcap
+            // LM head: final norm (f16 in-place) + f16 GEMM -> f32 logits
             let dbg_lmhead = step_counter.get() == 0
                 && std::env::var("RVLLM_DBG_LAYER").is_ok();
 
-            rvllm_fused::FusedRmsnormFp8QuantLaunch {
+            rvllm_fused::gemma4_launcher::RmsnormInplaceLaunch {
                 num_tokens: num_seqs, hidden, eps: arch.rms_norm_eps,
             }.launch(
-                kernels.fused_rmsnorm_fp8_quant,
-                hidden_fp8.device_ptr(), hidden_scale.device_ptr(),
+                kernels.fused_rmsnorm,
                 residual_ptr, self.model.final_norm.offset_bytes, stream,
             )?;
             if dbg_lmhead {
                 cudarc::driver::sys::cuStreamSynchronize(stream as _);
-                let mut sc = [0.0f32; 1];
-                cudarc::driver::sys::cuMemcpyDtoH_v2(
-                    sc.as_mut_ptr() as *mut _, hidden_scale.device_ptr(), 4,
-                );
-                let mut fp8 = [0u8; 4];
-                cudarc::driver::sys::cuMemcpyDtoH_v2(
-                    fp8.as_mut_ptr() as *mut _, hidden_fp8.device_ptr(), 4,
-                );
-                eprintln!("  [lm_head] after rmsnorm_fp8_quant: hidden_scale={:.6e} hidden_fp8={:?}", sc[0], fp8);
+                let mut s = [0u16; 4];
+                cudarc::driver::sys::cuMemcpyDtoH_v2(s.as_mut_ptr() as *mut _, residual_ptr, 8);
+                let v: Vec<f32> = s.iter().map(|&x| crate::bring_up::f16_to_f32(x)).collect();
+                eprintln!("  [lm_head] after rmsnorm_f16: first4={:.4?}", v);
             }
-            self.cublaslt.fp8_gemm_f32(
-                hidden_fp8.device_ptr(), self.model.lm_head_fp8.offset_bytes,
+            self.cublaslt.f16_gemm_f32(
+                residual_ptr, self.model.lm_head_f16.offset_bytes,
                 logits_f32.device_ptr(), num_seqs as i32, vocab as i32, hidden as i32,
-                hidden_scale.device_ptr(), self.model.lm_head_fp8.scale_ptr, stream,
+                stream,
             )?;
             if dbg_lmhead {
                 cudarc::driver::sys::cuStreamSynchronize(stream as _);

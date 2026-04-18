@@ -53,6 +53,7 @@ pub struct Gemma4LayerWeights {
 pub struct Gemma4LoadedModel {
     pub embedding: F16Weight,
     pub lm_head_fp8: Fp8Weight,
+    pub lm_head_f16: F16Weight,
     pub final_norm: F16Weight,
     /// Sliding layers: theta=10000, full rotation (rotary_dim=256)
     pub rope_cos_sliding: F16Weight,

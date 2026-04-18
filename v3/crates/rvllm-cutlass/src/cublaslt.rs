@@ -128,6 +128,95 @@ impl CublasLt {
         self.fp8_gemm_inner(a_fp8, b_fp8, 0, 0, d_f32, m, n, k, a_scale, b_scale, stream, false, 2)
     }
 
+    /// F16 x F16 matmul with F32 output: D_f32 = A_f16 * B_f16^T.
+    /// No FP8, no scale pointers. Used for lm_head where FP8 quantization
+    /// destroys the weight distribution.
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn f16_gemm_f32(
+        &self,
+        a_f16: u64,
+        b_f16: u64,
+        d_f32: u64,
+        m: i32,
+        n: i32,
+        k: i32,
+        stream: u64,
+    ) -> Result<()> {
+        let mut desc: lt::cublasLtMatmulDesc_t = std::ptr::null_mut();
+        let rc = lt::cublasLtMatmulDescCreate(
+            &mut desc,
+            lt::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+            lt::cudaDataType_t::CUDA_R_32F,
+        );
+        if rc != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+            return Err(cublaslt_err("cublasLtMatmulDescCreate(f16)"));
+        }
+        let transa: i32 = 1;
+        let transb: i32 = 0;
+        set_attr(desc, lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA,
+            &transa as *const _ as *const _, std::mem::size_of_val(&transa))?;
+        set_attr(desc, lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSB,
+            &transb as *const _ as *const _, std::mem::size_of_val(&transb))?;
+
+        let mut layout_a: lt::cublasLtMatrixLayout_t = std::ptr::null_mut();
+        let mut layout_b: lt::cublasLtMatrixLayout_t = std::ptr::null_mut();
+        let mut layout_d: lt::cublasLtMatrixLayout_t = std::ptr::null_mut();
+        let r = lt::cublasLtMatrixLayoutCreate(&mut layout_a,
+            lt::cudaDataType_t::CUDA_R_16F, k as u64, n as u64, k as i64);
+        if r != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS { return Err(cublaslt_err("layout A(f16)")); }
+        let r = lt::cublasLtMatrixLayoutCreate(&mut layout_b,
+            lt::cudaDataType_t::CUDA_R_16F, k as u64, m as u64, k as i64);
+        if r != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS { return Err(cublaslt_err("layout B(f16)")); }
+        let r = lt::cublasLtMatrixLayoutCreate(&mut layout_d,
+            lt::cudaDataType_t::CUDA_R_32F, n as u64, m as u64, n as i64);
+        if r != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS { return Err(cublaslt_err("layout D(f16)")); }
+
+        let key = AlgoKey { m, n, k, kind: 20 };
+        let cached_algo = self.algo_cache.lock().ok().and_then(|c| c.get(&key).copied());
+        let algo = if let Some(a) = cached_algo { a } else {
+            let mut pref: lt::cublasLtMatmulPreference_t = std::ptr::null_mut();
+            lt::cublasLtMatmulPreferenceCreate(&mut pref);
+            let ws = self.workspace_bytes;
+            lt::cublasLtMatmulPreferenceSetAttribute(pref,
+                lt::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                &ws as *const _ as *const _, std::mem::size_of::<usize>());
+            let mut heur: [lt::cublasLtMatmulHeuristicResult_t; 1] = std::mem::zeroed();
+            let mut ret: i32 = 0;
+            let r = lt::cublasLtMatmulAlgoGetHeuristic(
+                self.handle, desc, layout_a, layout_b, layout_d, layout_d,
+                pref, 1, heur.as_mut_ptr(), &mut ret);
+            lt::cublasLtMatmulPreferenceDestroy(pref);
+            if r != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS || ret == 0 {
+                return Err(cublaslt_err("heuristic(f16)"));
+            }
+            let best = heur[0].algo;
+            if let Ok(mut c) = self.algo_cache.lock() { c.insert(key, best); }
+            best
+        };
+
+        let one: f32 = 1.0;
+        let zero: f32 = 0.0;
+        let r = lt::cublasLtMatmul(
+            self.handle, desc,
+            &one as *const _ as *const _,
+            b_f16 as *const _, layout_a,
+            a_f16 as *const _, layout_b,
+            &zero as *const _ as *const _,
+            d_f32 as *const _, layout_d,
+            d_f32 as *mut _, layout_d,
+            &algo, self.workspace as *mut _, self.workspace_bytes, stream as _,
+        );
+        lt::cublasLtMatrixLayoutDestroy(layout_d);
+        lt::cublasLtMatrixLayoutDestroy(layout_b);
+        lt::cublasLtMatrixLayoutDestroy(layout_a);
+        lt::cublasLtMatmulDescDestroy(desc);
+        if r != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+            return Err(cublaslt_err("cublasLtMatmul(f16)"));
+        }
+        Ok(())
+    }
+
     /// FP8 matmul with row-broadcast f16 bias epilogue.
     #[cfg(feature = "cuda")]
     #[allow(clippy::too_many_arguments)]

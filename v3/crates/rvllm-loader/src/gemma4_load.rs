@@ -180,7 +180,6 @@ pub fn load_gemma4_model(
             )?
         }
     } else {
-        // Tied embeddings: embed_tokens is always BF16. CPU-quantize to FP8.
         let (si, e) = must_get(&embed_name)?;
         eprintln!("[loader] tied embeddings: CPU-quantizing BF16 embed_tokens ({} elements) to FP8 for lm_head",
             e.shape.iter().product::<usize>());
@@ -193,6 +192,15 @@ pub fn load_gemma4_model(
             "lm_head(tied_embed)",
             model_dir,
         )?
+    };
+
+    let lm_head_f16 = {
+        let (si, e) = if let Some(t) = get_tensor("lm_head.weight") { t } else { must_get(&embed_name)? };
+        let buf = tensor_to_f16_bytes(&e, bytes_of(si, &e), model_dir)?;
+        eprintln!("[loader] lm_head_f16: {} elements ({:.1} MB)", e.shape.iter().product::<usize>(), buf.len() as f64 / 1e6);
+        let region = arena.region("lm_head_f16", buf.len(), 16)?;
+        unsafe { region.copy_from_host(&buf)? };
+        F16Weight { offset_bytes: region.device_ptr(), shape: e.shape.clone() }
     };
 
     // Sliding RoPE: theta=10000, full rotation of head_dim_sliding (256)
@@ -375,6 +383,7 @@ pub fn load_gemma4_model(
     Ok(Gemma4LoadedModel {
         embedding,
         lm_head_fp8,
+        lm_head_f16,
         final_norm,
         rope_cos_sliding,
         rope_sin_sliding,
