@@ -584,32 +584,29 @@ fn f32_bytes_to_f16_bytes(raw: &[u8]) -> Vec<u8> {
 }
 
 fn f16_bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
-    let n = bytes.len() / 2;
-    let mut out = Vec::with_capacity(n);
-    for i in 0..n {
-        let v = f16::from_le_bytes([bytes[2 * i], bytes[2 * i + 1]]);
-        out.push(v.to_f32());
-    }
-    out
+    use rayon::prelude::*;
+    bytes
+        .par_chunks_exact(2)
+        .map(|c| f16::from_le_bytes([c[0], c[1]]).to_f32())
+        .collect()
 }
 
 fn quantize_to_fp8_bytes(f32_vals: &[f32], scale: f32) -> Vec<u8> {
+    use rayon::prelude::*;
     let inv = 1.0 / scale;
-    let mut out = Vec::with_capacity(f32_vals.len());
-    for v in f32_vals {
-        let q = (*v * inv).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX);
-        out.push(fp8_e4m3_encode(q));
-    }
-    out
+    f32_vals
+        .par_iter()
+        .map(|v| fp8_e4m3_encode((*v * inv).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX)))
+        .collect()
 }
 
 // Minimal reference E4M3 encode with round-to-nearest-even (matches NVIDIA hw).
-// FP8 E4M3: 1 sign, 4 exp, 3 mantissa, bias 7, finite range [-448, 448].
+// FP8 E4M3FN: 1 sign, 4 exp, 3 mantissa, bias 7, finite range [-448, 448].
 fn fp8_e4m3_encode(v: f32) -> u8 {
     if v.is_nan() {
         return 0x7f;
     }
-    let s: u8 = if v < 0.0 { 0x80 } else { 0 };
+    let s: u8 = if v.to_bits() >> 31 != 0 { 0x80 } else { 0 };
     let a = v.abs();
     if a == 0.0 {
         return s;
@@ -620,30 +617,33 @@ fn fp8_e4m3_encode(v: f32) -> u8 {
     let bits = a.to_bits();
     let exp32 = ((bits >> 23) & 0xff) as i32 - 127;
     let mant32 = bits & 0x7f_ffff;
-    let exp8 = exp32 + 7;
+    let mut exp8 = exp32 + 7;
     if exp8 <= 0 {
         let shift = 1 - exp8;
         let full = (mant32 | (1 << 23)) as u32;
-        let rshift = 21 + shift as u32;
-        let m = full >> rshift;
+        let rshift = (20 + shift) as u32;
+        let mut m = full >> rshift;
         let round_bit = if rshift > 0 { (full >> (rshift - 1)) & 1 } else { 0 };
         let sticky = if rshift > 1 { (full & ((1 << (rshift - 1)) - 1) != 0) as u32 } else { 0 };
-        let m = m + ((round_bit & (sticky | (m & 1))) as u32);
+        m += round_bit & (sticky | (m & 1));
+        if m >= 8 {
+            return s | 0x08;
+        }
         return s | (m as u8 & 0x07);
-    }
-    if exp8 >= 0xf {
-        return s | 0x7e;
     }
     let trunc = mant32 >> 20;
     let round_bit = (mant32 >> 19) & 1;
     let sticky = (mant32 & 0x7_ffff) != 0;
     let m = trunc + (round_bit & (sticky as u32 | (trunc & 1)));
     if m >= 8 {
-        let exp8 = exp8 + 1;
-        if exp8 >= 0xf {
+        exp8 += 1;
+        if exp8 > 15 {
             return s | 0x7e;
         }
         return s | ((exp8 as u8 & 0x0f) << 3);
+    }
+    if exp8 > 15 {
+        return s | 0x7e;
     }
     s | ((exp8 as u8 & 0x0f) << 3) | (m as u8 & 0x07)
 }

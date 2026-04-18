@@ -7,6 +7,7 @@
 //! GPU-side fused quantize kernel (faster, no DtoH round-trip) lives
 //! in `rvllm-fused` and feeds its per-tensor clamp count back here.
 
+use rayon::prelude::*;
 use rvllm_core::{LoaderCtx, LoaderError, Result, RvllmError};
 
 pub const FP8_E4M3_MAX: f32 = 448.0;
@@ -20,25 +21,22 @@ pub struct QuantResult {
     pub clamp_ppm: f32,
 }
 
-/// Reference CPU quantize: compute amax, scale = amax/448, count clamps.
-/// GPU kernel computes the same + writes the FP8 bytes; this function
-/// is the audit trail for the gate.
 pub fn quantize_per_tensor_ref(values: &[f32]) -> QuantResult {
     let amax = values
-        .iter()
+        .par_iter()
         .copied()
         .map(f32::abs)
-        .fold(0.0f32, f32::max)
+        .reduce(|| 0.0f32, f32::max)
         .max(1e-12);
     let scale = amax / FP8_E4M3_MAX;
     let inv = 1.0 / scale;
-    let mut clamps = 0u64;
-    for v in values {
-        let q = v * inv;
-        if !(-FP8_E4M3_MAX..=FP8_E4M3_MAX).contains(&q) {
-            clamps += 1;
-        }
-    }
+    let clamps: u64 = values
+        .par_iter()
+        .filter(|v| {
+            let q = **v * inv;
+            !(-FP8_E4M3_MAX..=FP8_E4M3_MAX).contains(&q)
+        })
+        .count() as u64;
     let ppm = if values.is_empty() {
         0.0
     } else {

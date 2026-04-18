@@ -19,3 +19,4 @@ rvllm-mem = { workspace = true }
 half = { workspace = true }
 serde_json = { workspace = true }
 memmap2 = "0.9"
+rayon = "1.10"

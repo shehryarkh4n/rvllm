@@ -547,13 +547,11 @@ fn f32_to_f16(raw: &[u8]) -> Vec<u8> {
 }
 
 fn f16_bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
-    let n = bytes.len() / 2;
-    let mut out = Vec::with_capacity(n);
-    for i in 0..n {
-        let v = f16::from_le_bytes([bytes[2 * i], bytes[2 * i + 1]]);
-        out.push(v.to_f32());
-    }
-    out
+    use rayon::prelude::*;
+    bytes
+        .par_chunks_exact(2)
+        .map(|c| f16::from_le_bytes([c[0], c[1]]).to_f32())
+        .collect()
 }
 
 fn concat_tensors(
@@ -654,20 +652,22 @@ fn upload_fp8_direct_channelscale(
     let rows = entry.shape[0];
     let cols = entry.nbytes as usize / rows;
     let (unified_scale, fp8_bytes) = if let Some(se) = scale_entry {
+        use rayon::prelude::*;
         let ch_scales = read_channelscale_bf16(se, shards);
         let max_scale = ch_scales.iter().copied().fold(0.0f32, f32::max);
-        let mut out = raw.to_vec();
-        for r in 0..rows {
-            let rs = ch_scales[r];
-            if (rs - max_scale).abs() > 1e-12 {
-                let ratio = rs / max_scale;
-                let row_start = r * cols;
-                for c in 0..cols {
-                    let f = fp8_e4m3_to_f32(out[row_start + c]) * ratio;
-                    out[row_start + c] = fp8_e4m3_encode(f);
+        let out: Vec<u8> = raw
+            .par_chunks(cols)
+            .enumerate()
+            .flat_map_iter(|(r, row)| {
+                let rs = ch_scales[r];
+                if (rs - max_scale).abs() <= 1e-12 {
+                    row.to_vec()
+                } else {
+                    let ratio = rs / max_scale;
+                    row.iter().map(|&b| fp8_e4m3_encode(fp8_e4m3_to_f32(b) * ratio)).collect()
                 }
-            }
-        }
+            })
+            .collect();
         (max_scale, out)
     } else {
         (1.0 / 448.0, raw.to_vec())
@@ -714,6 +714,7 @@ fn fuse_fp8_direct_channelscale(
         global_max = 1.0 / 448.0;
     }
 
+    use rayon::prelude::*;
     let mut fused = Vec::new();
     for (i, &(si, ref entry)) in parts.iter().enumerate() {
         let raw = &shards[*si].bytes()[entry.file_offset as usize..(entry.file_offset + entry.nbytes) as usize];
@@ -723,19 +724,23 @@ fn fuse_fp8_direct_channelscale(
         if ch_scales.is_empty() {
             fused.extend_from_slice(raw);
         } else {
-            for r in 0..rows {
-                let rs = ch_scales[r];
-                let row_start = r * cols;
-                if (rs - global_max).abs() < 1e-12 {
-                    fused.extend_from_slice(&raw[row_start..row_start + cols]);
-                } else {
-                    let ratio = rs / global_max;
-                    for c in 0..cols {
-                        let f = fp8_e4m3_to_f32(raw[row_start + c]) * ratio;
-                        fused.push(fp8_e4m3_encode(f));
+            let part: Vec<u8> = (0..rows)
+                .into_par_iter()
+                .flat_map_iter(|r| {
+                    let rs = ch_scales[r];
+                    let row_start = r * cols;
+                    let row_slice = &raw[row_start..row_start + cols];
+                    if (rs - global_max).abs() < 1e-12 {
+                        row_slice.to_vec()
+                    } else {
+                        let ratio = rs / global_max;
+                        row_slice.iter().map(|&b| {
+                            fp8_e4m3_encode(fp8_e4m3_to_f32(b) * ratio)
+                        }).collect()
                     }
-                }
-            }
+                })
+                .collect();
+            fused.extend_from_slice(&part);
         }
     }
     let region = arena.region(region_name, fused.len(), 16)?;
@@ -753,9 +758,10 @@ fn fuse_fp8_direct_channelscale(
 }
 
 fn quantize_to_fp8_bytes(f32_vals: &[f32], scale: f32) -> Vec<u8> {
+    use rayon::prelude::*;
     let inv = 1.0 / scale;
     f32_vals
-        .iter()
+        .par_iter()
         .map(|v| fp8_e4m3_encode((*v * inv).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX)))
         .collect()
 }
@@ -764,7 +770,7 @@ fn fp8_e4m3_encode(v: f32) -> u8 {
     if v.is_nan() {
         return 0x7f;
     }
-    let s: u8 = if v < 0.0 { 0x80 } else { 0 };
+    let s: u8 = if v.to_bits() >> 31 != 0 { 0x80 } else { 0 };
     let a = v.abs();
     if a == 0.0 {
         return s;
@@ -775,19 +781,19 @@ fn fp8_e4m3_encode(v: f32) -> u8 {
     let bits = a.to_bits();
     let exp32 = ((bits >> 23) & 0xff) as i32 - 127;
     let mant32 = bits & 0x7f_ffff;
-    let exp8 = exp32 + 7;
+    let mut exp8 = exp32 + 7;
     if exp8 <= 0 {
         let shift = 1 - exp8;
         let full = (mant32 | (1 << 23)) as u32;
-        let rshift = 21 + shift as u32;
-        let m = full >> rshift;
+        let rshift = (20 + shift) as u32;
+        let mut m = full >> rshift;
         let round_bit = if rshift > 0 { (full >> (rshift - 1)) & 1 } else { 0 };
         let sticky = if rshift > 1 { (full & ((1 << (rshift - 1)) - 1) != 0) as u32 } else { 0 };
-        let m = m + ((round_bit & (sticky | (m & 1))) as u32);
+        m += round_bit & (sticky | (m & 1));
+        if m >= 8 {
+            return s | 0x08; // overflow to smallest normal: exp=1, m=0
+        }
         return s | (m as u8 & 0x07);
-    }
-    if exp8 >= 0xf {
-        return s | 0x7e;
     }
     // round-to-nearest-even: 20 bits dropped from f32 mantissa
     let trunc = mant32 >> 20;
@@ -795,12 +801,15 @@ fn fp8_e4m3_encode(v: f32) -> u8 {
     let sticky = (mant32 & 0x7_ffff) != 0;
     let m = trunc + (round_bit & (sticky as u32 | (trunc & 1)));
     if m >= 8 {
-        // mantissa overflow, bump exponent
-        let exp8 = exp8 + 1;
-        if exp8 >= 0xf {
+        exp8 += 1;
+        // E4M3FN: exp=15 is valid (max finite=0x7e=448), only 0x7f is NaN
+        if exp8 > 15 {
             return s | 0x7e;
         }
         return s | ((exp8 as u8 & 0x0f) << 3);
+    }
+    if exp8 > 15 {
+        return s | 0x7e;
     }
     s | ((exp8 as u8 & 0x0f) << 3) | (m as u8 & 0x07)
 }

@@ -192,7 +192,29 @@ Sampling tail:
 
 ### GPU perplexity status
 
-The GPU forward pass for 31B Gemma 4 is implemented and runs end-to-end. Perplexity validation against the TPU baseline (25.51) is actively being debugged - tracking logit softcap and F32 precision through lm_head GEMM. Throughput numbers will be posted once perplexity is confirmed correct.
+**Current blocker: FP8 per-channel-to-per-tensor weight rescaling produces wrong real values.**
+
+The GPU forward pass runs end-to-end. The remaining bug is in the weight loader's per-channel scale unification, NOT in the cuBLASLt GEMM configuration. Proven by inline diagnostic (RVLLM_GEMM_DIAG=1):
+
+```
+cuBLASLt_D[0][0] = 4.922354e3   manual_dot = 4.922552e3   ratio = 0.999960  PASS
+```
+
+cuBLASLt correctly computes `a_scale * b_scale * dot(fp8_act, fp8_wt)`. The problem is that `fp8_to_f32(rescaled_byte) * unified_scale` does not reconstruct the original real weight value. The F16 dequant bypass (which loads `fp8_float * per_channel_scale -> f16`) gives correct q_proj=[181, 9.3, -74, -5.0] matching HuggingFace. The FP8 path gives q_proj=[4924, 312, -2756, 29] -- 27x too large -- because the rescaled bytes and/or unified scale are wrong.
+
+What's proven correct:
+- Embedding: matches HF exactly
+- lm_head F16 path: logits amax ~36, matches HF ~26
+- F16 layer dequant: q_proj matches HF within quantization noise
+- cuBLASLt FP8 GEMM: ratio 0.999960 (perfect), config is correct
+- FP8 encoder (fp8_e4m3_encode): matches NVIDIA hardware RNE
+- Fused activation quantization kernels: correct per-token FP8 + scale
+- Per-token vs per-tensor scale mismatch: only affects tokens 1+ (token 0 is correct)
+
+What's broken:
+- `fuse_fp8_direct_channelscale` / `upload_fp8_direct_channelscale` in `gemma4_load.rs`: the per-channel-to-per-tensor rescaling produces FP8 bytes whose `fp8_to_f32(byte) * max_scale` does not equal the original `fp8_to_f32(original_byte) * channel_scale[row]`. The 27x error factor likely comes from the rescaling ratio or the unified scale value being wrong.
+
+Next step: verify the rescaling math. The function takes `real_weight = fp8(byte) * ch_scale[r]`, rescales to `new_byte = fp8_encode(fp8(byte) * ch_scale[r] / max_scale)`, stores `unified_scale = max_scale`. Check whether `fp8_decode(new_byte) * max_scale` actually reconstructs `fp8(byte) * ch_scale[r]` for the actual Gemma 4 scale distributions, or if precision loss during re-encoding causes the 27x blowup.
 
 ### Kernels
 

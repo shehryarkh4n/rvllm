@@ -465,8 +465,107 @@ impl CublasLt {
         if r != lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
             return Err(cublaslt_err("cublasLtMatmul"));
         }
+
+        // One-shot diagnostic: compare cuBLASLt D[0][0] against manual FP8 dot product.
+        // Fires once per (M,N,K,kind) shape, controlled by env RVLLM_GEMM_DIAG=1.
+        if !beta_one && bias_f16 == 0 {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static DIAG_DONE: AtomicBool = AtomicBool::new(false);
+            if std::env::var("RVLLM_GEMM_DIAG").map_or(false, |v| v == "1")
+                && !DIAG_DONE.swap(true, Ordering::Relaxed)
+            {
+                cudarc::driver::sys::cuStreamSynchronize(stream as _);
+                // Read scales
+                let mut sa = [0.0f32; 1];
+                let mut sb = [0.0f32; 1];
+                cudarc::driver::sys::cuMemcpyDtoH_v2(
+                    sa.as_mut_ptr() as *mut _, a_scale, 4);
+                cudarc::driver::sys::cuMemcpyDtoH_v2(
+                    sb.as_mut_ptr() as *mut _, b_scale, 4);
+                // Read first K bytes of cuBLAS-A (our weight row 0) and cuBLAS-B (our act row 0)
+                let kk = k as usize;
+                let mut wa = vec![0u8; kk];
+                let mut ab = vec![0u8; kk];
+                cudarc::driver::sys::cuMemcpyDtoH_v2(
+                    wa.as_mut_ptr() as *mut _, b_fp8, kk);
+                cudarc::driver::sys::cuMemcpyDtoH_v2(
+                    ab.as_mut_ptr() as *mut _, a_fp8, kk);
+                // Manual FP8 dot product for D[0][0]:
+                // cuBLAS computes D = A_SCALE * B_SCALE * op(A)^T * op(B)
+                // D[0][0] = sa * sb * sum_c( fp8(weight[0][c]) * fp8(act[0][c]) )
+                let mut raw_dot: f64 = 0.0;
+                for c in 0..kk {
+                    let wv = fp8_e4m3_to_f32_inline(wa[c]) as f64;
+                    let av = fp8_e4m3_to_f32_inline(ab[c]) as f64;
+                    raw_dot += wv * av;
+                }
+                let expected = sa[0] as f64 * sb[0] as f64 * raw_dot;
+                // Read cuBLASLt result D[0][0]
+                let cublas_val: f64 = match d_out_type {
+                    2 => {
+                        let mut v = [0.0f32; 1];
+                        cudarc::driver::sys::cuMemcpyDtoH_v2(
+                            v.as_mut_ptr() as *mut _, d_f16, 4);
+                        v[0] as f64
+                    }
+                    1 => {
+                        let mut v = [0u16; 1];
+                        cudarc::driver::sys::cuMemcpyDtoH_v2(
+                            v.as_mut_ptr() as *mut _, d_f16, 2);
+                        let bits = v[0] as u32;
+                        let sign = (bits >> 15) & 1;
+                        let exp = (bits >> 7) & 0xff;
+                        let mant = bits & 0x7f;
+                        let f = if exp == 0 { (mant as f32) * (1.0 / 16384.0 / 128.0) }
+                                else { f32::from_bits((sign << 31) | ((exp + 112) << 23) | (mant << 16)) };
+                        if sign == 1 { -f.abs() as f64 } else { f as f64 }
+                    }
+                    _ => {
+                        let mut v = [0u16; 1];
+                        cudarc::driver::sys::cuMemcpyDtoH_v2(
+                            v.as_mut_ptr() as *mut _, d_f16, 2);
+                        let bits = v[0] as u32;
+                        let sign = (bits >> 15) & 1;
+                        let exp = (bits >> 10) & 0x1f;
+                        let mant = bits & 0x3ff;
+                        let f = if exp == 0 { (mant as f32) * (1.0 / 16384.0 / 1024.0) }
+                                else { f32::from_bits((sign << 31) | ((exp + 112) << 23) | (mant << 13)) };
+                        if sign == 1 { -f.abs() as f64 } else { f as f64 }
+                    }
+                };
+                let ratio = if expected.abs() > 1e-20 { cublas_val / expected } else { f64::NAN };
+                eprintln!("[GEMM_DIAG] M={} N={} K={} d_out_type={}", m, n, k, d_out_type);
+                eprintln!("[GEMM_DIAG] a_scale(act)={:.6e} b_scale(wt)={:.6e}", sa[0], sb[0]);
+                eprintln!("[GEMM_DIAG] weight_fp8[0..8]={:?} act_fp8[0..8]={:?}",
+                    &wa[..8.min(kk)], &ab[..8.min(kk)]);
+                eprintln!("[GEMM_DIAG] raw_dot(f64)={:.6e} expected(sa*sb*dot)={:.6e}", raw_dot, expected);
+                eprintln!("[GEMM_DIAG] cuBLASLt_D[0][0]={:.6e} ratio(cublas/expected)={:.6}", cublas_val, ratio);
+                if (ratio - 1.0).abs() > 0.05 {
+                    eprintln!("[GEMM_DIAG] *** MISMATCH *** ratio={:.6} -- cuBLASLt config is wrong!", ratio);
+                } else {
+                    eprintln!("[GEMM_DIAG] PASS -- cuBLASLt matches manual computation");
+                    eprintln!("[GEMM_DIAG] Bug is upstream of fp8_gemm (wrong bytes or wrong scales)");
+                }
+            }
+        }
+
         Ok(())
     }
+}
+
+#[cfg(feature = "cuda")]
+fn fp8_e4m3_to_f32_inline(b: u8) -> f32 {
+    let s = (b >> 7) & 1;
+    let e = (b >> 3) & 0xF;
+    let m = b & 0x7;
+    let val = if e == 0 {
+        if m == 0 { 0.0f32 } else { (m as f32) * (1.0 / 512.0) }
+    } else if e == 15 && m == 7 {
+        return f32::NAN;
+    } else {
+        f32::from_bits(((e as u32 + 120) << 23) | ((m as u32) << 20))
+    };
+    if s != 0 { -val } else { val }
 }
 
 #[cfg(feature = "cuda")]
