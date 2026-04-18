@@ -67,8 +67,8 @@ td.pending{color:#b6a1e5;font-style:italic}
 <div class="wrap">
 
 <header>
-  <h1>rvLLM 0.3.2 &mdash; benchmark results</h1>
-  <div class="sub">LLM inference engine: Rust+CUDA on GPU, JAX+XLA on TPU. <strong>Gemma 4 31B at 79.9 tok/s on TPU v6e-4</strong> (int8, TP=4 SPMD, zero host overhead). Also: Qwen3-8B, Mistral-7B, Llama 3.1 8B on H100 SXM.</div>
+  <h1>rvLLM 0.4.0 &mdash; benchmark results</h1>
+  <div class="sub">LLM inference engine: JAX+XLA on TPU, Rust+CUDA on GPU. Primary model: <strong>Gemma 4 31B &mdash; 13,943 tok/s on TPU v6e-4</strong> (int8, B=768, TP=4 SPMD, PPL 25.51). GPU results below (Qwen, Mistral, Llama) have throughput numbers but <strong>unvalidated perplexity</strong> &mdash; PRs welcome.</div>
   <div class="meta">
     <a href="index.html">site</a>
     <a href="https://github.com/m0at/rvllm">github</a>
@@ -227,7 +227,11 @@ No Docker. No conda. No torch. No vLLM. One pip install, one Python file, ~500 l
 <div class="footnote"><strong>GPU Gemma 4 bottleneck:</strong> cuBLASLt descriptor overhead at batch=1. CUDA graph capture will close the gap. The TPU path avoids this entirely -- XLA fuses all ops into one compiled loop.</div>
 
 
-<h2 class="section">GPU: H100 SXM results <span class="sub">Rust+CUDA, FP8</span></h2>
+<h2 class="section">GPU: H100 SXM results <span class="sub">Rust+CUDA, FP8 &mdash; throughput valid, perplexity unvalidated</span></h2>
+
+<div class="caveat">
+  <strong>Perplexity not validated.</strong> The GPU throughput numbers below are real measurements but the models (Qwen2.5, Mistral, Llama) have not had their perplexity verified on the current v3 codebase. Gemma 4 31B is the only model with end-to-end perplexity validation (TPU path: 25.51). <strong>PRs to fix GPU model perplexity are welcome.</strong>
+</div>
 
 <h2>Throughput <span class="sub">steady-state decode, tok/s</span> <span class="badge measured">Measured</span></h2>
 <div class="chart-box">

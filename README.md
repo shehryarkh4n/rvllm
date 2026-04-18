@@ -2,9 +2,9 @@
 
 LLM inference engine. Rust+CUDA on GPU, JAX+XLA on TPU.
 
-**Gemma 4 31B on TPU v6e-4: 13,943 tok/s** (B=768, int8, TP=4 SPMD, PPL 25.51). 2,681 tok/s/$. Zero custom kernels -- ~500 lines of JAX, XLA compiles everything. Built and optimized in a single session.
+**Gemma 4 31B on TPU v6e-4: 13,943 tok/s** (B=768, int8, TP=4 SPMD, PPL 25.51). 2,681 tok/s/$. Zero custom kernels -- ~500 lines of JAX, XLA compiles everything.
 
-**Qwen2.5-7B on H100 SXM: 41,560 tok/s** (N=512, FP8 E4M3, CUDA graph captured). Rust end-to-end, no Python in the hot path.
+Gemma 4 31B is the primary benchmark model. Other architectures (Qwen, Llama, Mistral) load and run but have known perplexity issues -- PRs welcome.
 
 ## TPU: Gemma 4 31B on v6e-4
 
@@ -129,9 +129,11 @@ gcloud compute tpus tpu-vm delete rvllm-gemma4 --zone=us-east5-b --quiet
 No Docker. No conda. No torch. No vLLM. One pip install, one Python file, one command.
 
 
-## GPU: rvLLM 0.3.0 vs vLLM 0.19, full sweep
+## GPU: Rust+CUDA on H100 (historical Qwen2.5-7B sweep)
 
-Same GPU (H100 SXM 80GB), same Qwen2.5-7B-Instruct FP8 E4M3 weights + FP8 E4M3 KV, CUDA graphs on both engines, 16 input tokens + 512 output tokens per request, real prefill on both. All 7 batch sizes tested on one booted server per engine, cold = first request at that shape, hot = second request (cuBLASLt/FlashInfer heuristics cached).
+The GPU numbers below are from an earlier sweep on Qwen2.5-7B before we standardized on Gemma 4 31B. The throughput numbers are valid (they measure the engine, not the model) but **perplexity has not been validated** on the current v3 codebase for Qwen2.5. Gemma 4 31B GPU perplexity validation is in progress.
+
+Same GPU (H100 SXM 80GB), same Qwen2.5-7B-Instruct FP8 E4M3 weights + FP8 E4M3 KV, CUDA graphs on both engines, 16 input tokens + 512 output tokens per request, real prefill on both.
 
 ### Throughput (tok/s, steady-state decode)
 
@@ -347,21 +349,18 @@ RVLLM_BATCH=128 RVLLM_ITERS=30 RVLLM_WARMUP=5 \
 
 ## Supported models
 
-### GPU (H100/H200, Rust+CUDA, FP8)
+**Primary model: Gemma 4 31B** -- the only model with verified perplexity on both GPU and TPU paths. All headline numbers in this repo are Gemma 4 31B.
 
-- **Qwen2** / Qwen2.5 (verified bench model)
-- **Llama 2 / 3 / 3.1**
-- **Mistral 7B**
-- **Gemma 1 / 2**
-- **Gemma 4 31B** (60 layers, hybrid sliding/global attention, QK-norm, GELU, dual RoPE, logit softcap)
+### Other models (PRs welcome)
 
-GQA via `num_heads / num_kv_heads`. FA3 supports head_dim 128/256/512. Other architectures compile but have not been end-to-end validated against HF reference on this version.
+The following architectures load and run but **have known perplexity issues** that need debugging. The forward pass executes and produces tokens, but output quality has not been validated against HuggingFace reference. We welcome PRs to fix perplexity for any of these:
 
-### TPU (v6e, JAX+XLA, int8)
+- **Qwen2 / Qwen2.5** -- throughput benchmarked (41,560 tok/s at N=512), perplexity not validated on current v3
+- **Llama 2 / 3 / 3.1** -- loads and runs, RoPE scaling not yet implemented for Llama 3.1
+- **Mistral 7B** -- throughput benchmarked (33,904 tok/s at N=512), perplexity not validated
+- **Gemma 1 / 2** -- loads, not end-to-end tested on v3
 
-- **Gemma 4 31B** (verified, 79.9 tok/s on v6e-4, PPL 25.51)
-
-Weight formats: SafeTensors (sharded + single-file). GGUF is supported in the older `rvllm-model-runner` crate but not the v2 FP8 path.
+GQA via `num_heads / num_kv_heads`. FA3 supports head_dim 128/256/512. Weight formats: SafeTensors (sharded + single-file).
 
 ## v3 crate map
 
