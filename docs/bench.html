@@ -108,69 +108,6 @@ td.pending{color:#b6a1e5;font-style:italic}
   <strong>Honest caveat.</strong> rvLLM wins at N&ge;64 by <strong>+12% to +40%</strong>; vLLM still wins at N&le;16 by <strong>+44% to +63%</strong>. Crossover sits near N=32&ndash;64. The per-step fixed cost of our 339 graph-captured launches dominates at tiny batch. An nsys profile (below) confirms the gap is entirely in the <code>gate_up</code> and <code>down</code> GEMMs using a 128&times;M tile that wastes 93% of its M dimension on padding at M=8. Skinny-M GEMM autotune is the next commit.
 </div>
 
-<h2>Throughput <span class="sub">steady-state decode, tok/s</span> <span class="badge measured">Measured</span></h2>
-<div class="chart-box">
-  <div class="chart-title"><strong>Tok/s by batch size</strong> &mdash; higher is better
-    <div class="note">Both engines: Qwen2.5-7B FP8 E4M3 + FP8 E4M3 KV, 16 input + 512 output tokens, CUDA graphs on, real prefill, H100 SXM 80GB.</div>
-  </div>
-  <div id="chart-throughput" style="height:340px"></div>
-</div>
-
-<table>
-<thead><tr><th>N</th><th class="r">rvLLM 0.3.0</th><th class="r">vLLM 0.19 (hot)</th><th class="r">&Delta;</th></tr></thead>
-<tbody>
-<tr class="vllm-win"><td>1</td><td class="r">137</td><td class="r">223</td><td class="r neg">vLLM +62.8%</td></tr>
-<tr class="vllm-win"><td>8</td><td class="r">1,096</td><td class="r">1,712</td><td class="r neg">vLLM +56.2%</td></tr>
-<tr class="vllm-win"><td>16</td><td class="r">2,313</td><td class="r">3,342</td><td class="r neg">vLLM +44.5%</td></tr>
-<tr class="rvllm-win"><td>64</td><td class="r"><strong>12,528</strong></td><td class="r">11,151</td><td class="r pos"><strong>rvLLM +12.3%</strong></td></tr>
-<tr class="rvllm-win"><td>128</td><td class="r"><strong>22,339</strong></td><td class="r">17,778</td><td class="r pos"><strong>rvLLM +25.6%</strong></td></tr>
-<tr class="rvllm-win"><td>256</td><td class="r"><strong>32,129</strong></td><td class="r">24,270</td><td class="r pos"><strong>rvLLM +32.4%</strong></td></tr>
-<tr class="rvllm-win"><td>512</td><td class="r"><strong>43,780</strong></td><td class="r">31,485</td><td class="r pos"><strong>rvLLM +39.0%</strong></td></tr>
-</tbody>
-</table>
-
-<h2>Multi-model throughput <span class="sub">vLLM baselines + rvLLM results across architectures</span></h2>
-
-<div class="note">
-  <strong>Expanding beyond Qwen2.5-7B.</strong> The table below shows vLLM baselines for four model families (all FP8 dynamic quant, 16 in / 512 out tokens, H100 SXM 80GB) alongside confirmed rvLLM results where available. Sweeps are running; results will be filled in as they land.
-</div>
-
-<div class="chart-box">
-  <div class="chart-title"><strong>Multi-model tok/s comparison at N=128</strong> &mdash; higher is better
-    <div class="note">vLLM 0.19 V1, FP8 dynamic quant. rvLLM where measured. OPT-1.3B rvLLM blocked on FA3 head_dim=64 support.</div>
-  </div>
-  <div id="chart-multimodel" style="height:300px"></div>
-</div>
-
-<h3>vLLM baselines <span class="badge measured">Measured</span></h3>
-<table class="mm-table">
-<thead><tr><th>N</th><th class="r">OPT-1.3B</th><th class="r">Mistral-7B</th><th class="r">Qwen3-8B</th><th class="r">Qwen2.5-7B <span class="badge estimate">Est</span></th></tr></thead>
-<tbody>
-<tr><td>1</td><td class="r">577</td><td class="r">239</td><td class="r">212</td><td class="r">~230</td></tr>
-<tr><td>8</td><td class="r">4,135</td><td class="r">1,839</td><td class="r">1,629</td><td class="r">~1,800</td></tr>
-<tr><td>16</td><td class="r">6,869</td><td class="r">3,564</td><td class="r">3,246</td><td class="r">~3,500</td></tr>
-<tr><td>64</td><td class="r">17,122</td><td class="r">11,733</td><td class="r">10,388</td><td class="r">~11,150</td></tr>
-<tr><td>128</td><td class="r">23,102</td><td class="r">17,878</td><td class="r">16,406</td><td class="r">~17,780</td></tr>
-<tr><td>256</td><td class="r">27,372</td><td class="r">25,085</td><td class="r">22,842</td><td class="r">~24,260</td></tr>
-<tr><td>512</td><td class="r">26,621</td><td class="r">28,274</td><td class="r">27,965</td><td class="r">~31,530</td></tr>
-</tbody>
-</table>
-<div class="footnote"><strong>Note:</strong> Qwen2.5-7B vLLM numbers are estimates (~) extrapolated from our existing measured run at slightly different config. OPT-1.3B, Mistral-7B, and Qwen3-8B are fresh measured baselines.</div>
-
-<h3>rvLLM results <span class="badge measured">Measured</span></h3>
-<table class="mm-table">
-<thead><tr><th>N</th><th class="r">Mistral-7B</th><th class="r">Qwen3-8B</th><th class="r">Qwen3-1.7B</th><th class="r">Llama 3.1 8B</th></tr></thead>
-<tbody>
-<tr><td>1</td><td class="r">129</td><td class="r">119</td><td class="r">293</td><td class="r">57</td></tr>
-<tr><td>8</td><td class="r">1,077</td><td class="r">988</td><td class="r">2,333</td><td class="r">473</td></tr>
-<tr><td>16</td><td class="r">2,153</td><td class="r">1,973</td><td class="r">4,619</td><td class="r">952</td></tr>
-<tr><td>64</td><td class="r">11,319</td><td class="r">10,284</td><td class="r">20,071</td><td class="r">5,042</td></tr>
-<tr><td>128</td><td class="r"><strong>18,853</strong></td><td class="r"><strong>17,358</strong></td><td class="r"><strong>33,447</strong></td><td class="r">8,328</td></tr>
-<tr><td>256</td><td class="r"><strong>27,467</strong></td><td class="r"><strong>25,191</strong></td><td class="r"><strong>44,484</strong></td><td class="r">12,167</td></tr>
-<tr><td>512</td><td class="r"><strong>33,904</strong></td><td class="r"><strong>30,775</strong></td><td class="r"><strong>56,135</strong></td><td class="r">15,079</td></tr>
-</tbody>
-</table>
-
 <h2 class="section">TPU: Gemma 4 31B <span class="sub">v6e-4, JAX+XLA, int8 quantized</span> <span class="badge measured">Measured</span></h2>
 
 <div class="note">
@@ -288,6 +225,72 @@ No Docker. No conda. No torch. No vLLM. One pip install, one Python file, ~500 l
 </tbody>
 </table>
 <div class="footnote"><strong>GPU Gemma 4 bottleneck:</strong> cuBLASLt descriptor overhead at batch=1. CUDA graph capture will close the gap. The TPU path avoids this entirely -- XLA fuses all ops into one compiled loop.</div>
+
+
+<h2 class="section">GPU: H100 SXM results <span class="sub">Rust+CUDA, FP8</span></h2>
+
+<h2>Throughput <span class="sub">steady-state decode, tok/s</span> <span class="badge measured">Measured</span></h2>
+<div class="chart-box">
+  <div class="chart-title"><strong>Tok/s by batch size</strong> &mdash; higher is better
+    <div class="note">Both engines: Qwen2.5-7B FP8 E4M3 + FP8 E4M3 KV, 16 input + 512 output tokens, CUDA graphs on, real prefill, H100 SXM 80GB.</div>
+  </div>
+  <div id="chart-throughput" style="height:340px"></div>
+</div>
+
+<table>
+<thead><tr><th>N</th><th class="r">rvLLM 0.3.0</th><th class="r">vLLM 0.19 (hot)</th><th class="r">&Delta;</th></tr></thead>
+<tbody>
+<tr class="vllm-win"><td>1</td><td class="r">137</td><td class="r">223</td><td class="r neg">vLLM +62.8%</td></tr>
+<tr class="vllm-win"><td>8</td><td class="r">1,096</td><td class="r">1,712</td><td class="r neg">vLLM +56.2%</td></tr>
+<tr class="vllm-win"><td>16</td><td class="r">2,313</td><td class="r">3,342</td><td class="r neg">vLLM +44.5%</td></tr>
+<tr class="rvllm-win"><td>64</td><td class="r"><strong>12,528</strong></td><td class="r">11,151</td><td class="r pos"><strong>rvLLM +12.3%</strong></td></tr>
+<tr class="rvllm-win"><td>128</td><td class="r"><strong>22,339</strong></td><td class="r">17,778</td><td class="r pos"><strong>rvLLM +25.6%</strong></td></tr>
+<tr class="rvllm-win"><td>256</td><td class="r"><strong>32,129</strong></td><td class="r">24,270</td><td class="r pos"><strong>rvLLM +32.4%</strong></td></tr>
+<tr class="rvllm-win"><td>512</td><td class="r"><strong>43,780</strong></td><td class="r">31,485</td><td class="r pos"><strong>rvLLM +39.0%</strong></td></tr>
+</tbody>
+</table>
+
+<h2>Multi-model throughput <span class="sub">vLLM baselines + rvLLM results across architectures</span></h2>
+
+<div class="note">
+  <strong>Expanding beyond Qwen2.5-7B.</strong> The table below shows vLLM baselines for four model families (all FP8 dynamic quant, 16 in / 512 out tokens, H100 SXM 80GB) alongside confirmed rvLLM results where available. Sweeps are running; results will be filled in as they land.
+</div>
+
+<div class="chart-box">
+  <div class="chart-title"><strong>Multi-model tok/s comparison at N=128</strong> &mdash; higher is better
+    <div class="note">vLLM 0.19 V1, FP8 dynamic quant. rvLLM where measured. OPT-1.3B rvLLM blocked on FA3 head_dim=64 support.</div>
+  </div>
+  <div id="chart-multimodel" style="height:300px"></div>
+</div>
+
+<h3>vLLM baselines <span class="badge measured">Measured</span></h3>
+<table class="mm-table">
+<thead><tr><th>N</th><th class="r">OPT-1.3B</th><th class="r">Mistral-7B</th><th class="r">Qwen3-8B</th><th class="r">Qwen2.5-7B <span class="badge estimate">Est</span></th></tr></thead>
+<tbody>
+<tr><td>1</td><td class="r">577</td><td class="r">239</td><td class="r">212</td><td class="r">~230</td></tr>
+<tr><td>8</td><td class="r">4,135</td><td class="r">1,839</td><td class="r">1,629</td><td class="r">~1,800</td></tr>
+<tr><td>16</td><td class="r">6,869</td><td class="r">3,564</td><td class="r">3,246</td><td class="r">~3,500</td></tr>
+<tr><td>64</td><td class="r">17,122</td><td class="r">11,733</td><td class="r">10,388</td><td class="r">~11,150</td></tr>
+<tr><td>128</td><td class="r">23,102</td><td class="r">17,878</td><td class="r">16,406</td><td class="r">~17,780</td></tr>
+<tr><td>256</td><td class="r">27,372</td><td class="r">25,085</td><td class="r">22,842</td><td class="r">~24,260</td></tr>
+<tr><td>512</td><td class="r">26,621</td><td class="r">28,274</td><td class="r">27,965</td><td class="r">~31,530</td></tr>
+</tbody>
+</table>
+<div class="footnote"><strong>Note:</strong> Qwen2.5-7B vLLM numbers are estimates (~) extrapolated from our existing measured run at slightly different config. OPT-1.3B, Mistral-7B, and Qwen3-8B are fresh measured baselines.</div>
+
+<h3>rvLLM results <span class="badge measured">Measured</span></h3>
+<table class="mm-table">
+<thead><tr><th>N</th><th class="r">Mistral-7B</th><th class="r">Qwen3-8B</th><th class="r">Qwen3-1.7B</th><th class="r">Llama 3.1 8B</th></tr></thead>
+<tbody>
+<tr><td>1</td><td class="r">129</td><td class="r">119</td><td class="r">293</td><td class="r">57</td></tr>
+<tr><td>8</td><td class="r">1,077</td><td class="r">988</td><td class="r">2,333</td><td class="r">473</td></tr>
+<tr><td>16</td><td class="r">2,153</td><td class="r">1,973</td><td class="r">4,619</td><td class="r">952</td></tr>
+<tr><td>64</td><td class="r">11,319</td><td class="r">10,284</td><td class="r">20,071</td><td class="r">5,042</td></tr>
+<tr><td>128</td><td class="r"><strong>18,853</strong></td><td class="r"><strong>17,358</strong></td><td class="r"><strong>33,447</strong></td><td class="r">8,328</td></tr>
+<tr><td>256</td><td class="r"><strong>27,467</strong></td><td class="r"><strong>25,191</strong></td><td class="r"><strong>44,484</strong></td><td class="r">12,167</td></tr>
+<tr><td>512</td><td class="r"><strong>33,904</strong></td><td class="r"><strong>30,775</strong></td><td class="r"><strong>56,135</strong></td><td class="r">15,079</td></tr>
+</tbody>
+</table>
 
 <h3>Head-to-head: rvLLM vs vLLM</h3>
 <table class="mm-table">
