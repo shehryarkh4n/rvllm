@@ -39,6 +39,7 @@ pub struct Gemma4FusedModules {
     pub softcap_mod: LoadedModule,
     pub residual_scale_mod: LoadedModule,
     pub vnorm_mod: LoadedModule,
+    pub vector_add_mod: LoadedModule,
     pub fn_rmsnorm: KernelFn,
     pub fn_rmsnorm_fp8_quant: KernelFn,
     pub fn_quantize: KernelFn,
@@ -49,6 +50,7 @@ pub struct Gemma4FusedModules {
     pub fn_softcap: KernelFn,
     pub fn_residual_scale: KernelFn,
     pub fn_vnorm: KernelFn,
+    pub fn_vector_add: KernelFn,
 }
 
 pub struct Gemma4Bringup {
@@ -187,6 +189,7 @@ impl Gemma4Bringup {
         let gate_up_scale = arena.region("gate_up_scale", (num_seqs * 4) as usize, 16).unwrap();
         let mlp_out_fp8 = arena.region("mlp_out_fp8", (num_seqs * inter) as usize, 16).unwrap();
         let mlp_out_scale = arena.region("mlp_out_scale", (num_seqs * 4) as usize, 16).unwrap();
+        let delta_f16 = arena.region("delta_f16", (num_seqs * hidden * 2) as usize, 16).unwrap();
 
         // Uniform KV dim across layer types (sliding 16*256=4096, global 4*512=2048 but
         // k_eq_v doubles it back). Use max for allocation.
@@ -334,7 +337,7 @@ impl Gemma4Bringup {
                     attn_out: attn_out.device_ptr(),
                     attn_out_fp8: attn_out_fp8.device_ptr(),
                     attn_out_scale: attn_out_scale.device_ptr(),
-                    post_attn_normed: 0, // unused in current forward
+                    delta_f16: delta_f16.device_ptr(),
                     gate_up_out: gate_up_out.device_ptr(),
                     gate_up_fp8: gate_up_fp8.device_ptr(),
                     gate_up_scale: gate_up_scale.device_ptr(),
@@ -480,6 +483,7 @@ impl Gemma4Bringup {
         let gate_up_scale = arena.region("gate_up_scale", (num_seqs * 4) as usize, 16)?;
         let mlp_out_fp8 = arena.region("mlp_out_fp8", (num_seqs * inter) as usize, 16)?;
         let mlp_out_scale = arena.region("mlp_out_scale", (num_seqs * 4) as usize, 16)?;
+        let delta_f16 = arena.region("delta_f16_ppl", (num_seqs * hidden * 2) as usize, 16)?;
 
         let kv_elem_per_layer = 2 * num_blocks_total * block_size * max_nkvh * max_hd;
         let kv_cache = arena.region(
@@ -784,6 +788,7 @@ impl Gemma4Bringup {
             quantize_fp8_per_token: self.fused.fn_quantize,
             residual_scale_f16: self.fused.fn_residual_scale,
             vnorm_f16: self.fused.fn_vnorm,
+            vector_add_f16: self.fused.fn_vector_add,
         }
     }
 }
@@ -801,6 +806,7 @@ fn load_gemma4_fused(loader: &KernelLoader) -> Result<Gemma4FusedModules> {
     let softcap_mod = loader.load_ptx("logit_softcap")?;
     let residual_scale_mod = loader.load_ptx("residual_scale_f16")?;
     let vnorm_mod = loader.load_ptx("vnorm_f16")?;
+    let vector_add_mod = loader.load_ptx("vector_add_f16")?;
 
     let rmsnorm_inplace_mod = loader.load_ptx("rmsnorm_inplace_f16")?;
     let fn_rmsnorm = rmsnorm_inplace_mod.get_function("rmsnorm_inplace_f16_kernel")?;
@@ -817,6 +823,7 @@ fn load_gemma4_fused(loader: &KernelLoader) -> Result<Gemma4FusedModules> {
     let fn_residual_scale =
         residual_scale_mod.get_function("residual_scale_f16_kernel")?;
     let fn_vnorm = vnorm_mod.get_function("vnorm_f16_kernel")?;
+    let fn_vector_add = vector_add_mod.get_function("vector_add_f16_kernel")?;
 
     Ok(Gemma4FusedModules {
         rmsnorm_mod,
@@ -828,6 +835,7 @@ fn load_gemma4_fused(loader: &KernelLoader) -> Result<Gemma4FusedModules> {
         softcap_mod,
         residual_scale_mod,
         vnorm_mod,
+        vector_add_mod,
         fn_rmsnorm,
         fn_rmsnorm_fp8_quant,
         fn_quantize,
@@ -838,5 +846,6 @@ fn load_gemma4_fused(loader: &KernelLoader) -> Result<Gemma4FusedModules> {
         fn_softcap,
         fn_residual_scale,
         fn_vnorm,
+        fn_vector_add,
     })
 }

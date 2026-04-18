@@ -93,7 +93,7 @@ pub struct Gemma4LayerScratch {
     pub attn_out: u64,
     pub attn_out_fp8: u64,
     pub attn_out_scale: u64,
-    pub post_attn_normed: u64,
+    pub delta_f16: u64,
     pub gate_up_out: u64,
     pub gate_up_fp8: u64,
     pub gate_up_scale: u64,
@@ -132,6 +132,7 @@ pub struct Gemma4LayerKernels {
     pub quantize_fp8_per_token: KernelFn,
     pub residual_scale_f16: KernelFn,
     pub vnorm_f16: KernelFn,
+    pub vector_add_f16: KernelFn,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -318,13 +319,12 @@ pub unsafe fn gemma4_forward(
         stream,
     )?;
 
-    // 7. O proj with residual epilogue (cuBLASLt)
+    // 7. O proj -> delta buffer (NOT residual)
     #[cfg(feature = "cuda")]
-    cublaslt.fp8_gemm_residual(
+    cublaslt.fp8_gemm(
         scratch.attn_out_fp8,
         weights.o_fp8,
-        residual,
-        residual,
+        scratch.delta_f16,
         dims.num_tokens as i32,
         dims.hidden as i32,
         q_dim as i32,
@@ -333,18 +333,8 @@ pub unsafe fn gemma4_forward(
         stream,
     )?;
 
-    #[cfg(feature = "cuda")]
-    probe!("after_step7_residual", residual, dims.hidden);
-
-    // 8. post_attention_layernorm (norm-only, applied to residual in-place
-    //    for Gemma's pre-post norm structure). This is a norm without FP8
-    //    quant -- it feeds into the pre_feedforward_layernorm which does quant.
-    // For Gemma 3/4, the post-attention and post-feedforward norms are
-    // applied to the residual as: residual = post_norm(residual) before
-    // the next sub-block's pre-norm. We implement this as:
-    //   normed = rmsnorm(residual, post_attn_gamma)
-    //   then the pre_ff norm quantizes it to FP8.
-    // The "normed" intermediate is stored in post_attn_normed scratch.
+    // 8. post_attention_layernorm on the DELTA (not residual).
+    // HF: hidden_states = post_attn_norm(attn_output); residual += hidden_states
     gemma4_launcher::RmsnormInplaceLaunch {
         num_tokens: dims.num_tokens,
         hidden: dims.hidden,
@@ -352,10 +342,16 @@ pub unsafe fn gemma4_forward(
     }
     .launch(
         kernels.fused_rmsnorm,
-        residual,
+        scratch.delta_f16,
         weights.post_attn_norm_gamma,
         stream,
     )?;
+
+    // 8b. residual += normed delta
+    gemma4_launcher::VectorAddF16Launch {
+        n: dims.num_tokens * dims.hidden,
+    }
+    .launch(kernels.vector_add_f16, residual, scratch.delta_f16, stream)?;
 
     #[cfg(feature = "cuda")]
     probe!("after_step8_residual", residual, dims.hidden);
@@ -402,13 +398,12 @@ pub unsafe fn gemma4_forward(
         stream,
     )?;
 
-    // 12. Down proj with residual epilogue (cuBLASLt)
+    // 12. Down proj -> delta buffer (NOT residual)
     #[cfg(feature = "cuda")]
-    cublaslt.fp8_gemm_residual(
+    cublaslt.fp8_gemm(
         scratch.mlp_out_fp8,
         weights.down_fp8,
-        residual,
-        residual,
+        scratch.delta_f16,
         dims.num_tokens as i32,
         dims.hidden as i32,
         dims.intermediate as i32,
@@ -417,10 +412,8 @@ pub unsafe fn gemma4_forward(
         stream,
     )?;
 
-    #[cfg(feature = "cuda")]
-    probe!("after_step12_residual", residual, dims.hidden);
-
-    // 13. post_feedforward_layernorm (norm-only, in-place on residual)
+    // 13. post_feedforward_layernorm on the DELTA (not residual).
+    // HF: hidden_states = post_ff_norm(mlp_output); residual += hidden_states
     gemma4_launcher::RmsnormInplaceLaunch {
         num_tokens: dims.num_tokens,
         hidden: dims.hidden,
@@ -428,10 +421,16 @@ pub unsafe fn gemma4_forward(
     }
     .launch(
         kernels.fused_rmsnorm,
-        residual,
+        scratch.delta_f16,
         weights.post_ff_norm_gamma,
         stream,
     )?;
+
+    // 13b. residual += normed delta
+    gemma4_launcher::VectorAddF16Launch {
+        n: dims.num_tokens * dims.hidden,
+    }
+    .launch(kernels.vector_add_f16, residual, scratch.delta_f16, stream)?;
 
     #[cfg(feature = "cuda")]
     probe!("after_step13_residual", residual, dims.hidden);
