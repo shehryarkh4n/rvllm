@@ -344,8 +344,9 @@ pub fn load_gemma4_model(
             (qkv, o_proj, gate_up, down_proj)
         };
 
-        let use_f16_layers = std::env::var("RVLLM_F16_LAYERS").map_or(false, |v| v == "1");
-        let (qkv_f16_w, o_proj_f16_w, gate_up_f16_w, down_proj_f16_w) = if use_f16_layers {
+        let f16_max = std::env::var("RVLLM_F16_LAYERS")
+            .ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
+        let (qkv_f16_w, o_proj_f16_w, gate_up_f16_w, down_proj_f16_w) = if l < f16_max {
             let qkv_buf = concat_tensors(&[&q_tensor, &k_tensor, &v_tensor], &shards, model_dir)?;
             let qkv_r = arena.region(Box::leak(format!("qkv_f16_L{l}").into_boxed_str()), qkv_buf.len(), 16)?;
             unsafe { qkv_r.copy_from_host(&qkv_buf)? };
@@ -371,7 +372,7 @@ pub fn load_gemma4_model(
             unsafe { d_r.copy_from_host(&d_buf)? };
             let d_w = F16Weight { offset_bytes: d_r.device_ptr(), shape: d_entry.1.shape.clone() };
 
-            if l == 0 { eprintln!("[loader] RVLLM_F16_LAYERS=1: loading F16 weights for all layers"); }
+            if l == 0 { eprintln!("[loader] RVLLM_F16_LAYERS={f16_max}: loading F16 weights for layers 0..{f16_max}"); }
             (Some(qkv_w), Some(o_w), Some(gu_w), Some(d_w))
         } else {
             (None, None, None, None)
