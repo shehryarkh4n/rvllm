@@ -481,7 +481,7 @@ impl Bringup {
                     attn_norm_gamma: layer.input_layernorm.offset_bytes,
                     qkv_fp8: layer.qkv.offset_bytes,
                     qkv_scale: layer.qkv.scale_ptr,
-                    qkv_bias: layer.qkv_bias.offset_bytes,
+                    qkv_bias: layer.qkv_bias.as_ref().map_or(0, |b| b.offset_bytes),
                     o_fp8: layer.o_proj.offset_bytes,
                     o_scale: layer.o_proj.scale_ptr,
                     mlp_norm_gamma: layer.post_attention_layernorm.offset_bytes,
@@ -535,6 +535,25 @@ impl Bringup {
                     stream,
                     phase,
                 )?;
+
+                // NaN diagnostic: read 8 f16 values from residual after each layer.
+                #[cfg(feature = "cuda")]
+                if std::env::var("RVLLM_NAN_CHECK").ok().as_deref() == Some("1") {
+                    unsafe {
+                        cudarc::driver::sys::cuStreamSynchronize(stream as _);
+                        let mut sample = [0u16; 8];
+                        cudarc::driver::sys::cuMemcpyDtoH_v2(
+                            sample.as_mut_ptr() as *mut _,
+                            residual_ptr,
+                            16,
+                        );
+                        let nan_count = sample.iter().filter(|&&v| (v & 0x7C00) == 0x7C00 && (v & 0x03FF) != 0).count();
+                        let inf_count = sample.iter().filter(|&&v| v == 0x7C00 || v == 0xFC00).count();
+                        if nan_count > 0 || inf_count > 0 {
+                            eprintln!("[NaN] layer {layer_idx}: {nan_count} NaN, {inf_count} Inf in residual[0..8] = {:04X?}", sample);
+                        }
+                    }
+                }
             }
             // Skip LM head during prefill — we only care about first-token
             // sampling after the LAST token of each seq, which is a
@@ -982,7 +1001,7 @@ impl Bringup {
                     attn_norm_gamma: layer.input_layernorm.offset_bytes,
                     qkv_fp8: layer.qkv.offset_bytes,
                     qkv_scale: layer.qkv.scale_ptr,
-                    qkv_bias: layer.qkv_bias.offset_bytes,
+                    qkv_bias: layer.qkv_bias.as_ref().map_or(0, |b| b.offset_bytes),
                     o_fp8: layer.o_proj.offset_bytes,
                     o_scale: layer.o_proj.scale_ptr,
                     mlp_norm_gamma: layer.post_attention_layernorm.offset_bytes,

@@ -62,7 +62,7 @@ pub struct LayerWeights {
     pub attn_norm_gamma: u64,
     pub qkv_fp8: u64,
     pub qkv_scale: u64,
-    pub qkv_bias: u64, // [q_dim + 2*kv_dim] f16
+    pub qkv_bias: u64, // 0 = no bias, else [q_dim + 2*kv_dim] f16
     pub o_fp8: u64,
     pub o_scale: u64,
     pub mlp_norm_gamma: u64,
@@ -198,18 +198,32 @@ pub unsafe fn forward_phase(
     //    offsets into the same buffer (set by bring_up).
     let qkv_n = dims.num_heads * dims.head_dim + 2 * dims.num_kv_heads * dims.head_dim;
     #[cfg(feature = "cuda")]
-    cublaslt.fp8_gemm_bias(
-        scratch.hidden_fp8,
-        weights.qkv_fp8,
-        weights.qkv_bias,
-        scratch.q_out,
-        dims.num_tokens as i32,
-        qkv_n as i32,
-        dims.hidden as i32,
-        scratch.hidden_scale,
-        weights.qkv_scale,
-        stream,
-    )?;
+    if weights.qkv_bias != 0 {
+        cublaslt.fp8_gemm_bias(
+            scratch.hidden_fp8,
+            weights.qkv_fp8,
+            weights.qkv_bias,
+            scratch.q_out,
+            dims.num_tokens as i32,
+            qkv_n as i32,
+            dims.hidden as i32,
+            scratch.hidden_scale,
+            weights.qkv_scale,
+            stream,
+        )?;
+    } else {
+        cublaslt.fp8_gemm(
+            scratch.hidden_fp8,
+            weights.qkv_fp8,
+            scratch.q_out,
+            dims.num_tokens as i32,
+            qkv_n as i32,
+            dims.hidden as i32,
+            scratch.hidden_scale,
+            weights.qkv_scale,
+            stream,
+        )?;
+    }
     // Suppress unused warnings when cuda feature is off.
     #[cfg(not(feature = "cuda"))]
     {

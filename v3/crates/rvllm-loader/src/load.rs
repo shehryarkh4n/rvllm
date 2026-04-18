@@ -28,6 +28,7 @@ pub struct ModelArch {
     pub vocab_size: usize,
     pub rope_theta: f32,
     pub max_position_embeddings: usize,
+    pub attention_bias: bool,
 }
 
 impl ModelArch {
@@ -59,6 +60,7 @@ impl ModelArch {
         let rope_theta = v["rope_theta"].as_f64().unwrap_or(10000.0) as f32;
         let max_position_embeddings =
             v["max_position_embeddings"].as_u64().unwrap_or(2048) as usize;
+        let attention_bias = v["attention_bias"].as_bool().unwrap_or(true);
         let head_dim = if num_attention_heads == 0 {
             0
         } else {
@@ -88,6 +90,7 @@ impl ModelArch {
             vocab_size,
             rope_theta,
             max_position_embeddings,
+            attention_bias,
         })
     }
 }
@@ -235,22 +238,22 @@ pub fn load_model(model_dir: &Path, arena: &HbmArena, arch: &ModelArch) -> Resul
             model_dir,
         )?;
 
-        // Concat q/k/v biases. Qwen2.5 has attention_bias=true; leaving
-        // these out would silently produce wrong logits after QKV.
-        let qkv_bias_bytes = concat_qkv_bias(
-            &must_get(&ln("self_attn.q_proj.bias"))?,
-            &must_get(&ln("self_attn.k_proj.bias"))?,
-            &must_get(&ln("self_attn.v_proj.bias"))?,
-            &shards,
-            model_dir,
-        )?;
-        let qkv_bias = {
+        let qkv_bias = if arch.attention_bias {
+            let qkv_bias_bytes = concat_qkv_bias(
+                &must_get(&ln("self_attn.q_proj.bias"))?,
+                &must_get(&ln("self_attn.k_proj.bias"))?,
+                &must_get(&ln("self_attn.v_proj.bias"))?,
+                &shards,
+                model_dir,
+            )?;
             let r = arena.region("qkv_bias", qkv_bias_bytes.len(), 16)?;
             unsafe { r.copy_from_host(&qkv_bias_bytes)? };
-            F16Weight {
+            Some(F16Weight {
                 offset_bytes: r.device_ptr() - arena_base(arena),
                 shape: vec![qkv_rows],
-            }
+            })
+        } else {
+            None
         };
 
         let o_proj = upload_fp8_from(
