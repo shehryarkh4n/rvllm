@@ -1,60 +1,50 @@
 #!/usr/bin/env python3
 """Gemma 4 31B inference on TPU v6e-4 via JAX SPMD (TP=4).
 
-60 layers = 10 groups of (5 sliding + 1 global).
-Nested scan: outer over 10 groups, inner over 5 sliding layers per group.
-Global layer called explicitly between inner scans.
-
-Weight shapes differ between sliding and global:
-  Sliding: q=[8192,5376] k=[4096,5376] v=[4096,5376] o=[5376,8192] qn/kn=[256]
-  Global:  q=[16384,5376] k=[2048,5376] v=MISSING     o=[5376,16384] qn/kn=[512]
-  FFN: identical for all layers
+Flat scan over all 60 layers. Weights padded to max shape so one scan
+body handles both sliding and global layers via jax.lax.cond.
 
 Usage:
     python3 gemma4_tpu_infer.py --model-dir /path/to/gemma-4-31B-it \
         --max-tokens 32 --prompt "2,3257"
 """
 import argparse, json, os, struct, sys, time
-from functools import partial
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+import ml_dtypes
 
-# ── constants ──
 H      = 5376
 NH     = 32
 INTER  = 21504
 VOCAB  = 262144
 NL     = 60
-N_GROUPS = 10
 WINDOW = 1024
 SOFTCAP_VAL = 30.0
 EPS    = 1e-6
 B      = 1
 
-# sliding attention
-S_Q_DIM  = 8192   # 32 * 256
-S_KV_DIM = 4096   # 16 * 256
-S_HD     = 256
-S_KVH    = 16
-S_GQA    = NH // S_KVH  # 2
+# Max shapes across layer types (pad smaller to these)
+MAX_Q  = 16384   # max(8192, 16384)
+MAX_KV = 4096    # max(4096, 2048)
+MAX_O  = 16384   # max(8192, 16384)
+MAX_NORM_HD = 512  # max(256, 512)
 
-# global attention
-G_Q_DIM  = 16384  # 32 * 512
-G_KV_DIM = 2048   # 4 * 512
-G_HD     = 512
-G_KVH    = 4
-G_GQA    = NH // G_KVH  # 8
+# Sliding params
+S_Q, S_KV, S_HD, S_KVH = 8192, 4096, 256, 16
+S_GQA = NH // S_KVH  # 2
+# Global params
+G_Q, G_KV, G_HD, G_KVH = 16384, 2048, 512, 4
+G_GQA = NH // G_KVH  # 8
 
-# ── mesh ──
+LAYER_IS_GLOBAL = np.array([1 if (i+1) % 6 == 0 else 0 for i in range(NL)], dtype=np.int32)
+
 def make_mesh():
     devs = jax.devices()
-    assert len(devs) >= 4, f"Need 4 TPU chips, got {len(devs)}"
     return Mesh(np.array(devs[:4]), ('tp',))
 
-# ── primitives ──
 def rms_norm(x, g):
     x32 = x.astype(jnp.float32)
     return (x * jax.lax.rsqrt(jnp.mean(x32 * x32, axis=-1, keepdims=True) + EPS).astype(x.dtype)) * g
@@ -62,6 +52,10 @@ def rms_norm(x, g):
 def head_norm(h, g):
     h32 = h.astype(jnp.float32)
     return (h * jax.lax.rsqrt(jnp.mean(h32 * h32, axis=-1, keepdims=True) + EPS).astype(h.dtype)) * g
+
+def head_norm_noscale(h):
+    h32 = h.astype(jnp.float32)
+    return (h * jax.lax.rsqrt(jnp.mean(h32 * h32, axis=-1, keepdims=True) + EPS).astype(h.dtype))
 
 def rope(x, cos, sin, rot_dim):
     half = rot_dim // 2
@@ -79,127 +73,121 @@ def precompute_rope(theta, rot_dim, max_pos):
     angles = np.outer(np.arange(max_pos, dtype=np.float32), freqs)
     return np.cos(angles).astype(np.float32), np.sin(angles).astype(np.float32)
 
-def decode_attn(q, k, v, k_cache, v_cache, pos, ctx, scale, gqa_ratio, max_ctx, window=-1):
-    """Generic decode attention. q:(B,NH,HD) k:(B,KVH,HD) v:(B,KVH,HD)"""
-    kvh = k.shape[1]
-    hd = k.shape[2]
-    kv_dim = kvh * hd
+# ── attention branches ──
 
-    k_cache = k_cache.at[pos].set(k.reshape(B, kv_dim)[0])
-    v_cache = v_cache.at[pos].set(v.reshape(B, kv_dim)[0])
-
-    k_ctx = jnp.repeat(k_cache.reshape(max_ctx, kvh, hd), gqa_ratio, axis=1)
-    v_ctx = jnp.repeat(v_cache.reshape(max_ctx, kvh, hd), gqa_ratio, axis=1)
-
-    sc = jnp.einsum('bnh,tnh->bnt', q.astype(jnp.float32),
-                     k_ctx.astype(jnp.float32)) * scale
-    t = jnp.arange(max_ctx)
-    if window > 0:
-        valid = (t < ctx) & (t >= jnp.maximum(0, pos - window + 1))
-    else:
-        valid = t < ctx
-    sc = jnp.where(valid[None, None, :], sc, jnp.float32(-1e9))
-    p = jax.nn.softmax(sc, axis=-1).astype(q.dtype)
-    out = jnp.einsum('bnt,tnh->bnh', p, v_ctx)
-    return out, k_cache, v_cache
-
-# ── FFN (shared by both layer types) ──
-def ffn_block(x, ln3, ln4, gw, uw, dw, ls):
-    residual = x
-    h = rms_norm(x, ln3)
-    gate = h @ gw.T
-    up = h @ uw.T
-    h = jax.nn.gelu(gate, approximate=True) * up
-    h = h @ dw.T
-    h = rms_norm(h, ln4)
-    return residual + h * ls
-
-# ── sliding layer ──
-def sliding_layer(carry, xs):
-    x, pos, ctx, cos_s, sin_s = carry
-    max_ctx = xs['skc'].shape[0]
-
-    residual = x
-    h = rms_norm(x, xs['ln1'])
-    q = (h @ xs['sqw'].T).reshape(B, NH, S_HD)
-    k = (h @ xs['skw'].T).reshape(B, S_KVH, S_HD)
-    v = (h @ xs['svw'].T).reshape(B, S_KVH, S_HD)
-
-    q = head_norm(q, xs['sqn'])
-    k = head_norm(k, xs['skn'])
-
+def _sliding_attn(q_flat, k_flat, v_flat, qn, kn, cos_s, sin_s, kc, vc, pos, ctx, max_ctx):
+    q = head_norm(q_flat[:, :S_Q].reshape(B, NH, S_HD), qn[:S_HD])
+    k = head_norm(k_flat[:, :S_KV].reshape(B, S_KVH, S_HD), kn[:S_HD])
+    v = head_norm_noscale(v_flat[:, :S_KV].reshape(B, S_KVH, S_HD))
     c = cos_s[pos][None, None, :]
     s = sin_s[pos][None, None, :]
     q = rope(q, c, s, S_HD)
     k = rope(k, c, s, S_HD)
+    kc = kc.at[pos].set(k.reshape(B, S_KV)[0].astype(kc.dtype))
+    vc = vc.at[pos].set(v.reshape(B, S_KV)[0].astype(vc.dtype))
+    k_ctx = kc[:max_ctx].reshape(max_ctx, S_KVH, S_HD)
+    v_ctx = vc[:max_ctx].reshape(max_ctx, S_KVH, S_HD)
+    q_g = q.reshape(B, S_KVH, S_GQA, S_HD)
+    sc = jnp.einsum('bghd,tgd->bght', q_g.astype(jnp.float32), k_ctx.astype(jnp.float32))
+    # Gemma 4 uses scaling=1.0 (QK-norm handles magnitude)
+    # sc = sc / jnp.sqrt(jnp.float32(S_HD))
+    t = jnp.arange(max_ctx)
+    valid = (t < ctx) & (t >= jnp.maximum(0, pos - WINDOW + 1))
+    sc = jnp.where(valid[None, None, None, :], sc, jnp.float32(-1e9))
+    p = jax.nn.softmax(sc, axis=-1).astype(q.dtype)
+    out = jnp.einsum('bght,tgd->bghd', p, v_ctx).reshape(B, S_Q)
+    return out, kc, vc
 
-    scale = 1.0 / jnp.sqrt(jnp.float32(S_HD))
-    attn_out, skc, svc = decode_attn(q, k, v, xs['skc'], xs['svc'], pos, ctx,
-                                      scale, S_GQA, max_ctx, window=WINDOW)
-    h = attn_out.reshape(B, S_Q_DIM) @ xs['sow'].T
+def _global_attn(q_flat, k_flat, v_flat, qn, kn, cos_g, sin_g, kc, vc, pos, ctx, max_ctx):
+    k_raw = k_flat[:, :G_KV].reshape(B, G_KVH, G_HD)
+    q = head_norm(q_flat[:, :G_Q].reshape(B, NH, G_HD), qn)
+    k = head_norm(k_raw, kn)
+    v = head_norm_noscale(k_raw)  # k_eq_v: V = v_norm(raw_K), no scale, no RoPE
+    c = cos_g[pos][None, None, :]
+    s = sin_g[pos][None, None, :]
+    q = rope(q, c, s, 128)
+    k = rope(k, c, s, 128)
+    k_val = jnp.pad(k.reshape(B, G_KV)[0], (0, MAX_KV - G_KV)).astype(kc.dtype)
+    v_val = jnp.pad(v.reshape(B, G_KV)[0], (0, MAX_KV - G_KV)).astype(vc.dtype)
+    kc = kc.at[pos].set(k_val)
+    vc = vc.at[pos].set(v_val)
+    k_ctx = kc[:max_ctx, :G_KV].reshape(max_ctx, G_KVH, G_HD)
+    v_ctx = vc[:max_ctx, :G_KV].reshape(max_ctx, G_KVH, G_HD)
+    q_g = q.reshape(B, G_KVH, G_GQA, G_HD)
+    sc = jnp.einsum('bghd,tgd->bght', q_g.astype(jnp.float32), k_ctx.astype(jnp.float32))
+    # Gemma 4 uses scaling=1.0 (QK-norm handles magnitude)
+    # sc = sc / jnp.sqrt(jnp.float32(G_HD))
+    valid = jnp.arange(max_ctx) < ctx
+    sc = jnp.where(valid[None, None, None, :], sc, jnp.float32(-1e9))
+    p = jax.nn.softmax(sc, axis=-1).astype(q.dtype)
+    out = jnp.einsum('bght,tgd->bghd', p, v_ctx).reshape(B, G_Q)
+    return out, kc, vc
+
+# ── flat scan body ──
+
+def one_layer(carry, xs):
+    x, pos, ctx, cos_s, sin_s, cos_g, sin_g = carry
+    max_ctx = xs['kc'].shape[0]
+
+    residual = x
+    h = rms_norm(x, xs['ln1'])
+
+    q_flat = int8_matmul(h, xs['qw'], xs['qw_s'])
+    k_flat = int8_matmul(h, xs['kw'], xs['kw_s'])
+    v_flat = int8_matmul(h, xs['vw'], xs['vw_s'])
+
+    ig = xs['ig']
+
+    def do_sliding(args):
+        q, k, v, qn, kn, kc, vc = args
+        out, kc2, vc2 = _sliding_attn(q, k, v, qn, kn, cos_s, sin_s, kc, vc, pos, ctx, max_ctx)
+        # Pad attn output to MAX_Q
+        return jnp.pad(out, ((0,0),(0, MAX_Q - S_Q))), kc2, vc2
+
+    def do_global(args):
+        q, k, v, qn, kn, kc, vc = args
+        out, kc2, vc2 = _global_attn(q, k, v, qn, kn, cos_g, sin_g, kc, vc, pos, ctx, max_ctx)
+        return out, kc2, vc2  # already MAX_Q size
+
+    attn_out, kc, vc = jax.lax.cond(
+        ig, do_global, do_sliding,
+        (q_flat, k_flat, v_flat, xs['qn'], xs['kn'], xs['kc'], xs['vc']))
+
+    o_out = int8_matmul(attn_out, xs['ow'], xs['ow_s'])
+
+    h = o_out
     h = rms_norm(h, xs['ln2'])
     x = residual + h * xs['ls']
 
-    x = ffn_block(x, xs['ln3'], xs['ln4'], xs['gw'], xs['uw'], xs['dw'], xs['ls'])
-    return (x, pos, ctx, cos_s, sin_s), {'skc': skc, 'svc': svc}
-
-# ── global layer ──
-def global_layer_fn(carry, gp):
-    x, pos, ctx, cos_g, sin_g = carry
-    max_ctx = gp['gkc'].shape[0]
-
     residual = x
-    h = rms_norm(x, gp['ln1'])
-    q = (h @ gp['gqw'].T).reshape(B, NH, G_HD)
-    k = (h @ gp['gkw'].T).reshape(B, G_KVH, G_HD)
-    v = k  # k_eq_v
+    h = rms_norm(x, xs['ln3'])
+    gate = int8_matmul(h, xs['gw'], xs['gw_s'])
+    up = int8_matmul(h, xs['uw'], xs['uw_s'])
+    h = jax.nn.gelu(gate, approximate=True) * up
+    h = int8_matmul(h, xs['dw'], xs['dw_s'])
+    h = rms_norm(h, xs['ln4'])
+    x = residual + h * xs['ls']
 
-    q = head_norm(q, gp['gqn'])
-    k = head_norm(k, gp['gkn'])
-
-    c = cos_g[pos][None, None, :]
-    s = sin_g[pos][None, None, :]
-    rot_dim = 128  # 512 * 0.25
-    q = rope(q, c, s, rot_dim)
-    k = rope(k, c, s, rot_dim)
-
-    scale = 1.0 / jnp.sqrt(jnp.float32(G_HD))
-    attn_out, gkc, gvc = decode_attn(q, k, v, gp['gkc'], gp['gvc'], pos, ctx,
-                                      scale, G_GQA, max_ctx, window=-1)
-    h = attn_out.reshape(B, G_Q_DIM) @ gp['gow'].T
-    h = rms_norm(h, gp['ln2'])
-    x = residual + h * gp['ls']
-
-    x = ffn_block(x, gp['ln3'], gp['ln4'], gp['gw'], gp['uw'], gp['dw'], gp['ls'])
-    return (x, pos, ctx, cos_g, sin_g), {'gkc': gkc, 'gvc': gvc}
-
-# ── one group (5 sliding + 1 global) ──
-def one_group(carry, group_xs):
-    x, pos, ctx, cos_s, sin_s, cos_g, sin_g = carry
-
-    s_carry = (x, pos, ctx, cos_s, sin_s)
-    s_carry, s_out = jax.lax.scan(sliding_layer, s_carry, group_xs['sliding'])
-    x = s_carry[0]
-
-    g_carry = (x, pos, ctx, cos_g, sin_g)
-    g_carry, g_out = global_layer_fn(g_carry, group_xs['global'])
-    x = g_carry[0]
-
-    return (x, pos, ctx, cos_s, sin_s, cos_g, sin_g), {'s': s_out, 'g': g_out}
+    return (x, pos, ctx, cos_s, sin_s, cos_g, sin_g), {'kc': kc, 'vc': vc}
 
 # ── forward ──
-def forward(token_id, pos, ctx, embed, final_norm, groups, cos_s, sin_s, cos_g, sin_g):
+
+def forward(token_id, pos, ctx, embed, final_norm, weights, caches, cos_s, sin_s, cos_g, sin_g):
     x = embed[token_id].reshape(B, H) * jnp.sqrt(jnp.float32(H))
     init = (x, pos, ctx, cos_s, sin_s, cos_g, sin_g)
 
-    final, scan_out = jax.lax.scan(one_group, init, groups)
+    layer_xs = {**weights, 'kc': caches['kc'], 'vc': caches['vc']}
+    final, scan_out = jax.lax.scan(one_layer, init, layer_xs)
     x = final[0]
     x = rms_norm(x, final_norm)
     logits = x.astype(jnp.float32) @ embed.astype(jnp.float32).T
     logits = SOFTCAP_VAL * jnp.tanh(logits / SOFTCAP_VAL)
-    return jnp.argmax(logits, axis=-1).astype(jnp.int32), scan_out
+    log_probs = jax.nn.log_softmax(logits, axis=-1)
+    new_caches = {'kc': scan_out['kc'], 'vc': scan_out['vc']}
+    return jnp.argmax(logits, axis=-1).astype(jnp.int32), log_probs, new_caches
 
 # ── safetensors reader ──
+
 def read_safetensors(path):
     with open(path, 'rb') as f:
         header_len = struct.unpack('<Q', f.read(8))[0]
@@ -222,8 +210,6 @@ def read_safetensors(path):
             tensors[name] = raw.view(np.float32).reshape(shape)
     return tensors
 
-import ml_dtypes
-
 def to_np_bf16(arr):
     if arr.dtype == np.uint16:
         return arr.view(ml_dtypes.bfloat16)
@@ -236,6 +222,23 @@ def to_np_bf16(arr):
     raise ValueError(f"unsupported dtype {arr.dtype}")
 
 # ── weight loading ──
+
+def pad_to(arr, target_shape):
+    pads = [(0, t - s) for s, t in zip(arr.shape, target_shape)]
+    return np.pad(arr, pads)
+
+def quantize_int8_perchannel(arr_bf16):
+    """Quantize bf16 weight to int8 with per-output-channel scale."""
+    w = arr_bf16.astype(np.float32)
+    amax = np.abs(w).max(axis=-1, keepdims=True).clip(min=1e-10)
+    scale = (amax / 127.0).astype(np.float32)
+    w_int8 = np.round(w / scale).clip(-127, 127).astype(np.int8)
+    return w_int8, scale.squeeze(-1).astype(ml_dtypes.bfloat16)
+
+def int8_matmul(x, w_int8, scale):
+    """x @ (w_int8 * scale).T with fused int8 read."""
+    return (x @ w_int8.astype(jnp.bfloat16).T) * scale
+
 def load_model(model_dir, mesh, max_ctx):
     idx_path = os.path.join(model_dir, 'model.safetensors.index.json')
     if os.path.exists(idx_path):
@@ -254,7 +257,7 @@ def load_model(model_dir, mesh, max_ctx):
                 prefix = 'model.language_model'
                 break
 
-    print(f"loading from {model_dir}, prefix={prefix}, {len(shard_names)} shard(s)", file=sys.stderr)
+    print(f"loading from {model_dir}, prefix={prefix}", file=sys.stderr)
     all_t = {}
     for sn in shard_names:
         print(f"  reading {sn}...", file=sys.stderr)
@@ -263,6 +266,8 @@ def load_model(model_dir, mesh, max_ctx):
 
     def get(name):
         return all_t[name]
+    def has(name):
+        return name in all_t
 
     def put(arr, spec):
         return jax.device_put(to_np_bf16(arr), NamedSharding(mesh, spec))
@@ -270,151 +275,155 @@ def load_model(model_dir, mesh, max_ctx):
     embed = put(get(f'{prefix}.embed_tokens.weight'), P(None, None))
     final_norm = put(get(f'{prefix}.norm.weight'), P(None))
 
-    # Layer indices: 0-4=sliding, 5=global, 6-10=sliding, 11=global, ...
-    sliding_indices = [i for i in range(NL) if (i + 1) % 6 != 0]  # 50 layers
-    global_indices  = [i for i in range(NL) if (i + 1) % 6 == 0]  # 10 layers
-    assert len(sliding_indices) == 50 and len(global_indices) == 10
+    # Stack all 60 layers with padding to max shapes, quantize large weights to int8
+    print("  stacking 60 layers (padded, int8 quantized)...", file=sys.stderr)
+    matmul_keys = ['qw','kw','vw','ow','gw','uw','dw']
+    bf16_keys = ['qn','kn','ln1','ln2','ln3','ln4','ls']
+    stacked_i8 = {k: [] for k in matmul_keys}
+    stacked_sc = {k+'_s': [] for k in matmul_keys}
+    stacked_bf = {k: [] for k in bf16_keys}
+    stacked_ig = []
 
-    # Stack sliding weights: [10, 5, ...]
-    print("  stacking sliding layers...", file=sys.stderr)
-    s_keys = ['sqw','skw','svw','sow','sqn','skn','ln1','ln2','ln3','ln4','gw','uw','dw','ls']
-    s_stacked = {k: [] for k in s_keys}
-    for group in range(N_GROUPS):
-        group_layers = []
-        for j in range(5):
-            layer_idx = sliding_indices[group * 5 + j]
-            lp = f'{prefix}.layers.{layer_idx}'
-            group_layers.append({
-                'sqw': get(f'{lp}.self_attn.q_proj.weight'),
-                'skw': get(f'{lp}.self_attn.k_proj.weight'),
-                'svw': get(f'{lp}.self_attn.v_proj.weight'),
-                'sow': get(f'{lp}.self_attn.o_proj.weight'),
-                'sqn': get(f'{lp}.self_attn.q_norm.weight'),
-                'skn': get(f'{lp}.self_attn.k_norm.weight'),
-                'ln1': get(f'{lp}.input_layernorm.weight'),
-                'ln2': get(f'{lp}.post_attention_layernorm.weight'),
-                'ln3': get(f'{lp}.pre_feedforward_layernorm.weight'),
-                'ln4': get(f'{lp}.post_feedforward_layernorm.weight'),
-                'gw':  get(f'{lp}.mlp.gate_proj.weight'),
-                'uw':  get(f'{lp}.mlp.up_proj.weight'),
-                'dw':  get(f'{lp}.mlp.down_proj.weight'),
-                'ls':  get(f'{lp}.layer_scalar'),
-            })
-        for k in s_keys:
-            s_stacked[k].append(np.stack([gl[k] for gl in group_layers]))
-        if group % 3 == 0:
-            print(f"    sliding group {group}", file=sys.stderr)
+    for i in range(NL):
+        lp = f'{prefix}.layers.{i}'
+        is_global = LAYER_IS_GLOBAL[i]
 
-    # Stack to [10, 5, ...] and shard
-    s_sharding = {
-        'sqw': P(None, None, 'tp', None),  # [10,5,S_Q_DIM,H]
-        'skw': P(None, None, 'tp', None),
-        'svw': P(None, None, 'tp', None),
-        'sow': P(None, None, None, 'tp'),
-        'sqn': P(None, None, None),
-        'skn': P(None, None, None),
-        'ln1': P(None, None, None),
-        'ln2': P(None, None, None),
-        'ln3': P(None, None, None),
-        'ln4': P(None, None, None),
-        'gw':  P(None, None, 'tp', None),
-        'uw':  P(None, None, 'tp', None),
-        'dw':  P(None, None, None, 'tp'),
-        'ls':  P(None, None, None),
+        qw = to_np_bf16(get(f'{lp}.self_attn.q_proj.weight'))
+        kw = to_np_bf16(get(f'{lp}.self_attn.k_proj.weight'))
+        ow = to_np_bf16(get(f'{lp}.self_attn.o_proj.weight'))
+
+        if has(f'{lp}.self_attn.v_proj.weight'):
+            vw = to_np_bf16(get(f'{lp}.self_attn.v_proj.weight'))
+        else:
+            vw = np.zeros((MAX_KV, H), dtype=ml_dtypes.bfloat16)
+
+        gw = to_np_bf16(get(f'{lp}.mlp.gate_proj.weight'))
+        uw = to_np_bf16(get(f'{lp}.mlp.up_proj.weight'))
+        dw = to_np_bf16(get(f'{lp}.mlp.down_proj.weight'))
+
+        raw = {'qw': pad_to(qw, (MAX_Q, H)), 'kw': pad_to(kw, (MAX_KV, H)),
+               'vw': pad_to(vw, (MAX_KV, H)), 'ow': pad_to(ow, (H, MAX_O)),
+               'gw': gw, 'uw': uw, 'dw': dw}
+        for k in matmul_keys:
+            w_i8, sc = quantize_int8_perchannel(raw[k])
+            stacked_i8[k].append(w_i8)
+            stacked_sc[k+'_s'].append(sc)
+
+        stacked_bf['qn'].append(pad_to(to_np_bf16(get(f'{lp}.self_attn.q_norm.weight')), (MAX_NORM_HD,)))
+        stacked_bf['kn'].append(pad_to(to_np_bf16(get(f'{lp}.self_attn.k_norm.weight')), (MAX_NORM_HD,)))
+        stacked_bf['ln1'].append(to_np_bf16(get(f'{lp}.input_layernorm.weight')))
+        stacked_bf['ln2'].append(to_np_bf16(get(f'{lp}.post_attention_layernorm.weight')))
+        stacked_bf['ln3'].append(to_np_bf16(get(f'{lp}.pre_feedforward_layernorm.weight')))
+        stacked_bf['ln4'].append(to_np_bf16(get(f'{lp}.post_feedforward_layernorm.weight')))
+        stacked_bf['ls'].append(to_np_bf16(get(f'{lp}.layer_scalar')) if has(f'{lp}.layer_scalar') else np.array([1.0], dtype=ml_dtypes.bfloat16))
+        stacked_ig.append(np.array(is_global, dtype=np.int32))
+
+        if i % 15 == 0:
+            print(f"    layer {i}", file=sys.stderr)
+
+    # Sharding for int8 weights (same partition axes as bf16)
+    i8_sharding = {
+        'qw': P(None, 'tp', None), 'kw': P(None, 'tp', None), 'vw': P(None, 'tp', None),
+        'ow': P(None, None, 'tp'), 'gw': P(None, 'tp', None), 'uw': P(None, 'tp', None),
+        'dw': P(None, None, 'tp'),
     }
-    sliding_xs = {}
-    for k in s_keys:
-        arr = np.stack(s_stacked[k])
-        sliding_xs[k] = put(arr, s_sharding[k])
-        print(f"    s/{k}: {arr.shape}", file=sys.stderr)
-
-    # Sliding KV caches: [10, 5, max_ctx, S_KV_DIM]
-    zero_skc = jnp.zeros((N_GROUPS, 5, max_ctx, S_KV_DIM), dtype=jnp.bfloat16)
-    zero_svc = jnp.zeros((N_GROUPS, 5, max_ctx, S_KV_DIM), dtype=jnp.bfloat16)
-    sliding_xs['skc'] = jax.device_put(zero_skc, NamedSharding(mesh, P(None, None, None, 'tp')))
-    sliding_xs['svc'] = jax.device_put(zero_svc, NamedSharding(mesh, P(None, None, None, 'tp')))
-
-    # Stack global weights: [10, ...]
-    print("  stacking global layers...", file=sys.stderr)
-    g_keys = ['gqw','gkw','gow','gqn','gkn','ln1','ln2','ln3','ln4','gw','uw','dw','ls']
-    g_stacked = {k: [] for k in g_keys}
-    for gi, layer_idx in enumerate(global_indices):
-        lp = f'{prefix}.layers.{layer_idx}'
-        g_stacked['gqw'].append(get(f'{lp}.self_attn.q_proj.weight'))
-        g_stacked['gkw'].append(get(f'{lp}.self_attn.k_proj.weight'))
-        g_stacked['gow'].append(get(f'{lp}.self_attn.o_proj.weight'))
-        g_stacked['gqn'].append(get(f'{lp}.self_attn.q_norm.weight'))
-        g_stacked['gkn'].append(get(f'{lp}.self_attn.k_norm.weight'))
-        g_stacked['ln1'].append(get(f'{lp}.input_layernorm.weight'))
-        g_stacked['ln2'].append(get(f'{lp}.post_attention_layernorm.weight'))
-        g_stacked['ln3'].append(get(f'{lp}.pre_feedforward_layernorm.weight'))
-        g_stacked['ln4'].append(get(f'{lp}.post_feedforward_layernorm.weight'))
-        g_stacked['gw'].append(get(f'{lp}.mlp.gate_proj.weight'))
-        g_stacked['uw'].append(get(f'{lp}.mlp.up_proj.weight'))
-        g_stacked['dw'].append(get(f'{lp}.mlp.down_proj.weight'))
-        g_stacked['ls'].append(get(f'{lp}.layer_scalar'))
-
-    g_sharding = {
-        'gqw': P(None, 'tp', None),
-        'gkw': P(None, 'tp', None),
-        'gow': P(None, None, 'tp'),
-        'gqn': P(None, None),
-        'gkn': P(None, None),
-        'ln1': P(None, None),
-        'ln2': P(None, None),
-        'ln3': P(None, None),
-        'ln4': P(None, None),
-        'gw':  P(None, 'tp', None),
-        'uw':  P(None, 'tp', None),
-        'dw':  P(None, None, 'tp'),
-        'ls':  P(None, None),
+    sc_sharding = {
+        'qw_s': P(None, 'tp'), 'kw_s': P(None, 'tp'), 'vw_s': P(None, 'tp'),
+        'ow_s': P(None, None), 'gw_s': P(None, 'tp'), 'uw_s': P(None, 'tp'),
+        'dw_s': P(None, None),
     }
-    global_xs = {}
-    for k in g_keys:
-        arr = np.stack(g_stacked[k])
-        global_xs[k] = put(arr, g_sharding[k])
-        print(f"    g/{k}: {arr.shape}", file=sys.stderr)
 
-    # Global KV caches: [10, max_ctx, G_KV_DIM]
-    zero_gkc = jnp.zeros((N_GROUPS, max_ctx, G_KV_DIM), dtype=jnp.bfloat16)
-    zero_gvc = jnp.zeros((N_GROUPS, max_ctx, G_KV_DIM), dtype=jnp.bfloat16)
-    global_xs['gkc'] = jax.device_put(zero_gkc, NamedSharding(mesh, P(None, None, 'tp')))
-    global_xs['gvc'] = jax.device_put(zero_gvc, NamedSharding(mesh, P(None, None, 'tp')))
+    def put_i8(arr, spec):
+        return jax.device_put(jnp.array(arr, dtype=jnp.int8), NamedSharding(mesh, spec))
 
-    # Combine into groups pytree: {'sliding': {...}, 'global': {...}}
-    groups = {'sliding': sliding_xs, 'global': global_xs}
+    weights = {}
+    for k in matmul_keys:
+        arr = np.stack(stacked_i8[k])
+        weights[k] = put_i8(arr, i8_sharding[k])
+        print(f"    {k}: {arr.shape} int8", file=sys.stderr)
+        sc_arr = np.stack(stacked_sc[k+'_s'])
+        weights[k+'_s'] = put(sc_arr, sc_sharding[k+'_s'])
+    for k in bf16_keys:
+        arr = np.stack(stacked_bf[k])
+        weights[k] = put(arr, P(None, None))
+        print(f"    {k}: {arr.shape} bf16", file=sys.stderr)
+    weights['ig'] = jax.device_put(jnp.array(np.array(stacked_ig)), NamedSharding(mesh, P(None)))
 
-    del all_t, s_stacked, g_stacked
+    kv_sh = NamedSharding(mesh, P(None, None, 'tp'))
+    caches = {
+        'kc': jax.device_put(jnp.zeros((NL, max_ctx, MAX_KV), dtype=jnp.bfloat16), kv_sh),
+        'vc': jax.device_put(jnp.zeros((NL, max_ctx, MAX_KV), dtype=jnp.bfloat16), kv_sh),
+    }
+
+    del all_t, stacked_i8, stacked_sc, stacked_bf
     print("  done loading", file=sys.stderr)
-    return embed, final_norm, groups
+    return embed, final_norm, weights, caches
 
 # ── main ──
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--model-dir', required=True)
-    parser.add_argument('--max-tokens', type=int, default=32)
-    parser.add_argument('--max-ctx', type=int, default=2048)
-    parser.add_argument('--prompt', default='2')
-    args = parser.parse_args()
 
-    mesh = make_mesh()
-    print(f"mesh: {mesh}", file=sys.stderr)
+def load_tokenizer(model_dir):
+    tok_path = os.path.join(model_dir, 'tokenizer.json')
+    if os.path.exists(tok_path):
+        from tokenizers import Tokenizer
+        return Tokenizer.from_file(tok_path)
+    return None
 
-    max_ctx = args.max_ctx
-    embed, final_norm, groups = load_model(args.model_dir, mesh, max_ctx)
+def run_perplexity(args, mesh, embed, final_norm, weights, caches, cos_s, sin_s, cos_g, sin_g):
+    tokenizer = load_tokenizer(args.model_dir)
+    if tokenizer is None:
+        print("ERROR: no tokenizer.json found", file=sys.stderr)
+        return
 
-    cos_s, sin_s = precompute_rope(10000.0, S_HD, max_ctx)   # (max_ctx, 128)
-    cos_g, sin_g = precompute_rope(1000000.0, 128, max_ctx)   # (max_ctx, 64) partial rot
-    cos_s = jax.device_put(jnp.array(cos_s), NamedSharding(mesh, P(None, None)))
-    sin_s = jax.device_put(jnp.array(sin_s), NamedSharding(mesh, P(None, None)))
-    cos_g = jax.device_put(jnp.array(cos_g), NamedSharding(mesh, P(None, None)))
-    sin_g = jax.device_put(jnp.array(sin_g), NamedSharding(mesh, P(None, None)))
+    if args.ppl_file:
+        with open(args.ppl_file) as f:
+            text = f.read()
+    else:
+        text = "The quick brown fox jumps over the lazy dog. In the beginning was the Word, and the Word was with God, and the Word was God. He was in the beginning with God. All things were made through him, and without him was not any thing made that was made. In him was life, and the life was the light of men. The light shines in the darkness, and the darkness has not overcome it."
 
+    token_ids = tokenizer.encode(text).ids
+    max_tokens = min(len(token_ids), args.max_ctx - 1)
+    token_ids = [2] + token_ids[:max_tokens]  # BOS + text
+    print(f"perplexity eval: {len(token_ids)} tokens", file=sys.stderr)
+
+    fwd_jit = jax.jit(forward, donate_argnums=(6,))
+    total_nll = 0.0
+    n_tokens = 0
+    t_start = time.time()
+
+    for step in range(len(token_ids) - 1):
+        tok_arr = jnp.array([token_ids[step]], dtype=jnp.int32)
+        pos = jnp.int32(step)
+        ctx = jnp.int32(step + 1)
+
+        next_tok, log_probs, caches = fwd_jit(
+            tok_arr, pos, ctx, embed, final_norm, weights, caches, cos_s, sin_s, cos_g, sin_g)
+
+        target = token_ids[step + 1]
+        nll = -float(log_probs[0, target])
+        total_nll += nll
+        n_tokens += 1
+
+        if step % 50 == 0:
+            ppl_so_far = float(np.exp(total_nll / max(n_tokens, 1)))
+            elapsed = time.time() - t_start
+            tps = n_tokens / max(elapsed, 0.01)
+            print(f"  step {step}/{len(token_ids)-1} nll={nll:.3f} ppl={ppl_so_far:.2f} ({tps:.1f} tok/s)", file=sys.stderr)
+
+    avg_nll = total_nll / n_tokens
+    ppl = float(np.exp(avg_nll))
+    elapsed = time.time() - t_start
+    print(file=sys.stderr)
+    print(f"=== Perplexity ===", file=sys.stderr)
+    print(f"tokens:     {n_tokens}", file=sys.stderr)
+    print(f"avg NLL:    {avg_nll:.4f}", file=sys.stderr)
+    print(f"perplexity: {ppl:.2f}", file=sys.stderr)
+    print(f"time:       {elapsed:.1f}s ({n_tokens/elapsed:.1f} tok/s)", file=sys.stderr)
+
+def run_generate(args, mesh, embed, final_norm, weights, caches, cos_s, sin_s, cos_g, sin_g):
     prompt_ids = [int(x.strip()) for x in args.prompt.split(',')]
     print(f"prompt: {len(prompt_ids)} tokens {prompt_ids[:10]}", file=sys.stderr)
 
-    fwd_jit = jax.jit(forward)
-
+    fwd_jit = jax.jit(forward, donate_argnums=(6,))
     generated = []
     last_sampled = None
     total_steps = len(prompt_ids) + args.max_tokens
@@ -431,20 +440,10 @@ def main():
         tok_arr = jnp.array([token_id], dtype=jnp.int32)
 
         t0 = time.time()
-        next_tok, scan_out = fwd_jit(
-            tok_arr, pos, ctx, embed, final_norm, groups, cos_s, sin_s, cos_g, sin_g)
+        next_tok, _log_probs, caches = fwd_jit(
+            tok_arr, pos, ctx, embed, final_norm, weights, caches, cos_s, sin_s, cos_g, sin_g)
         next_tok.block_until_ready()
         dt = time.time() - t0
-
-        # Update KV caches from scan output
-        groups = {
-            'sliding': {**groups['sliding'],
-                        'skc': scan_out['s']['skc'],
-                        'svc': scan_out['s']['svc']},
-            'global':  {**groups['global'],
-                        'gkc': scan_out['g']['gkc'],
-                        'gvc': scan_out['g']['gvc']},
-        }
 
         sampled = int(next_tok[0])
         last_sampled = sampled
@@ -474,8 +473,37 @@ def main():
         decode_time = total - ttft
         tps = len(generated) / decode_time
         print(f"decode tok/s:     {tps:.1f}", file=sys.stderr)
+        print(f"ms/token:         {decode_time/len(generated)*1000:.1f}", file=sys.stderr)
     print(f"total time:       {total:.1f}s", file=sys.stderr)
     print(f"generated:        {generated[:20]}", file=sys.stderr)
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--model-dir', required=True)
+    parser.add_argument('--max-tokens', type=int, default=32)
+    parser.add_argument('--max-ctx', type=int, default=2048)
+    parser.add_argument('--prompt', default='2')
+    parser.add_argument('--perplexity', action='store_true')
+    parser.add_argument('--ppl-file', default=None)
+    args = parser.parse_args()
+
+    mesh = make_mesh()
+    print(f"mesh: {mesh}", file=sys.stderr)
+
+    max_ctx = args.max_ctx
+    embed, final_norm, weights, caches = load_model(args.model_dir, mesh, max_ctx)
+
+    cos_s, sin_s = precompute_rope(10000.0, S_HD, max_ctx)
+    cos_g, sin_g = precompute_rope(1000000.0, 128, max_ctx)
+    cos_s = jax.device_put(jnp.array(cos_s), NamedSharding(mesh, P(None, None)))
+    sin_s = jax.device_put(jnp.array(sin_s), NamedSharding(mesh, P(None, None)))
+    cos_g = jax.device_put(jnp.array(cos_g), NamedSharding(mesh, P(None, None)))
+    sin_g = jax.device_put(jnp.array(sin_g), NamedSharding(mesh, P(None, None)))
+
+    if args.perplexity:
+        run_perplexity(args, mesh, embed, final_norm, weights, caches, cos_s, sin_s, cos_g, sin_g)
+    else:
+        run_generate(args, mesh, embed, final_norm, weights, caches, cos_s, sin_s, cos_g, sin_g)
 
 if __name__ == '__main__':
     main()
