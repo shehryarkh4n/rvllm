@@ -3259,9 +3259,12 @@ name = "rvllm-xla"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "clap",
  "half",
  "libloading 0.8.9",
+ "rand 0.8.5",
  "rvllm-core",
+ "serde_json",
  "thiserror 2.0.18",
  "tracing",
 ]

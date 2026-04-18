@@ -19,6 +19,7 @@ NAME_TO_FILE = {
     "quantize_activation_fp8": "quantize_activation_fp8.ptx",
     "fused_lm_head_argmax": "fused_lm_head_argmax.ptx",
     "embedding_gather": "embedding_gather.ptx",
+    "embedding_gather_f16": "embedding_gather_f16.ptx",
 }
 
 

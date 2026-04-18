@@ -17,6 +17,10 @@ path = "src/main.rs"
 name = "rvllm-eval"
 path = "src/bin/rvllm_eval.rs"
 
+[[bin]]
+name = "rvllm-ppl"
+path = "src/bin/rvllm_ppl.rs"
+
 [features]
 default = []
 cuda = ["rvllm-runtime/cuda", "rvllm-fused/cuda", "rvllm-mem/cuda", "dep:cudarc"]

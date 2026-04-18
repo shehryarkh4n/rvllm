@@ -60,6 +60,13 @@ impl CapturedGraph {
             return Err(graph_err(GraphError::CaptureFailed, bucket));
         }
         body_res?;
+        let mut num_nodes: usize = 0;
+        let _ = cuGraphGetNodes(raw, std::ptr::null_mut(), &mut num_nodes);
+        if num_nodes == 0 {
+            eprintln!("[graph] WARNING: captured graph has 0 nodes (bucket={bucket})");
+        } else {
+            eprintln!("[graph] captured {num_nodes} nodes (bucket={bucket})");
+        }
         let mut exec: CUgraphExec = core::ptr::null_mut();
         let r = cuGraphInstantiateWithFlags(&mut exec, raw, 0);
         let _ = cuGraphDestroy(raw);

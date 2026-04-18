@@ -69,7 +69,7 @@ impl ModelArch {
         let rope_theta = v["rope_theta"].as_f64().unwrap_or(10000.0) as f32;
         let max_position_embeddings =
             v["max_position_embeddings"].as_u64().unwrap_or(2048) as usize;
-        let attention_bias = v["attention_bias"].as_bool().unwrap_or(true);
+        let attention_bias = v["attention_bias"].as_bool().unwrap_or(false);
         let layer_types_val = v["layer_types"].as_array()
             .or_else(|| v["text_config"]["layer_types"].as_array());
         let layer_types: Vec<LayerAttnType> = match layer_types_val {

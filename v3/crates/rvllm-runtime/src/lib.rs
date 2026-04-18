@@ -15,7 +15,7 @@ pub mod layer_exec;
 pub mod sched_state;
 pub mod scheduler;
 
-pub use bring_up::{Bringup, EnginePaths, FusedModules};
+pub use bring_up::{Bringup, EnginePaths, FusedModules, PplResult};
 pub use engine::{Engine, PendingStep, StepOutput};
 pub use layer_exec::{forward, LayerDims};
 pub use sched_state::{ReqState, Request};

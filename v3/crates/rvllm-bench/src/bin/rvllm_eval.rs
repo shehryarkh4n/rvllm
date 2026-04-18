@@ -83,11 +83,11 @@ fn run() -> Result<(), String> {
     // Load embedding_gather kernel (not loaded by default bring_up).
     let embed_mod = br
         .kernels
-        .load_ptx("embedding_gather")
-        .map_err(|e| format!("load embedding_gather: {e}"))?;
+        .load_ptx("embedding_gather_f16")
+        .map_err(|e| format!("load embedding_gather_f16: {e}"))?;
     let fn_embed = embed_mod
-        .get_function("embedding_gather_kernel")
-        .map_err(|e| format!("get embedding_gather_kernel: {e}"))?;
+        .get_function("embedding_gather_f16_kernel")
+        .map_err(|e| format!("get embedding_gather_f16_kernel: {e}"))?;
 
     // -- run generation (all unsafe: raw device pointers) --
     let output_ids = unsafe { generate(&br, fn_embed, &prompt_ids, max_new) }
@@ -253,6 +253,7 @@ unsafe fn generate(
         rms_eps: 1e-6,
     };
     let kernels = layer_exec::LayerKernels {
+        fused_rmsnorm: br.fused_modules.fn_rmsnorm,
         fused_add_rmsnorm: br.fused_modules.fn_add_rmsnorm,
         fused_rope_cache_fp8kv: br.fused_modules.fn_rope_cache_fp8kv,
         fused_silu_mul: br.fused_modules.fn_silu_mul,
@@ -278,7 +279,7 @@ unsafe fn generate(
                 attn_norm_gamma: layer.input_layernorm.offset_bytes,
                 qkv_fp8: layer.qkv.offset_bytes,
                 qkv_scale: layer.qkv.scale_ptr,
-                qkv_bias: layer.qkv_bias.offset_bytes,
+                qkv_bias: layer.qkv_bias.as_ref().map_or(0, |b| b.offset_bytes),
                 o_fp8: layer.o_proj.offset_bytes,
                 o_scale: layer.o_proj.scale_ptr,
                 mlp_norm_gamma: layer.post_attention_layernorm.offset_bytes,
@@ -322,6 +323,7 @@ unsafe fn generate(
                 dims, &kernels, &w, &scratch, &meta, plans,
                 &br.cutlass, &br.cublaslt, &br.fa3,
                 residual_ptr, stream, phase,
+                br.arch.layer_types[layer_idx],
             ).map_err(|e| e.to_string())?;
         }
         // Final norm + LM head + argmax (only for decode, prefill skips).

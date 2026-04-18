@@ -51,6 +51,16 @@ footer{margin-top:4rem;padding-top:1.5rem;border-top:1px solid #151515;color:#66
 .badge.measured{background:rgba(132,230,183,0.15);color:#84E6B7;border:1px solid rgba(132,230,183,0.35)}
 .badge.estimate{background:rgba(232,210,109,0.12);color:#e8d26d;border:1px solid rgba(232,210,109,0.32)}
 .badge.future{background:rgba(154,133,217,0.13);color:#b6a1e5;border:1px solid rgba(154,133,217,0.32)}
+td.pending{color:#b6a1e5;font-style:italic}
+.mm-table thead th{font-size:0.72rem}
+.mm-table td.model-name{font-weight:600;color:#fff}
+.mm-table .delta-col{font-size:0.78rem}
+.tpu-progress{background:#0a0d12;border:1px solid #1f2630;border-radius:10px;padding:1rem 1.2rem;margin:0.8rem 0}
+.tpu-progress .step{display:flex;align-items:center;gap:0.6rem;padding:0.3rem 0;font-size:0.86rem;color:#ccc}
+.tpu-progress .step .dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.tpu-progress .step .dot.done{background:#84E6B7}
+.tpu-progress .step .dot.active{background:#e8d26d}
+.tpu-progress .step .dot.todo{background:#555}
 </style>
 </head>
 <body>
@@ -58,7 +68,7 @@ footer{margin-top:4rem;padding-top:1.5rem;border-top:1px solid #151515;color:#66
 
 <header>
   <h1>rvLLM 0.3.0 &mdash; benchmark results</h1>
-  <div class="sub">Qwen2.5-7B-Instruct, FP8 E4M3 weights + FP8 E4M3 KV cache, H100 SXM 80GB, single GPU. rvLLM 0.3.0 (Rust) vs vLLM 0.19 V1 (Python).</div>
+  <div class="sub">Multi-model FP8 inference on H100 SXM 80GB. rvLLM 0.3.0 (Rust) vs vLLM 0.19 V1 (Python). Models: OPT-1.3B, Mistral-7B, Qwen3-8B, Qwen2.5-7B &mdash; all FP8 dynamic quant, 16 in / 512 out tokens.</div>
   <div class="meta">
     <a href="index.html">site</a>
     <a href="https://github.com/m0at/rvllm">github</a>
@@ -113,6 +123,72 @@ footer{margin-top:4rem;padding-top:1.5rem;border-top:1px solid #151515;color:#66
 <tr class="rvllm-win"><td>512</td><td class="r"><strong>43,780</strong></td><td class="r">31,485</td><td class="r pos"><strong>rvLLM +39.0%</strong></td></tr>
 </tbody>
 </table>
+
+<h2>Multi-model throughput <span class="sub">vLLM baselines + rvLLM results across architectures</span></h2>
+
+<div class="note">
+  <strong>Expanding beyond Qwen2.5-7B.</strong> The table below shows vLLM baselines for four model families (all FP8 dynamic quant, 16 in / 512 out tokens, H100 SXM 80GB) alongside confirmed rvLLM results where available. Sweeps are running; results will be filled in as they land.
+</div>
+
+<div class="chart-box">
+  <div class="chart-title"><strong>Multi-model tok/s comparison at N=128</strong> &mdash; higher is better
+    <div class="note">vLLM 0.19 V1, FP8 dynamic quant. rvLLM where measured. OPT-1.3B rvLLM blocked on FA3 head_dim=64 support.</div>
+  </div>
+  <div id="chart-multimodel" style="height:300px"></div>
+</div>
+
+<h3>vLLM baselines <span class="badge measured">Measured</span></h3>
+<table class="mm-table">
+<thead><tr><th>N</th><th class="r">OPT-1.3B</th><th class="r">Mistral-7B</th><th class="r">Qwen3-8B</th><th class="r">Qwen2.5-7B <span class="badge estimate">Est</span></th></tr></thead>
+<tbody>
+<tr><td>1</td><td class="r">577</td><td class="r">239</td><td class="r">212</td><td class="r">~230</td></tr>
+<tr><td>8</td><td class="r">4,135</td><td class="r">1,839</td><td class="r">1,629</td><td class="r">~1,800</td></tr>
+<tr><td>16</td><td class="r">6,869</td><td class="r">3,564</td><td class="r">3,246</td><td class="r">~3,500</td></tr>
+<tr><td>64</td><td class="r">17,122</td><td class="r">11,733</td><td class="r">10,388</td><td class="r">~11,150</td></tr>
+<tr><td>128</td><td class="r">23,102</td><td class="r">17,878</td><td class="r">16,406</td><td class="r">~17,780</td></tr>
+<tr><td>256</td><td class="r">27,372</td><td class="r">25,085</td><td class="r">22,842</td><td class="r">~24,260</td></tr>
+<tr><td>512</td><td class="r">26,621</td><td class="r">28,274</td><td class="r">27,965</td><td class="r">~31,530</td></tr>
+</tbody>
+</table>
+<div class="footnote"><strong>Note:</strong> Qwen2.5-7B vLLM numbers are estimates (~) extrapolated from our existing measured run at slightly different config. OPT-1.3B, Mistral-7B, and Qwen3-8B are fresh measured baselines.</div>
+
+<h3>rvLLM results <span class="badge measured">Measured</span> <span class="badge future">Sweeps pending</span></h3>
+<table class="mm-table">
+<thead><tr><th>N</th><th class="r">OPT-1.3B</th><th class="r">Mistral-7B</th><th class="r">Qwen3-8B</th><th class="r">Qwen2.5-7B</th></tr></thead>
+<tbody>
+<tr><td>1</td><td class="r pending">blocked</td><td class="r pending">pending</td><td class="r">119</td><td class="r">137</td></tr>
+<tr><td>8</td><td class="r pending">blocked</td><td class="r pending">pending</td><td class="r">988</td><td class="r">1,096</td></tr>
+<tr><td>16</td><td class="r pending">blocked</td><td class="r pending">pending</td><td class="r pending">pending</td><td class="r">2,313</td></tr>
+<tr><td>64</td><td class="r pending">blocked</td><td class="r pending">pending</td><td class="r pending">pending</td><td class="r"><strong>12,528</strong></td></tr>
+<tr><td>128</td><td class="r pending">blocked</td><td class="r pending">pending</td><td class="r">17,306</td><td class="r"><strong>22,339</strong></td></tr>
+<tr><td>256</td><td class="r pending">blocked</td><td class="r pending">pending</td><td class="r pending">pending</td><td class="r"><strong>32,129</strong></td></tr>
+<tr><td>512</td><td class="r pending">blocked</td><td class="r pending">pending</td><td class="r pending">pending</td><td class="r"><strong>43,780</strong></td></tr>
+</tbody>
+</table>
+
+<div class="note">
+  <strong>Status by model:</strong><br>
+  <strong>Qwen2.5-7B</strong> &mdash; full sweep complete. rvLLM wins at N&ge;64 (+12% to +39%).<br>
+  <strong>Qwen3-8B</strong> &mdash; graph capture fix working. N=1 (119), N=8 (988), N=128 (17,306) confirmed. Remaining batch sizes running.<br>
+  <strong>Mistral-7B</strong> &mdash; loader fix just deployed, sweep pending.<br>
+  <strong>Qwen3-1.7B</strong> &mdash; sweep pending.<br>
+  <strong>OPT-1.3B</strong> &mdash; blocked: FA3 does not support head_dim=64. Requires FA3 update or fallback to FA2.
+</div>
+
+<h3>Head-to-head: rvLLM vs vLLM where both are measured</h3>
+<table class="mm-table">
+<thead><tr><th>Model</th><th>N</th><th class="r">rvLLM</th><th class="r">vLLM</th><th class="r">&Delta;</th></tr></thead>
+<tbody>
+<tr class="rvllm-win"><td class="model-name">Qwen2.5-7B</td><td>128</td><td class="r"><strong>22,339</strong></td><td class="r">~17,780</td><td class="r pos"><strong>rvLLM +25.6%</strong></td></tr>
+<tr class="rvllm-win"><td class="model-name">Qwen2.5-7B</td><td>512</td><td class="r"><strong>43,780</strong></td><td class="r">~31,530</td><td class="r pos"><strong>rvLLM +38.8%</strong></td></tr>
+<tr class="rvllm-win"><td class="model-name">Qwen3-8B</td><td>128</td><td class="r"><strong>17,306</strong></td><td class="r">16,406</td><td class="r pos"><strong>rvLLM +5.5%</strong></td></tr>
+<tr class="vllm-win"><td class="model-name">Qwen3-8B</td><td>1</td><td class="r">119</td><td class="r">212</td><td class="r neg">vLLM +78.2%</td></tr>
+<tr class="vllm-win"><td class="model-name">Qwen3-8B</td><td>8</td><td class="r">988</td><td class="r">1,629</td><td class="r neg">vLLM +64.9%</td></tr>
+</tbody>
+</table>
+<div class="footnote"><strong>Pattern holds across models:</strong> vLLM leads at small batch (N&le;16) due to rvLLM's per-step CUDA graph launch overhead on skinny GEMMs. rvLLM catches up and surpasses at N&ge;64&ndash;128 where the compute-bound regime favors its tighter kernel dispatch and lower framework overhead.</div>
+
+<h2>Qwen2.5-7B detailed results <span class="sub">original single-model sweep</span> <span class="badge measured">Measured</span></h2>
 
 <h2>Time-to-first-token <span class="sub">prompt &rarr; first sampled token visible on host</span> <span class="badge measured">Measured</span></h2>
 <div class="chart-box">
@@ -449,6 +525,34 @@ footer{margin-top:4rem;padding-top:1.5rem;border-top:1px solid #151515;color:#66
 <strong>TPU e2e bench</strong>: OPT-1.3B loaded via <code>FlaxOPTForCausalLM.from_pretrained("facebook/opt-1.3b", from_pt=True, dtype=jnp.bfloat16)</code> on a Cloud TPU v6e-4 in <code>us-east5-a</code>. Each N: warmup (2 tokens), TTFT (1 token generate), throughput (128 token generate). JAX 0.6.2, transformers, torch CPU for weight conversion. VM torn down after bench. Qwen2.5-7B was attempted but has no Flax model class; vLLM-on-TPU was attempted but blocked by torch_xla/libtpu version matrix (vLLM 0.19 needs torch 2.10 + tpu_inference, which aren't co-installable on the v2-alpha-tpuv6e VM image yet).
 </div>
 
+<h2 class="section">TPU / XLA &mdash; Rust PJRT path <span class="sub">direct Rust &rarr; PJRT, no Python, no JAX</span> <span class="badge future">In progress</span></h2>
+
+<div class="note">
+  <strong>Goal:</strong> match JAX kernel latencies through a direct Rust &rarr; PJRT C API path, eliminating Python and JAX from the inference stack entirely. This is the rvLLM-XLA backend.
+</div>
+
+<div class="tpu-progress">
+  <div class="step"><span class="dot done"></span> PJRT C API FFI &mdash; compile working</div>
+  <div class="step"><span class="dot done"></span> Buffer upload to TPU device working</div>
+  <div class="step"><span class="dot active"></span> Execute fix deployed, testing pending (waiting for TPU VM capacity)</div>
+  <div class="step"><span class="dot todo"></span> End-to-end decode step through Rust PJRT</div>
+  <div class="step"><span class="dot todo"></span> Full model inference loop</div>
+</div>
+
+<h3>JAX baseline latencies (target to match) <span class="badge measured">Measured</span></h3>
+<table>
+<thead><tr><th>Operation</th><th class="r">JAX latency (&mu;s)</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td>cast_fp (fp32 &rarr; bf16)</td><td class="r">117</td><td>dispatch floor on v6e</td></tr>
+<tr><td>rms_norm</td><td class="r">122</td><td>128x4096 fp32</td></tr>
+<tr><td>gemm_bf16</td><td class="r">120</td><td>M=128 N=K=4096</td></tr>
+</tbody>
+</table>
+
+<div class="note">
+  <strong>Why this matters.</strong> The JAX kernel latencies above (117&ndash;122 &mu;s) are dominated by XLA host-to-device dispatch overhead, not compute. If rvLLM's Rust PJRT path can match these numbers, it proves the Rust FFI adds no overhead versus JAX's Python &rarr; XLA path. The real win comes later: persistent PJRT sessions eliminate per-call dispatch and should push latencies below the JAX floor for fused megakernels.
+</div>
+
 <h2>Method &mdash; how these runs were produced</h2>
 <div class="method">
 <strong>rvLLM 0.3.0</strong> (tag <code>v0.3.0</code>, commit <code>82b1f59</code>):<br>
@@ -561,6 +665,32 @@ Reported throughput = tool's <code>Output token throughput (tok/s)</code>. Repor
     { n: 8192,  measured: null,  projected: 130000 },
     { n: 16384, measured: null,  projected: 150000 }
   ];
+
+  // Multi-model comparison at N=128 (the batch size where we have the most cross-model data)
+  const multiModelData = [
+    { model: 'OPT-1.3B', vllm: 23102, rvllm: null },
+    { model: 'Mistral-7B', vllm: 17878, rvllm: null },
+    { model: 'Qwen3-8B', vllm: 16406, rvllm: 17306 },
+    { model: 'Qwen2.5-7B', vllm: 17780, rvllm: 22339 }
+  ];
+
+  function MultiModel(){
+    return e(R.ResponsiveContainer, { width:'100%', height:'100%' },
+      e(R.BarChart, { data: multiModelData, margin: { top: 24, right: 24, left: 18, bottom: 8 } },
+        e(R.CartesianGrid, { stroke: '#1a1f28', strokeDasharray: '3 3' }),
+        e(R.XAxis, { dataKey: 'model', stroke: '#ccc', tick: { fill: '#ddd', fontSize: 12 } }),
+        e(R.YAxis, { stroke: '#666', tickFormatter: v => v.toLocaleString(), label: { value: 'tok/s @ N=128', angle: -90, position: 'insideLeft', fill: '#888', fontSize: 11 } }),
+        e(R.Tooltip, { contentStyle: { background:'#0b0f17', border:'1px solid #1f2833', color:'#f5f5f5' }, formatter: (v, name) => v == null ? 'pending' : v.toLocaleString() + ' tok/s' }),
+        e(R.Legend, { wrapperStyle: { paddingTop: 8 } }),
+        e(R.Bar, { dataKey: 'vllm', name: 'vLLM 0.19', fill: '#5a8bd4' },
+          e(R.LabelList, { dataKey: 'vllm', position: 'top', fill: '#8eb0e0', fontSize: 10, formatter: v => v ? v.toLocaleString() : '' })
+        ),
+        e(R.Bar, { dataKey: 'rvllm', name: 'rvLLM 0.3.0', fill: '#84E6B7' },
+          e(R.LabelList, { dataKey: 'rvllm', position: 'top', fill: '#b5f3d2', fontSize: 10, formatter: v => v ? v.toLocaleString() : 'pending' })
+        )
+      )
+    );
+  }
 
   function Throughput(){
     return e(R.ResponsiveContainer, { width:'100%', height:'100%' },
@@ -774,6 +904,7 @@ Reported throughput = tool's <code>Output token throughput (tok/s)</code>. Repor
     );
   }
 
+  ReactDOM.createRoot(document.getElementById('chart-multimodel')).render(e(MultiModel));
   ReactDOM.createRoot(document.getElementById('chart-throughput')).render(e(Throughput));
   ReactDOM.createRoot(document.getElementById('chart-ttft')).render(e(Ttft));
   ReactDOM.createRoot(document.getElementById('chart-nsys')).render(e(Nsys));

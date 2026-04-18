@@ -301,47 +301,33 @@ pub const OFFSET_CLIENT_DEVICES: usize = fn_offset(15);
 pub const OFFSET_CLIENT_COMPILE: usize = fn_offset(20);
 pub const OFFSET_CLIENT_BUFFER_FROM_HOST: usize = fn_offset(22);
 
-// LoadedExecutable_Execute is further down. In pjrt_c_api.h after the
-// LoadedExecutable block. The exact index depends on API version.
-// For PJRT API v0.54+:
-//  23: PJRT_Device_Id
-//  ...through various Device/Memory/Executable functions...
-//  ~47: PJRT_LoadedExecutable_Execute
-//  We use the known offset. Counting from pjrt_c_api.h:
-//  23-28: Device functions (6)
-//  29-32: Memory functions (4)
-//  33-40: Executable functions (8)
-//  41: PJRT_LoadedExecutable_Destroy
-//  42: PJRT_LoadedExecutable_GetExecutable
-//  43: PJRT_LoadedExecutable_Delete
-//  44: PJRT_LoadedExecutable_IsDeleted
-//  45: PJRT_LoadedExecutable_Execute
-//  46: PJRT_LoadedExecutable_GetCostAnalysis
-//  47+: Buffer functions
-//  BufferToHostBuffer is around index 53-55 depending on version.
+// Counted from pjrt_c_api.h (openxla/xla). Indices verified against all
+// 9 known-good offsets (fn[0]..fn[22]). The original count was off by
+// 10 for everything past index 22 -- missed the DeviceDescription group
+// (6 fields, indices 23-28) and the Memory group (5 fields, 29-33)
+// which shifted Executable/LoadedExecutable/Buffer blocks forward.
+//
+// Verified layout (PJRT API v0.69, struct_size=944, 113 fn ptrs):
+//  23-28: DeviceDescription (6)       29-33: Device (5)
+//  34: PJRT_Device_MemorySpaces       35-39: Memory (5)
+//  40-47: Executable (8)
+//  48: PJRT_LoadedExecutable_Destroy
+//  49: PJRT_LoadedExecutable_GetExecutable
+//  50: PJRT_LoadedExecutable_Delete
+//  51: PJRT_LoadedExecutable_IsDeleted
+//  52: PJRT_LoadedExecutable_AddressableDevices
+//  53: PJRT_LoadedExecutable_Fingerprint
+//  54: PJRT_LoadedExecutable_GetCostAnalysis
+//  55: PJRT_LoadedExecutable_Execute
+//  56-57: post-Execute LoadedExecutable functions
+//  58: PJRT_Buffer_Destroy
+//  59: PJRT_Buffer_ElementType
+//  60-69: Buffer query functions
+//  70: PJRT_Buffer_ToHostBuffer
 
-pub const OFFSET_LOADED_EXECUTABLE_EXECUTE: usize = fn_offset(45);
-
-// Buffer functions:
-//  After LoadedExecutable block and before TopologicalSort etc.
-//  ~48: PJRT_Buffer_Destroy
-//  ~49: PJRT_Buffer_ElementType
-//  ~50: PJRT_Buffer_Dimensions
-//  ~51: PJRT_Buffer_UnpaddedDimensions
-//  ~52: PJRT_Buffer_DynamicDimensionIndices
-//  ~53: PJRT_Buffer_GetMemoryLayout
-//  ~54: PJRT_Buffer_OnDeviceSizeInBytes
-//  ~55: PJRT_Buffer_Device
-//  ~56: PJRT_Buffer_Memory
-//  ~57: PJRT_Buffer_Delete
-//  ~58: PJRT_Buffer_IsDeleted
-//  ~59: PJRT_Buffer_CopyToDevice
-//  ~60: PJRT_Buffer_ToHostBuffer
-//  ~61: PJRT_Buffer_IsOnCpu
-//  ~62+: more functions
-
-pub const OFFSET_BUFFER_DESTROY: usize = fn_offset(48);
-pub const OFFSET_BUFFER_TO_HOST: usize = fn_offset(60);
+pub const OFFSET_LOADED_EXECUTABLE_EXECUTE: usize = fn_offset(55);
+pub const OFFSET_BUFFER_DESTROY: usize = fn_offset(58);
+pub const OFFSET_BUFFER_TO_HOST: usize = fn_offset(70);
 
 pub struct PjrtApiFns {
     pub plugin_initialize: PjrtPluginInitializeFn,
