@@ -17,17 +17,25 @@
 // Paged, non-split, PackGQA=true (matches vLLM decode path), fp16
 template<> void run_mha_fwd_<90, cutlass::half_t, 128, 128, false, true, false, true>(
     Flash_fwd_params &params, cudaStream_t stream);
+template<> void run_mha_fwd_<90, cutlass::half_t, 256, 256, false, true, false, true>(
+    Flash_fwd_params &params, cudaStream_t stream);
 
 // Paged, split, PackGQA=true (for low-batch high-seqlen), fp16
 template<> void run_mha_fwd_<90, cutlass::half_t, 128, 128, true, true, false, true>(
+    Flash_fwd_params &params, cudaStream_t stream);
+template<> void run_mha_fwd_<90, cutlass::half_t, 256, 256, true, true, false, true>(
     Flash_fwd_params &params, cudaStream_t stream);
 
 // Paged, non-split, PackGQA=true, e4m3 (FP8 KV)
 template<> void run_mha_fwd_<90, cutlass::float_e4m3_t, 128, 128, false, true, false, true>(
     Flash_fwd_params &params, cudaStream_t stream);
+template<> void run_mha_fwd_<90, cutlass::float_e4m3_t, 256, 256, false, true, false, true>(
+    Flash_fwd_params &params, cudaStream_t stream);
 
 // Paged, split, PackGQA=true, e4m3 (FP8 KV)
 template<> void run_mha_fwd_<90, cutlass::float_e4m3_t, 128, 128, true, true, false, true>(
+    Flash_fwd_params &params, cudaStream_t stream);
+template<> void run_mha_fwd_<90, cutlass::float_e4m3_t, 256, 256, true, true, false, true>(
     Flash_fwd_params &params, cudaStream_t stream);
 
 // Combine kernel for split-KV (reduction is fp16 O regardless of Q/K/V dtype)
@@ -41,9 +49,13 @@ void prepare_varlen_num_blocks(Flash_fwd_params &params, cudaStream_t stream,
 // Block sizes for hdim=128, fp16, PagedKVNonTMA=true, non-causal
 static constexpr int kBlockM = 128;
 static constexpr int kBlockN = 128;
+static constexpr int kMaxSupportedHeadDim = 256;
 
 // Round up helper
 static inline int round_multiple(int x, int m) { return (x + m - 1) / m * m; }
+static inline bool supported_head_dim(int head_dim) {
+    return head_dim == 128 || head_dim == 256;
+}
 
 extern "C" int fa3_sm90_workspace_size(
     int batch_size,
@@ -62,7 +74,7 @@ extern "C" int fa3_sm90_workspace_size(
     lse_bytes = round_multiple(lse_bytes, 256);
 
     // oaccum for split: [batch, num_splits, num_heads, head_dim] floats
-    int oaccum_bytes = batch_size * max_num_splits * num_heads * 128 * sizeof(float);
+    int oaccum_bytes = batch_size * max_num_splits * num_heads * kMaxSupportedHeadDim * sizeof(float);
     oaccum_bytes = round_multiple(oaccum_bytes, 256);
 
     // lseaccum for split: [batch, num_splits, num_heads] floats
@@ -102,10 +114,11 @@ static int fa3_sm90_paged_decode_impl(
     float* q_descale_ptr,
     float* k_descale_ptr,
     float* v_descale_ptr,
+    int   window_size_left,  // -1 = full attention, >= 0 = sliding window
     cudaStream_t stream
 ) {
-    if (head_dim != 128) {
-        fprintf(stderr, "fa3_sm90_paged_decode: only head_dim=128 supported, got %d\n", head_dim);
+    if (!supported_head_dim(head_dim)) {
+        fprintf(stderr, "fa3_sm90_paged_decode: only head_dim=128 or 256 supported, got %d\n", head_dim);
         return -1;
     }
 
@@ -129,7 +142,9 @@ static int fa3_sm90_paged_decode_impl(
     int* metadata_ptr = (int*)ws;
     float* lse_ptr = (float*)(ws + metadata_bytes);
     float* oaccum_ptr = (float*)(ws + metadata_bytes + lse_bytes);
-    int oaccum_bytes = round_multiple(batch_size * 128 * num_heads * 128 * (int)sizeof(float), 256);
+    int oaccum_bytes = round_multiple(
+        batch_size * 128 * num_heads * kMaxSupportedHeadDim * (int)sizeof(float), 256
+    );
     float* lseaccum_ptr = (float*)(ws + metadata_bytes + lse_bytes + oaccum_bytes);
 
     // Zero the metadata region (semaphore must start at 0)
@@ -183,9 +198,9 @@ static int fa3_sm90_paged_decode_impl(
     params.h = num_heads;
     params.h_k = num_kv_heads;
     params.d = head_dim;
-    params.d_rounded = 128;
+    params.d_rounded = head_dim;
     params.dv = head_dim;
-    params.dv_rounded = 128;
+    params.dv_rounded = head_dim;
     params.seqlen_q = max_seqlen_q;
     params.seqlen_k = max_blocks_per_seq * block_size;
     params.seqlen_q_rounded = round_multiple(max_seqlen_q, kBlockM);
@@ -239,9 +254,9 @@ static int fa3_sm90_paged_decode_impl(
     // Decode: seqlen_q == 1, non-causal (query sees all prior KV).
     // Prefill: causal self-attention over Q-then-KV, query t sees K 0..=t.
     params.is_causal = is_causal_prefill;
-    params.is_local = false;
-    params.window_size_left = params.seqlen_k - 1;
-    params.window_size_right = is_causal_prefill ? 0 : 0;  // right=0 in both
+    params.is_local = (window_size_left >= 0);
+    params.window_size_left = (window_size_left >= 0) ? window_size_left : (params.seqlen_k - 1);
+    params.window_size_right = 0;
     params.attention_chunk = 0;
 
     // Architecture
@@ -316,17 +331,33 @@ static int fa3_sm90_paged_decode_impl(
     // the combine kernel is fp16-output only, reused by both.
     if (is_fp8) {
         if (use_split) {
-            run_mha_fwd_<90, cutlass::float_e4m3_t, 128, 128, true, true, false, true>(params, stream);
+            if (head_dim == 128) {
+                run_mha_fwd_<90, cutlass::float_e4m3_t, 128, 128, true, true, false, true>(params, stream);
+            } else {
+                run_mha_fwd_<90, cutlass::float_e4m3_t, 256, 256, true, true, false, true>(params, stream);
+            }
             run_mha_fwd_combine_<cutlass::half_t, float, 128>(params, stream, false);
         } else {
-            run_mha_fwd_<90, cutlass::float_e4m3_t, 128, 128, false, true, false, true>(params, stream);
+            if (head_dim == 128) {
+                run_mha_fwd_<90, cutlass::float_e4m3_t, 128, 128, false, true, false, true>(params, stream);
+            } else {
+                run_mha_fwd_<90, cutlass::float_e4m3_t, 256, 256, false, true, false, true>(params, stream);
+            }
         }
     } else {
         if (use_split) {
-            run_mha_fwd_<90, cutlass::half_t, 128, 128, true, true, false, true>(params, stream);
+            if (head_dim == 128) {
+                run_mha_fwd_<90, cutlass::half_t, 128, 128, true, true, false, true>(params, stream);
+            } else {
+                run_mha_fwd_<90, cutlass::half_t, 256, 256, true, true, false, true>(params, stream);
+            }
             run_mha_fwd_combine_<cutlass::half_t, float, 128>(params, stream, false);
         } else {
-            run_mha_fwd_<90, cutlass::half_t, 128, 128, false, true, false, true>(params, stream);
+            if (head_dim == 128) {
+                run_mha_fwd_<90, cutlass::half_t, 128, 128, false, true, false, true>(params, stream);
+            } else {
+                run_mha_fwd_<90, cutlass::half_t, 256, 256, false, true, false, true>(params, stream);
+            }
         }
     }
 
@@ -352,6 +383,7 @@ int fa3_sm90_paged_decode(
     int   block_size,
     int   max_blocks_per_seq,
     int   num_blocks_total,
+    int   window_size_left,
     cudaStream_t stream
 ) {
     return fa3_sm90_paged_decode_impl(
@@ -363,6 +395,7 @@ int fa3_sm90_paged_decode(
         block_size, max_blocks_per_seq, num_blocks_total,
         /*is_fp8=*/false, /*is_causal_prefill=*/false,
         /*q_descale=*/nullptr, /*k_descale=*/nullptr, /*v_descale=*/nullptr,
+        window_size_left,
         stream);
 }
 
@@ -388,6 +421,7 @@ int fa3_sm90_paged_decode_fp8(
     int   block_size,
     int   max_blocks_per_seq,
     int   num_blocks_total,
+    int   window_size_left,
     cudaStream_t stream
 ) {
     return fa3_sm90_paged_decode_impl(
@@ -399,6 +433,7 @@ int fa3_sm90_paged_decode_fp8(
         block_size, max_blocks_per_seq, num_blocks_total,
         /*is_fp8=*/true, /*is_causal_prefill=*/false,
         q_descale_ptr, k_descale_ptr, v_descale_ptr,
+        window_size_left,
         stream);
 }
 
@@ -428,6 +463,7 @@ int fa3_sm90_paged_prefill_fp8(
     int   block_size,
     int   max_blocks_per_seq,
     int   num_blocks_total,
+    int   window_size_left,
     cudaStream_t stream
 ) {
     return fa3_sm90_paged_decode_impl(
@@ -439,6 +475,7 @@ int fa3_sm90_paged_prefill_fp8(
         block_size, max_blocks_per_seq, num_blocks_total,
         /*is_fp8=*/true, /*is_causal_prefill=*/true,
         q_descale_ptr, k_descale_ptr, v_descale_ptr,
+        window_size_left,
         stream);
 }
 

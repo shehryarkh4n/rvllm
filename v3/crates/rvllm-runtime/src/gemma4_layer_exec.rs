@@ -130,7 +130,8 @@ pub unsafe fn gemma4_forward(
     scratch: &Gemma4LayerScratch,
     meta: &Gemma4MetadataPtrs,
     cublaslt: &CublasLt,
-    fa3: &Fa3Kernels,
+    sliding_attention: &Fa3Kernels,
+    global_attention: &Fa3Kernels,
     residual: u64,
     stream: u64,
 ) -> Result<()> {
@@ -216,10 +217,20 @@ pub unsafe fn gemma4_forward(
         stream,
     )?;
 
-    // 5. FA3 attention (head_dim=256)
+    // 5. Attention backend selection:
+    //    - sliding layers: FA3 SM90 at head_dim=256
+    //    - global layers: fallback paged attention at head_dim=512
     // For sliding layers: context_lens should be clamped to
     // min(real_ctx, sliding_window) by the scheduler before this call.
-    let decode = PagedDecodeFp8Launcher::new(fa3);
+    let attention = match dims.layer_type {
+        Gemma4LayerType::SlidingAttention => sliding_attention,
+        Gemma4LayerType::GlobalAttention => global_attention,
+    };
+    let decode = PagedDecodeFp8Launcher::new(attention);
+    let window_size_left: i32 = match dims.layer_type {
+        Gemma4LayerType::SlidingAttention => (dims.sliding_window as i32) - 1,
+        Gemma4LayerType::GlobalAttention => -1,
+    };
     let decode_params = PagedDecodeParams {
         num_seqs: dims.num_tokens,
         num_heads: dims.num_heads,
@@ -229,6 +240,7 @@ pub unsafe fn gemma4_forward(
         max_blocks_per_seq: dims.max_blocks_per_seq,
         num_blocks_total: dims.num_blocks_total,
         scale: dims.attn_scale,
+        window_size_left,
     };
     decode.launch(
         decode_params,

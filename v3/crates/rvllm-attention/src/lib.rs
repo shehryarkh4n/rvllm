@@ -6,7 +6,7 @@
 //! the `.so` is missing or not in the manifest.
 //!
 //! The invariants:
-//! - `head_dim == 128` hard gate at construction (`AttentionError::UnsupportedHeadDim`)
+//! - `head_dim` must be one of `{128, 256, 512}` at construction
 //! - GQA ratio sanity (`num_heads` divisible by `num_kv_heads`)
 //! - context_lens[i] == 0 valid padded-slot marker; kernel must predicate
 
@@ -17,6 +17,8 @@ pub use decode::{PagedDecodeFp8Launcher, PagedDecodeLauncher, PagedDecodeParams}
 pub use prefill::{PagedPrefillFp8Launcher, PagedPrefillLauncher, PagedPrefillParams};
 
 use rvllm_core::{AttentionError, AttnCtx, Result, RvllmError};
+
+const SUPPORTED_HEAD_DIMS: &[u32] = &[128, 256, 512];
 
 /// Runtime-constructed wrapper around `libfa3_kernels.so`. The wrapper
 /// refuses to exist if the .so is missing or its manifest-verified
@@ -48,6 +50,7 @@ pub(crate) type PagedDecodeFn = unsafe extern "C" fn(
     block_size: i32,
     max_blocks_per_seq: i32,
     num_blocks_total: i32,
+    window_size_left: i32,
     stream: *mut std::ffi::c_void,
 ) -> i32;
 
@@ -75,6 +78,7 @@ pub(crate) type PagedDecodeFp8Fn = unsafe extern "C" fn(
     block_size: i32,
     max_blocks_per_seq: i32,
     num_blocks_total: i32,
+    window_size_left: i32,
     stream: *mut std::ffi::c_void,
 ) -> i32;
 
@@ -105,6 +109,7 @@ pub(crate) type PagedPrefillFp8Fn = unsafe extern "C" fn(
     block_size: i32,
     max_blocks_per_seq: i32,
     num_blocks_total: i32,
+    window_size_left: i32,
     stream: *mut std::ffi::c_void,
 ) -> i32;
 
@@ -143,11 +148,11 @@ impl Fa3Kernels {
                 bt: std::backtrace::Backtrace::capture(),
             });
         }
-        if head_dim != 128 {
+        if !SUPPORTED_HEAD_DIMS.contains(&head_dim) {
             return Err(RvllmError::Attention {
                 err: AttentionError::UnsupportedHeadDim {
                     got: head_dim,
-                    required: 128,
+                    supported: SUPPORTED_HEAD_DIMS,
                 },
                 ctx: AttnCtx {
                     op: "Fa3Kernels::load",
@@ -250,7 +255,7 @@ mod tests {
     }
 
     #[test]
-    fn non_128_head_dim_rejected() {
+    fn unsupported_head_dim_rejected() {
         // use a real-ish path so the missing-so check doesn't fire first
         let tmp = std::env::temp_dir().join("fa3-fake.so");
         std::fs::write(&tmp, b"fake").unwrap();

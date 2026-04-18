@@ -7,6 +7,8 @@
 
 use rvllm_core::{AttentionError, AttnCtx, Result, RvllmError};
 
+const SUPPORTED_HEAD_DIMS: &[u32] = &[128, 256, 512];
+
 /// Parameters for one paged decode launch.
 #[derive(Copy, Clone, Debug)]
 pub struct PagedDecodeParams {
@@ -18,6 +20,7 @@ pub struct PagedDecodeParams {
     pub max_blocks_per_seq: u32,
     pub num_blocks_total: u32,
     pub scale: f32,
+    pub window_size_left: i32, // -1 = full, >= 0 = sliding window
 }
 
 impl PagedDecodeParams {
@@ -28,11 +31,11 @@ impl PagedDecodeParams {
             num_seqs: self.num_seqs,
             head_dim: self.head_dim,
         };
-        if self.head_dim != 128 {
+        if !SUPPORTED_HEAD_DIMS.contains(&self.head_dim) {
             return Err(RvllmError::Attention {
                 err: AttentionError::UnsupportedHeadDim {
                     got: self.head_dim,
-                    required: 128,
+                    supported: SUPPORTED_HEAD_DIMS,
                 },
                 ctx: ctx(),
                 bt: std::backtrace::Backtrace::capture(),
@@ -60,7 +63,7 @@ impl PagedDecodeParams {
 }
 
 /// Launcher. Construction from `&Fa3Kernels` guarantees the .so is
-/// loaded and head_dim is 128.
+/// loaded and head_dim is supported by the backend.
 pub struct PagedDecodeLauncher<'a> {
     fa3: &'a super::Fa3Kernels,
 }
@@ -109,6 +112,7 @@ impl<'a> PagedDecodeLauncher<'a> {
                 params.block_size as i32,
                 params.max_blocks_per_seq as i32,
                 params.num_blocks_total as i32,
+                params.window_size_left,
                 stream as *mut std::ffi::c_void,
             );
             if rc != 0 {
@@ -195,6 +199,7 @@ impl<'a> PagedDecodeFp8Launcher<'a> {
                 params.block_size as i32,
                 params.max_blocks_per_seq as i32,
                 params.num_blocks_total as i32,
+                params.window_size_left,
                 stream as *mut std::ffi::c_void,
             );
             if rc != 0 {
@@ -258,5 +263,21 @@ mod tests {
     #[test]
     fn accepts_qwen_shape() {
         assert!(good().validate().is_ok());
+    }
+
+    #[test]
+    fn accepts_head_dim_256() {
+        let mut p = good();
+        p.head_dim = 256;
+        p.scale = 1.0 / (256f32).sqrt();
+        assert!(p.validate().is_ok());
+    }
+
+    #[test]
+    fn accepts_head_dim_512() {
+        let mut p = good();
+        p.head_dim = 512;
+        p.scale = 1.0 / (512f32).sqrt();
+        assert!(p.validate().is_ok());
     }
 }

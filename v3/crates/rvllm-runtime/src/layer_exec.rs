@@ -314,6 +314,7 @@ pub unsafe fn forward_phase(
                 max_blocks_per_seq: dims.max_blocks_per_seq,
                 num_blocks_total: dims.num_blocks_total,
                 scale: dims.attn_scale,
+                window_size_left: -1,
             };
             decode.launch(
                 decode_params,
@@ -351,6 +352,7 @@ pub unsafe fn forward_phase(
                 max_blocks_per_seq: dims.max_blocks_per_seq,
                 num_blocks_total: dims.num_blocks_total,
                 scale: dims.attn_scale,
+                window_size_left: -1,
             };
             prefill.launch(
                 prefill_params,

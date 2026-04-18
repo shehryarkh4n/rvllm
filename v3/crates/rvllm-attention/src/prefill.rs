@@ -6,6 +6,8 @@
 
 use rvllm_core::{AttentionError, AttnCtx, Result, RvllmError};
 
+const SUPPORTED_HEAD_DIMS: &[u32] = &[128, 256, 512];
+
 #[derive(Copy, Clone, Debug)]
 pub struct PagedPrefillParams {
     pub num_tokens: u32,
@@ -17,6 +19,7 @@ pub struct PagedPrefillParams {
     pub max_blocks_per_seq: u32,
     pub num_blocks_total: u32,
     pub scale: f32,
+    pub window_size_left: i32,
 }
 
 impl PagedPrefillParams {
@@ -27,11 +30,11 @@ impl PagedPrefillParams {
             num_seqs: self.num_seqs,
             head_dim: self.head_dim,
         };
-        if self.head_dim != 128 {
+        if !SUPPORTED_HEAD_DIMS.contains(&self.head_dim) {
             return Err(RvllmError::Attention {
                 err: AttentionError::UnsupportedHeadDim {
                     got: self.head_dim,
-                    required: 128,
+                    supported: SUPPORTED_HEAD_DIMS,
                 },
                 ctx: ctx(),
                 bt: std::backtrace::Backtrace::capture(),
@@ -153,6 +156,7 @@ impl<'a> PagedPrefillFp8Launcher<'a> {
                 params.block_size as i32,
                 params.max_blocks_per_seq as i32,
                 params.num_blocks_total as i32,
+                params.window_size_left,
                 stream as *mut std::ffi::c_void,
             );
             if rc != 0 {
@@ -200,5 +204,21 @@ mod tests {
             scale: 1.0,
         };
         assert!(p.validate().is_err());
+    }
+
+    #[test]
+    fn prefill_accepts_head_dim_256() {
+        let p = PagedPrefillParams {
+            num_tokens: 256,
+            num_seqs: 4,
+            num_heads: 28,
+            num_kv_heads: 4,
+            head_dim: 256,
+            block_size: 64,
+            max_blocks_per_seq: 33,
+            num_blocks_total: 1024,
+            scale: 1.0 / (256f32).sqrt(),
+        };
+        assert!(p.validate().is_ok());
     }
 }

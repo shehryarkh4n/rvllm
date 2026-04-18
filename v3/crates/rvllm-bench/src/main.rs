@@ -17,7 +17,9 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
+use rvllm_core::{ModelArch as HfModelArch, ModelConfig};
 use rvllm_runtime::{Bringup, EnginePaths};
+use rvllm_runtime::gemma4_bring_up::{Gemma4Bringup, Gemma4EnginePaths};
 
 fn env_path(k: &str) -> Result<PathBuf, String> {
     std::env::var(k)
@@ -30,6 +32,15 @@ fn env_u32(k: &str, default: u32) -> u32 {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(default)
+}
+
+fn is_gemma4_model_dir(model_dir: &std::path::Path) -> Result<bool, String> {
+    Ok(matches!(
+        ModelConfig::load_hf(model_dir)
+            .map_err(|e| format!("config parse {}: {e}", model_dir.display()))?
+            .architecture,
+        HfModelArch::Gemma4
+    ))
 }
 
 fn main() {
@@ -69,6 +80,35 @@ fn run() -> Result<(), String> {
     eprintln!("kernels_dir = {}", paths.kernels_dir.display());
     eprintln!("batch       = {batch}");
     eprintln!("iters       = {iters} (warmup {warmup})");
+
+    let is_gemma4 = is_gemma4_model_dir(&paths.model_dir)?;
+
+    if is_gemma4 {
+        eprintln!("== Gemma 4 detected, using Gemma4Bringup ==");
+        let g4_paths = Gemma4EnginePaths {
+            model_dir: paths.model_dir,
+            kernels_dir: paths.kernels_dir,
+            cutlass_so: paths.cutlass_so,
+            fa3_so: paths.fa3_so,
+            policy_json: paths.policy_json,
+        };
+        let t0 = Instant::now();
+        let g4 = Gemma4Bringup::load(g4_paths, arena_bytes)
+            .map_err(|e| format!("gemma4 bringup: {e}"))?;
+        eprintln!(
+            "bringup: {:.2}s | arch layers={} hidden={} heads={} sliding_kv={} global_kv={}",
+            t0.elapsed().as_secs_f64(),
+            g4.arch.num_hidden_layers,
+            g4.arch.hidden_size,
+            g4.arch.num_attention_heads,
+            g4.arch.num_kv_heads_sliding,
+            g4.arch.num_kv_heads_global,
+        );
+        eprintln!("arena used = {} MiB", g4.arena.used() / (1024 * 1024));
+        let result = unsafe { g4.run_bench(batch, iters, warmup) };
+        print_result(result);
+        return Ok(());
+    }
 
     let t0 = Instant::now();
     let br = Bringup::load(paths, arena_bytes).map_err(|e| format!("bringup: {e}"))?;
