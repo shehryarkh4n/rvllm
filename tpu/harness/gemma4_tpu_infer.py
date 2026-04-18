@@ -24,7 +24,7 @@ NL     = 60
 WINDOW = 1024
 SOFTCAP_VAL = 30.0
 EPS    = 1e-6
-B      = 1
+B      = 1  # batch size; set via --batch flag
 
 # Max shapes across layer types (pad smaller to these)
 MAX_Q  = 16384   # max(8192, 16384)
@@ -202,15 +202,15 @@ def make_decode_loop(num_prompt, total):
     def decode_loop(prompt_ids, embed, final_norm, weights, caches, cos_s, sin_s, cos_g, sin_g):
         generated = jnp.zeros(total, dtype=jnp.int32)
 
-        init_tok = prompt_ids[0:1]
+        init_tok = jnp.broadcast_to(prompt_ids[0:1], (B,))
         init_state = (jnp.int32(0), init_tok, caches, generated)
 
         def prompt_body(state):
             i, tok, caches, gen = state
             _, new_caches = forward_step(
                 tok, i, i + 1, embed, final_norm, weights, caches, cos_s, sin_s, cos_g, sin_g)
-            next_tok = jax.lax.dynamic_slice(prompt_ids, [i + 1], [1])
-            next_tok = jnp.where(i + 1 < num_prompt, next_tok, tok)
+            next_id = jax.lax.dynamic_slice(prompt_ids, [i + 1], [1])
+            next_tok = jnp.where(i + 1 < num_prompt, jnp.broadcast_to(next_id, (B,)), tok)
             return (i + 1, next_tok, new_caches, gen)
 
         def prompt_cond(state):
@@ -511,8 +511,9 @@ def run_fused(args, mesh, embed, final_norm, weights, caches, cos_s, sin_s, cos_
     gen2.block_until_ready()
     pure_time = time.time() - t0
     print(f"pure run:     {pure_time:.3f}s", file=sys.stderr)
-    print(f"tok/s:        {total/pure_time:.1f}", file=sys.stderr)
-    print(f"ms/token:     {pure_time/total*1000:.2f}", file=sys.stderr)
+    print(f"steps/s:      {total/pure_time:.1f}", file=sys.stderr)
+    print(f"tok/s:        {total*B/pure_time:.1f} (B={B})", file=sys.stderr)
+    print(f"ms/step:      {pure_time/total*1000:.2f}", file=sys.stderr)
 
 def run_generate(args, mesh, embed, final_norm, weights, caches, cos_s, sin_s, cos_g, sin_g):
     prompt_ids = [int(x.strip()) for x in args.prompt.split(',')]
@@ -532,7 +533,7 @@ def run_generate(args, mesh, embed, final_norm, weights, caches, cos_s, sin_s, c
             token_id = last_sampled
         pos = jnp.int32(step)
         ctx = jnp.int32(step + 1)
-        tok_arr = jnp.array([token_id], dtype=jnp.int32)
+        tok_arr = jnp.array([token_id] * B, dtype=jnp.int32)
 
         t0 = time.time()
         next_tok, _log_probs, caches = fwd_jit(
@@ -581,7 +582,11 @@ def main():
     parser.add_argument('--perplexity', action='store_true')
     parser.add_argument('--ppl-file', default=None)
     parser.add_argument('--fused', action='store_true', help='On-chip decode loop (zero host overhead)')
+    parser.add_argument('--batch', type=int, default=1, help='Batch size (lockstep decode)')
     args = parser.parse_args()
+
+    global B
+    B = args.batch
 
     mesh = make_mesh()
     print(f"mesh: {mesh}", file=sys.stderr)
