@@ -74,6 +74,10 @@ pub struct Gemma4LayerWeightPtrs {
     pub down_fp8: u64,
     pub down_scale: u64,
     pub layer_scalar_ptr: u64, // [1] f16, per-layer residual multiplier
+    pub qkv_f16: u64,    // 0 = use FP8, nonzero = use F16 GEMM
+    pub o_f16: u64,
+    pub gate_up_f16: u64,
+    pub down_f16: u64,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -227,23 +231,29 @@ pub unsafe fn gemma4_forward(
 
     #[cfg(feature = "cuda")]
     probe!("after_step1_residual", residual, dims.hidden);
+    #[cfg(feature = "cuda")]
+    probe_f32!("step1_hidden_scale", scratch.hidden_scale);
 
-    // 2. Q||K||V projection (cuBLASLt FP8 GEMM -> F32 -> F16)
+    // 2. Q||K||V projection
     #[cfg(feature = "cuda")]
-    cublaslt.fp8_gemm_f32(
-        scratch.hidden_fp8,
-        weights.qkv_fp8,
-        scratch.gemm_f32_tmp,
-        dims.num_tokens as i32,
-        qkv_rows as i32,
-        dims.hidden as i32,
-        scratch.hidden_scale,
-        weights.qkv_scale,
-        stream,
-    )?;
-    #[cfg(feature = "cuda")]
-    gemma4_launcher::Bf16ToF16SatLaunch { n: dims.num_tokens * qkv_rows }
-        .launch(kernels.f32_to_f16_sat, scratch.q_out, scratch.gemm_f32_tmp, stream)?;
+    if weights.qkv_f16 != 0 {
+        // F16 path: copy residual to delta_f16 scratch, apply rmsnorm in-place, use as GEMM input
+        cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
+            scratch.delta_f16, residual, (dims.num_tokens * dims.hidden * 2) as _, stream as _);
+        gemma4_launcher::RmsnormInplaceLaunch {
+            num_tokens: dims.num_tokens, hidden: dims.hidden, eps: dims.rms_eps,
+        }.launch(kernels.fused_rmsnorm, scratch.delta_f16, weights.attn_norm_gamma, stream)?;
+        cublaslt.f16_gemm_f32(scratch.delta_f16, weights.qkv_f16, scratch.gemm_f32_tmp,
+            dims.num_tokens as i32, qkv_rows as i32, dims.hidden as i32, stream)?;
+        gemma4_launcher::Bf16ToF16SatLaunch { n: dims.num_tokens * qkv_rows }
+            .launch(kernels.f32_to_f16_sat, scratch.q_out, scratch.gemm_f32_tmp, stream)?;
+    } else {
+        cublaslt.fp8_gemm_f32(scratch.hidden_fp8, weights.qkv_fp8, scratch.gemm_f32_tmp,
+            dims.num_tokens as i32, qkv_rows as i32, dims.hidden as i32,
+            scratch.hidden_scale, weights.qkv_scale, stream)?;
+        gemma4_launcher::Bf16ToF16SatLaunch { n: dims.num_tokens * qkv_rows }
+            .launch(kernels.f32_to_f16_sat, scratch.q_out, scratch.gemm_f32_tmp, stream)?;
+    }
 
     #[cfg(feature = "cuda")]
     probe!("step2_q_proj", scratch.q_out, dims.hidden);
@@ -385,17 +395,14 @@ pub unsafe fn gemma4_forward(
 
     // 7. O proj -> F32 tmp -> BF16 delta buffer
     #[cfg(feature = "cuda")]
-    cublaslt.fp8_gemm_f32(
-        scratch.attn_out_fp8,
-        weights.o_fp8,
-        scratch.gemm_f32_tmp,
-        dims.num_tokens as i32,
-        dims.hidden as i32,
-        q_dim as i32,
-        scratch.attn_out_scale,
-        weights.o_scale,
-        stream,
-    )?;
+    if weights.o_f16 != 0 {
+        cublaslt.f16_gemm_f32(scratch.attn_out, weights.o_f16, scratch.gemm_f32_tmp,
+            dims.num_tokens as i32, dims.hidden as i32, q_dim as i32, stream)?;
+    } else {
+        cublaslt.fp8_gemm_f32(scratch.attn_out_fp8, weights.o_fp8, scratch.gemm_f32_tmp,
+            dims.num_tokens as i32, dims.hidden as i32, q_dim as i32,
+            scratch.attn_out_scale, weights.o_scale, stream)?;
+    }
     #[cfg(feature = "cuda")]
     gemma4_launcher::Bf16ToF16SatLaunch { n: dims.num_tokens * dims.hidden }
         .launch(kernels.f32_to_bf16, scratch.delta_f16, scratch.gemm_f32_tmp, stream)?;
@@ -445,22 +452,26 @@ pub unsafe fn gemma4_forward(
     #[cfg(feature = "cuda")]
     probe_f32!("step9_gate_up_wscale", weights.gate_up_scale);
 
-    // 10. gate||up projection (cuBLASLt FP8 -> F32 -> F16)
+    // 10. gate||up projection
     #[cfg(feature = "cuda")]
-    cublaslt.fp8_gemm_f32(
-        scratch.hidden_fp8,
-        weights.gate_up_fp8,
-        scratch.gemm_f32_tmp,
-        dims.num_tokens as i32,
-        (2 * dims.intermediate) as i32,
-        dims.hidden as i32,
-        scratch.hidden_scale,
-        weights.gate_up_scale,
-        stream,
-    )?;
-    #[cfg(feature = "cuda")]
-    gemma4_launcher::Bf16ToF16SatLaunch { n: dims.num_tokens * 2 * dims.intermediate }
-        .launch(kernels.f32_to_f16_sat, scratch.gate_up_out, scratch.gemm_f32_tmp, stream)?;
+    if weights.gate_up_f16 != 0 {
+        // F16 path: norm residual into gate_up_out scratch, then F16 GEMM
+        cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
+            scratch.gate_up_out, residual, (dims.num_tokens * dims.hidden * 2) as _, stream as _);
+        gemma4_launcher::RmsnormInplaceLaunch {
+            num_tokens: dims.num_tokens, hidden: dims.hidden, eps: dims.rms_eps,
+        }.launch(kernels.fused_rmsnorm, scratch.gate_up_out, weights.pre_ff_norm_gamma, stream)?;
+        cublaslt.f16_gemm_f32(scratch.gate_up_out, weights.gate_up_f16, scratch.gemm_f32_tmp,
+            dims.num_tokens as i32, (2 * dims.intermediate) as i32, dims.hidden as i32, stream)?;
+        gemma4_launcher::Bf16ToF16SatLaunch { n: dims.num_tokens * 2 * dims.intermediate }
+            .launch(kernels.f32_to_f16_sat, scratch.gate_up_out, scratch.gemm_f32_tmp, stream)?;
+    } else {
+        cublaslt.fp8_gemm_f32(scratch.hidden_fp8, weights.gate_up_fp8, scratch.gemm_f32_tmp,
+            dims.num_tokens as i32, (2 * dims.intermediate) as i32, dims.hidden as i32,
+            scratch.hidden_scale, weights.gate_up_scale, stream)?;
+        gemma4_launcher::Bf16ToF16SatLaunch { n: dims.num_tokens * 2 * dims.intermediate }
+            .launch(kernels.f32_to_f16_sat, scratch.gate_up_out, scratch.gemm_f32_tmp, stream)?;
+    }
 
     #[cfg(feature = "cuda")]
     probe!("step10_gate_up_out", scratch.gate_up_out, dims.intermediate);
@@ -482,6 +493,7 @@ pub unsafe fn gemma4_forward(
     probe_f32!("step11_mlp_out_scale", scratch.mlp_out_scale);
 
     // 12. Down proj -> F32 tmp -> BF16 delta buffer
+    // (F16 bypass not supported here -- GELU*mul outputs FP8, so down_proj stays FP8)
     #[cfg(feature = "cuda")]
     cublaslt.fp8_gemm_f32(
         scratch.mlp_out_fp8,

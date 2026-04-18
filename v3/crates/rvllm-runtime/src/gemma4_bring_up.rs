@@ -331,6 +331,10 @@ impl Gemma4Bringup {
                     down_fp8: layer.down_proj.offset_bytes,
                     down_scale: layer.down_proj.scale_ptr,
                     layer_scalar_ptr: layer.layer_scalar.offset_bytes,
+                    qkv_f16: layer.qkv_f16.as_ref().map_or(0, |w| w.offset_bytes),
+                    o_f16: layer.o_proj_f16.as_ref().map_or(0, |w| w.offset_bytes),
+                    gate_up_f16: layer.gate_up_f16.as_ref().map_or(0, |w| w.offset_bytes),
+                    down_f16: layer.down_proj_f16.as_ref().map_or(0, |w| w.offset_bytes),
                 };
 
                 let scratch = Gemma4LayerScratch {
@@ -632,6 +636,10 @@ impl Gemma4Bringup {
                     down_fp8: layer.down_proj.offset_bytes,
                     down_scale: layer.down_proj.scale_ptr,
                     layer_scalar_ptr: layer.layer_scalar.offset_bytes,
+                    qkv_f16: layer.qkv_f16.as_ref().map_or(0, |w| w.offset_bytes),
+                    o_f16: layer.o_proj_f16.as_ref().map_or(0, |w| w.offset_bytes),
+                    gate_up_f16: layer.gate_up_f16.as_ref().map_or(0, |w| w.offset_bytes),
+                    down_f16: layer.down_proj_f16.as_ref().map_or(0, |w| w.offset_bytes),
                 };
 
                 let scratch = Gemma4LayerScratch {
