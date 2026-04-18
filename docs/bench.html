@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>rvLLM 0.3.0 - Gemma 4 31B Benchmarks</title>
+<title>rvLLM 0.3.0 - 31B Gemma 4 Benchmarks</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 html{font-size:16px;-webkit-font-smoothing:antialiased}
@@ -93,14 +93,42 @@ footer{margin-top:4rem;padding-top:1.5rem;border-top:1px solid #1a1a1a;color:#88
 .gpu-pipeline .step-desc code{background:#151c28;color:#b0d4ff;padding:1px 5px;border-radius:3px;font-size:0.78rem;font-family:ui-monospace,Menlo,Consolas,monospace}
 
 .divider{border:none;border-top:1px solid #1a1a1a;margin:3rem 0}
+
+.filter-bar{display:flex;gap:0.4rem;margin:1.5rem 0 0.5rem}
+.filter-btn{
+  padding:0.55rem 1.4rem;
+  background:linear-gradient(180deg,#14181f,#0e1118);
+  border:1px solid #252d3a;
+  border-radius:8px;
+  color:#a0a8b4;
+  font-size:0.88rem;font-weight:500;
+  letter-spacing:0.01em;
+  cursor:pointer;
+  transition:all 0.15s ease;
+  font-family:inherit;
+}
+.filter-btn:hover{
+  background:linear-gradient(180deg,#1c2230,#141a24);
+  color:#d0d8e0;
+  border-color:#3a4558;
+}
+.filter-btn.active{
+  background:linear-gradient(180deg,#1a3028,#122420);
+  border-color:#84E6B7;
+  color:#84E6B7;
+  box-shadow:0 0 10px rgba(132,230,183,0.12);
+}
+
+.section-block{transition:opacity 0.2s ease}
+.section-block.hidden{display:none}
 </style>
 </head>
 <body>
 <div class="wrap">
 
 <header>
-  <h1>rvLLM 0.3.0 Featuring 31B Gemma 4</h1>
-  <div class="sub">LLM inference engine benchmarks for <strong>Gemma 4 31B</strong>. TPU path: JAX+XLA on v6e-4 - <strong>13,943 tok/s</strong> (int8, B=768, TP=4 SPMD, PPL 25.51). GPU path: Rust+CUDA on H100 - 16-launch fused pipeline with FP8 quantization.</div>
+  <h1>rvLLM 0.3.0 - Featuring 31B Gemma 4</h1>
+  <div class="sub">LLM inference engine benchmarks for <strong>31B Gemma 4</strong>. TPU path: JAX+XLA on v6e-4 - <strong>13,943 tok/s</strong> (int8, B=768, TP=4 SPMD, PPL 25.51). GPU path: Rust+CUDA on H100 - 16-launch fused pipeline with FP8 quantization.</div>
   <div class="nav-buttons">
     <a href="index.html">Home</a>
     <a href="https://github.com/m0at/rvllm">GitHub</a>
@@ -109,9 +137,11 @@ footer{margin-top:4rem;padding-top:1.5rem;border-top:1px solid #1a1a1a;color:#88
   </div>
 </header>
 
-<!-- ============================================================ -->
-<!-- HERO STATS                                                    -->
-<!-- ============================================================ -->
+<div class="filter-bar">
+  <button class="filter-btn active" onclick="filterView('both')">Both</button>
+  <button class="filter-btn" onclick="filterView('tpu')">TPU</button>
+  <button class="filter-btn" onclick="filterView('gpu')">GPU</button>
+</div>
 
 <div class="pill-row">
   <div class="pill">
@@ -137,11 +167,9 @@ footer{margin-top:4rem;padding-top:1.5rem;border-top:1px solid #1a1a1a;color:#88
 </div>
 
 
-<!-- ============================================================ -->
-<!-- TPU RESULTS                                                   -->
-<!-- ============================================================ -->
+<div id="section-tpu" class="section-block">
 
-<h2 class="section">TPU: Gemma 4 31B <span class="sub">v6e-4, JAX+XLA, int8 quantized</span> <span class="badge measured">Measured</span></h2>
+<h2 class="section">TPU: 31B Gemma 4 <span class="sub">v6e-4, JAX+XLA, int8 quantized</span> <span class="badge measured">Measured</span></h2>
 
 <div class="note-box">
   <strong>No custom kernels.</strong> The entire forward pass is ~500 lines of JAX. XLA compiles it to a single fused while loop on 4 TPU v6e chips. Zero Python in the hot path - the decode loop runs entirely on-chip via <code>jax.lax.while_loop</code>.
@@ -150,7 +178,7 @@ footer{margin-top:4rem;padding-top:1.5rem;border-top:1px solid #1a1a1a;color:#88
 <h3>Batch scaling sweep</h3>
 <div class="chart-box">
   <div class="chart-title"><strong>Throughput vs batch size</strong> - higher is better
-    <div class="note">Gemma 4 31B, int8 weights, v6e-4 (4 chips, 128 GB HBM, ~3.3 TB/s). LIBTPU flags enabled for batched runs.</div>
+    <div class="note">31B Gemma 4, int8 weights, v6e-4 (4 chips, 128 GB HBM, ~3.3 TB/s). LIBTPU flags enabled for batched runs.</div>
   </div>
   <div id="chart-tpu-scaling" style="height:340px"></div>
 </div>
@@ -173,7 +201,7 @@ footer{margin-top:4rem;padding-top:1.5rem;border-top:1px solid #1a1a1a;color:#88
 
 <h3>TPU vs GPU cost comparison</h3>
 <div class="chart-box">
-  <div class="chart-title"><strong>Gemma 4 31B: TPU vs GPU at peak throughput</strong>
+  <div class="chart-title"><strong>31B Gemma 4: TPU vs GPU at peak throughput</strong>
     <div class="note">GPU projections based on HBM bandwidth scaling from measured v6e data. H100/H200 numbers are estimates.</div>
   </div>
   <div id="chart-tpu-vs-gpu" style="height:300px"></div>
@@ -193,7 +221,7 @@ footer{margin-top:4rem;padding-top:1.5rem;border-top:1px solid #1a1a1a;color:#88
 <h3>Optimization progression</h3>
 <div class="chart-box">
   <div class="chart-title"><strong>Zero to 13,943 tok/s in a single session</strong>
-    <div class="note">Each bar represents a concrete optimization step applied to the same Gemma 4 31B model on TPU v6e-4.</div>
+    <div class="note">Each bar represents a concrete optimization step applied to the same 31B Gemma 4 model on TPU v6e-4.</div>
   </div>
   <div id="chart-progression" style="height:320px"></div>
 </div>
@@ -255,20 +283,19 @@ No Docker. No conda. No torch. No vLLM. One pip install, one Python file, ~500 l
 </div>
 
 
-<hr class="divider">
+</div>
 
+<hr class="divider section-divider">
 
-<!-- ============================================================ -->
-<!-- GPU RESULTS                                                   -->
-<!-- ============================================================ -->
+<div id="section-gpu" class="section-block">
 
-<h2 class="section">GPU: Gemma 4 31B <span class="sub">H100 SXM, Rust+CUDA, FP8</span></h2>
+<h2 class="section">GPU: 31B Gemma 4 <span class="sub">H100 SXM, Rust+CUDA, FP8</span></h2>
 
 <div class="note-box">
   <strong>Gemma 4 architecture on GPU.</strong> The v3 GPU path implements a 16-kernel-launch fused pipeline for Gemma 4's unique dual-attention architecture (50 sliding-window + 10 global layers). All 60 layers captured in a single CUDA graph. FP8 E4M3 weights quantized at load with calibrated per-tensor scales.
 </div>
 
-<h3>Gemma 4 31B forward pass (16 launches per layer)</h3>
+<h3>31B Gemma 4 forward pass (16 launches per layer)</h3>
 <div class="gpu-pipeline">
   <span class="step-num">1.</span><span class="step-desc"><code>fused_rmsnorm_fp8_quant</code> - input layernorm + FP8 quantize</span>
   <span class="step-num">2.</span><span class="step-desc"><code>fp8_gemm</code> - fused Q||K||V projection</span>
@@ -304,16 +331,13 @@ No Docker. No conda. No torch. No vLLM. One pip install, one Python file, ~500 l
 </table>
 
 <div class="caveat">
-  <strong>GPU perplexity validation in progress.</strong> The GPU forward pass for Gemma 4 31B is implemented and runs end-to-end. Perplexity validation against the TPU baseline (25.51) is actively being debugged - tracking logit softcap and F32 precision through lm_head GEMM. Throughput numbers will be posted once perplexity is confirmed correct.
+  <strong>GPU perplexity validation in progress.</strong> The GPU forward pass for 31B Gemma 4 is implemented and runs end-to-end. Perplexity validation against the TPU baseline (25.51) is actively being debugged - tracking logit softcap and F32 precision through lm_head GEMM. Throughput numbers will be posted once perplexity is confirmed correct.
 </div>
 
 
-<hr class="divider">
+</div>
 
-
-<!-- ============================================================ -->
-<!-- METHOD                                                        -->
-<!-- ============================================================ -->
+<hr class="divider section-divider">
 
 <h2 class="section">Method</h2>
 <div class="method-box">
@@ -326,7 +350,7 @@ Perplexity: measured on a short text passage, compared against HuggingFace <code
 
 <strong>GPU pipeline</strong> (v3 codebase, Rust + CUDA):<br>
 Hardware: H100 SXM 80 GB.<br>
-Model: Gemma 4 31B, FP8 E4M3 weights (per-tensor scale at load), FP8 E4M3 KV cache (calibrated scales).<br>
+Model: 31B Gemma 4, FP8 E4M3 weights (per-tensor scale at load), FP8 E4M3 KV cache (calibrated scales).<br>
 Forward: 16 kernel launches per layer, 60 layers + lm_head + argmax = ~963 launches per step, captured in a single <code>cuGraphLaunch</code>.<br>
 Kernels: CUTLASS FP8 GEMMs (SM90), FlashAttention-3, custom fused ops (RMSNorm+quant, RoPE+KV, GELU*mul+quant, logit softcap).<br>
 </div>
@@ -458,6 +482,32 @@ Kernels: CUTLASS FP8 GEMMs (SM90), FlashAttention-3, custom fused ops (RMSNorm+q
   ReactDOM.createRoot(document.getElementById('chart-progression')).render(e(Progression));
   ReactDOM.createRoot(document.getElementById('chart-xprof')).render(e(Xprof));
 })();
+</script>
+
+<script>
+function filterView(mode) {
+  var tpu = document.getElementById('section-tpu');
+  var gpu = document.getElementById('section-gpu');
+  var dividers = document.querySelectorAll('.section-divider');
+  var btns = document.querySelectorAll('.filter-btn');
+
+  btns.forEach(function(b){ b.classList.remove('active'); });
+  event.currentTarget.classList.add('active');
+
+  if (mode === 'both') {
+    tpu.classList.remove('hidden');
+    gpu.classList.remove('hidden');
+    dividers.forEach(function(d){ d.classList.remove('hidden'); });
+  } else if (mode === 'tpu') {
+    tpu.classList.remove('hidden');
+    gpu.classList.add('hidden');
+    dividers.forEach(function(d){ d.classList.add('hidden'); });
+  } else if (mode === 'gpu') {
+    tpu.classList.add('hidden');
+    gpu.classList.remove('hidden');
+    dividers.forEach(function(d){ d.classList.add('hidden'); });
+  }
+}
 </script>
 </body>
 </html>
