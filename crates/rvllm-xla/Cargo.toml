@@ -38,3 +38,8 @@ required-features = ["tpu"]
 name = "infer-tpu"
 path = "src/bin/infer_tpu.rs"
 required-features = ["tpu"]
+
+[[bin]]
+name = "infer-gemma4-tpu"
+path = "src/bin/infer_gemma4_tpu.rs"
+required-features = ["tpu"]

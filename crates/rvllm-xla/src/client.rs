@@ -10,6 +10,12 @@ use tracing::info;
 use crate::ffi::*;
 use crate::{LLMError, Result};
 
+#[derive(Debug, Clone)]
+pub struct DeviceInfo {
+    pub index: usize,
+    pub local_hardware_id: i32,
+}
+
 pub struct PjrtClientInner {
     _lib: Library,
     fns: PjrtApiFns,
@@ -154,6 +160,33 @@ impl PjrtClientHandle {
 
     pub fn num_devices(&self) -> usize {
         self.inner.devices.len()
+    }
+
+    pub fn get_devices(&self) -> Result<Vec<DeviceInfo>> {
+        let mut infos = Vec::with_capacity(self.inner.devices.len());
+        for (idx, &device) in self.inner.devices.iter().enumerate() {
+            let hw_id = unsafe {
+                let mut args = PJRT_Device_LocalHardwareId_Args {
+                    struct_size: std::mem::size_of::<PJRT_Device_LocalHardwareId_Args>(),
+                    extension_start: ptr::null_mut(),
+                    device,
+                    local_hardware_id: -1,
+                };
+                let err = (self.inner.fns.device_local_hardware_id)(&mut args);
+                if !err.is_null() {
+                    let msg = extract_error_message(&self.inner.fns, err);
+                    return Err(LLMError::GpuError(format!(
+                        "PJRT_Device_LocalHardwareId failed for device {idx}: {msg}"
+                    )));
+                }
+                args.local_hardware_id
+            };
+            infos.push(DeviceInfo {
+                index: idx,
+                local_hardware_id: hw_id,
+            });
+        }
+        Ok(infos)
     }
 
     pub fn compile(&self, mlir_text: &str) -> Result<CompiledExecutable> {
@@ -338,6 +371,155 @@ impl PjrtClientHandle {
                 raw,
             })
             .collect();
+
+        Ok(results)
+    }
+
+    /// Execute across multiple devices. Each element of `per_device_inputs` is the
+    /// argument list for one device. Returns a flat Vec of output buffers: all outputs
+    /// from device 0, then device 1, etc.
+    pub fn execute_multi(
+        &self,
+        exe: &CompiledExecutable,
+        per_device_inputs: &[Vec<&PjrtBufferHandle>],
+    ) -> Result<Vec<PjrtBufferHandle>> {
+        self.execute_multi_inner(exe, per_device_inputs, &[])
+    }
+
+    /// Execute with buffer donation. `donated_input_indices` lists input positions
+    /// whose buffers the runtime may reuse for outputs (avoiding a device-side copy).
+    /// All indices NOT in `donated_input_indices` are marked non-donatable.
+    /// Single-device only. For multi-device + donation, use `execute_multi_with_donation`.
+    pub fn execute_with_donation(
+        &self,
+        exe: &CompiledExecutable,
+        inputs: &[&PjrtBufferHandle],
+        donated_input_indices: &[usize],
+    ) -> Result<Vec<PjrtBufferHandle>> {
+        let per_device = vec![inputs.to_vec()];
+        self.execute_multi_inner(exe, &per_device, donated_input_indices)
+    }
+
+    /// Execute across multiple devices with buffer donation support.
+    pub fn execute_multi_with_donation(
+        &self,
+        exe: &CompiledExecutable,
+        per_device_inputs: &[Vec<&PjrtBufferHandle>],
+        donated_input_indices: &[usize],
+    ) -> Result<Vec<PjrtBufferHandle>> {
+        self.execute_multi_inner(exe, per_device_inputs, donated_input_indices)
+    }
+
+    fn execute_multi_inner(
+        &self,
+        exe: &CompiledExecutable,
+        per_device_inputs: &[Vec<&PjrtBufferHandle>],
+        donated_input_indices: &[usize],
+    ) -> Result<Vec<PjrtBufferHandle>> {
+        let num_devices = per_device_inputs.len();
+        if num_devices == 0 {
+            return Err(LLMError::GpuError(
+                "execute_multi: per_device_inputs is empty".into(),
+            ));
+        }
+        if num_devices > self.inner.devices.len() {
+            return Err(LLMError::GpuError(format!(
+                "execute_multi: requested {} devices but only {} available",
+                num_devices,
+                self.inner.devices.len()
+            )));
+        }
+
+        let num_args = per_device_inputs[0].len();
+        for (i, dev_inputs) in per_device_inputs.iter().enumerate() {
+            if dev_inputs.len() != num_args {
+                return Err(LLMError::GpuError(format!(
+                    "execute_multi: device {} has {} args, expected {} (must match device 0)",
+                    i,
+                    dev_inputs.len(),
+                    num_args
+                )));
+            }
+        }
+
+        // Build per-device raw pointer lists
+        let input_ptr_vecs: Vec<Vec<*mut PjrtBuffer>> = per_device_inputs
+            .iter()
+            .map(|dev| dev.iter().map(|b| b.raw).collect())
+            .collect();
+        let input_lists: Vec<*const *mut PjrtBuffer> = input_ptr_vecs
+            .iter()
+            .map(|v| v.as_ptr())
+            .collect();
+
+        // Build non-donatable indices: every input index NOT in donated_input_indices
+        let non_donatable: Vec<i64> = if donated_input_indices.is_empty() {
+            // No donation requested -- mark all as non-donatable (safe default)
+            (0..num_args as i64).collect()
+        } else {
+            (0..num_args as i64)
+                .filter(|i| !donated_input_indices.contains(&(*i as usize)))
+                .collect()
+        };
+
+        // Output buffers: one list per device
+        let mut output_ptr_vecs: Vec<Vec<*mut PjrtBuffer>> =
+            (0..num_devices).map(|_| vec![ptr::null_mut(); 256]).collect();
+        let mut output_lists: Vec<*mut *mut PjrtBuffer> = output_ptr_vecs
+            .iter_mut()
+            .map(|v| v.as_mut_ptr())
+            .collect();
+
+        let exec_options = PJRT_ExecuteOptions {
+            struct_size: std::mem::size_of::<PJRT_ExecuteOptions>(),
+            extension_start: ptr::null_mut(),
+            send_callbacks: ptr::null(),
+            recv_callbacks: ptr::null(),
+            num_send_ops: 0,
+            num_recv_ops: 0,
+            launch_id: 0,
+            non_donatable_input_indices: non_donatable.as_ptr(),
+            num_non_donatable_input_indices: non_donatable.len(),
+            context: ptr::null(),
+            call_location: ptr::null(),
+            num_tasks: 0,
+            task_ids: ptr::null(),
+            incarnation_ids: ptr::null(),
+        };
+
+        unsafe {
+            let mut args = PJRT_LoadedExecutable_Execute_Args {
+                struct_size: std::mem::size_of::<PJRT_LoadedExecutable_Execute_Args>(),
+                extension_start: ptr::null_mut(),
+                executable: exe.raw,
+                options: &exec_options,
+                argument_lists: input_lists.as_ptr() as *const *const *mut PjrtBuffer,
+                num_devices,
+                num_args,
+                output_lists: output_lists.as_mut_ptr() as *const *mut *mut PjrtBuffer,
+                device_complete_events: ptr::null_mut(),
+                execute_device: ptr::null_mut(),
+            };
+            let err = (self.inner.fns.loaded_executable_execute)(&mut args);
+            if !err.is_null() {
+                let msg = extract_error_message(&self.inner.fns, err);
+                return Err(LLMError::GpuError(format!(
+                    "PJRT_LoadedExecutable_Execute failed: {msg}"
+                )));
+            }
+        };
+
+        // Collect outputs from all devices into a flat Vec
+        let mut results = Vec::new();
+        for dev_outputs in &output_ptr_vecs {
+            let count = dev_outputs.iter().take_while(|p| !p.is_null()).count();
+            for &raw in &dev_outputs[..count] {
+                results.push(PjrtBufferHandle {
+                    client: self.clone(),
+                    raw,
+                });
+            }
+        }
 
         Ok(results)
     }

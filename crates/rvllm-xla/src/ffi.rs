@@ -171,6 +171,17 @@ pub struct PJRT_ExecuteOptions {
     // total = 112
 }
 
+// --- PJRT_Device_LocalHardwareId ---
+// Index 30 in PJRT_Api fn table (Device group, indices 29-33).
+
+#[repr(C)]
+pub struct PJRT_Device_LocalHardwareId_Args {
+    pub struct_size: usize,
+    pub extension_start: *mut c_void,
+    pub device: *mut PjrtDevice,
+    pub local_hardware_id: i32,
+}
+
 // --- PJRT_Buffer_ToHostBuffer ---
 
 #[repr(C)]
@@ -243,6 +254,8 @@ pub type PjrtEventAwaitFn =
     unsafe extern "C" fn(*mut PJRT_Event_Await_Args) -> *mut PjrtError;
 pub type PjrtEventDestroyFn =
     unsafe extern "C" fn(*mut PJRT_Event_Destroy_Args);
+pub type PjrtDeviceLocalHardwareIdFn =
+    unsafe extern "C" fn(*mut PJRT_Device_LocalHardwareId_Args) -> *mut PjrtError;
 
 // --- PJRT_Api function table ---
 // In the real pjrt_c_api.h this is a massive struct with ~60+ function pointers.
@@ -338,6 +351,7 @@ pub const OFFSET_CLIENT_BUFFER_FROM_HOST: usize = fn_offset(22);
 //  60-69: Buffer query functions
 //  70: PJRT_Buffer_ToHostBuffer
 
+pub const OFFSET_DEVICE_LOCAL_HARDWARE_ID: usize = fn_offset(30);
 pub const OFFSET_LOADED_EXECUTABLE_EXECUTE: usize = fn_offset(55);
 pub const OFFSET_BUFFER_DESTROY: usize = fn_offset(58);
 pub const OFFSET_BUFFER_TO_HOST: usize = fn_offset(70);
@@ -350,6 +364,7 @@ pub struct PjrtApiFns {
     pub event_await: PjrtEventAwaitFn,
     pub client_create: PjrtClientCreateFn,
     pub client_devices: PjrtClientDevicesFn,
+    pub device_local_hardware_id: PjrtDeviceLocalHardwareIdFn,
     pub client_compile: PjrtClientCompileFn,
     pub client_buffer_from_host: PjrtClientBufferFromHostBufferFn,
     pub loaded_executable_execute: PjrtLoadedExecutableExecuteFn,
@@ -368,6 +383,7 @@ impl PjrtApiFns {
             event_await: read_fn_ptr(base, OFFSET_EVENT_AWAIT),
             client_create: read_fn_ptr(base, OFFSET_CLIENT_CREATE),
             client_devices: read_fn_ptr(base, OFFSET_CLIENT_DEVICES),
+            device_local_hardware_id: read_fn_ptr(base, OFFSET_DEVICE_LOCAL_HARDWARE_ID),
             client_compile: read_fn_ptr(base, OFFSET_CLIENT_COMPILE),
             client_buffer_from_host: read_fn_ptr(base, OFFSET_CLIENT_BUFFER_FROM_HOST),
             loaded_executable_execute: read_fn_ptr(base, OFFSET_LOADED_EXECUTABLE_EXECUTE),
