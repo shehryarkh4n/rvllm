@@ -400,6 +400,9 @@ pub unsafe fn gemma4_forward(
     gemma4_launcher::Bf16ToF16SatLaunch { n: dims.num_tokens * dims.hidden }
         .launch(kernels.f32_to_bf16, scratch.delta_f16, scratch.gemm_f32_tmp, stream)?;
 
+    #[cfg(feature = "cuda")]
+    probe!("step7_o_proj", scratch.delta_f16, dims.hidden);
+
     // 8. post_attention_layernorm on the DELTA (bf16 in-place)
     gemma4_launcher::RmsnormInplaceLaunch {
         num_tokens: dims.num_tokens,

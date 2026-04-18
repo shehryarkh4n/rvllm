@@ -13,6 +13,7 @@ attn = layer0.self_attn
 attn.q_proj.register_forward_hook(lambda m,i,o: cap.update({"q_proj": o.float().detach().cpu()}))
 attn.k_proj.register_forward_hook(lambda m,i,o: cap.update({"k_proj": o.float().detach().cpu()}))
 attn.v_proj.register_forward_hook(lambda m,i,o: cap.update({"v_proj": o.float().detach().cpu()}))
+attn.o_proj.register_forward_pre_hook(lambda m,i: cap.update({"attn_out_pre_o_proj": i[0].float().detach().cpu()}))
 attn.o_proj.register_forward_hook(lambda m,i,o: cap.update({"o_proj": o.float().detach().cpu()}))
 
 if hasattr(attn, "q_norm"):
@@ -27,7 +28,17 @@ with torch.no_grad():
     out = model(ids)
 
 print("=== HF Layer 0 ATTENTION internals ===")
-for name in ["input_norm", "q_proj", "k_proj", "v_proj", "q_norm", "k_norm", "o_proj", "post_attn_norm"]:
+for name in [
+    "input_norm",
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "q_norm",
+    "k_norm",
+    "attn_out_pre_o_proj",
+    "o_proj",
+    "post_attn_norm",
+]:
     if name in cap:
         t = cap[name].squeeze()
         flat = t.flatten()
