@@ -603,12 +603,11 @@ fn quantize_to_fp8_bytes(f32_vals: &[f32], scale: f32) -> Vec<u8> {
     out
 }
 
-// Minimal reference E4M3 encode. FP8 E4M3: 1 sign, 4 exp, 3 mantissa,
-// bias 7, finite range [-448, 448]. For v3 engine init we only need
-// correctness, not speed (CPU one-time path).
+// Minimal reference E4M3 encode with round-to-nearest-even (matches NVIDIA hw).
+// FP8 E4M3: 1 sign, 4 exp, 3 mantissa, bias 7, finite range [-448, 448].
 fn fp8_e4m3_encode(v: f32) -> u8 {
     if v.is_nan() {
-        return 0x7f; // S=0, E=1111, M=111 is NaN in E4M3FN (or similar).
+        return 0x7f;
     }
     let s: u8 = if v < 0.0 { 0x80 } else { 0 };
     let a = v.abs();
@@ -616,23 +615,37 @@ fn fp8_e4m3_encode(v: f32) -> u8 {
         return s;
     }
     if a > FP8_E4M3_MAX {
-        return s | 0x7e; // max finite
+        return s | 0x7e;
     }
     let bits = a.to_bits();
     let exp32 = ((bits >> 23) & 0xff) as i32 - 127;
     let mant32 = bits & 0x7f_ffff;
     let exp8 = exp32 + 7;
     if exp8 <= 0 {
-        // subnormal in E4M3: exp = 0, mantissa includes hidden bit
         let shift = 1 - exp8;
-        let m = (mant32 | (1 << 23)) >> (21 + shift);
+        let full = (mant32 | (1 << 23)) as u32;
+        let rshift = 21 + shift as u32;
+        let m = full >> rshift;
+        let round_bit = if rshift > 0 { (full >> (rshift - 1)) & 1 } else { 0 };
+        let sticky = if rshift > 1 { (full & ((1 << (rshift - 1)) - 1) != 0) as u32 } else { 0 };
+        let m = m + ((round_bit & (sticky | (m & 1))) as u32);
         return s | (m as u8 & 0x07);
     }
     if exp8 >= 0xf {
         return s | 0x7e;
     }
-    let m = (mant32 >> 20) as u8 & 0x07;
-    s | ((exp8 as u8 & 0x0f) << 3) | m
+    let trunc = mant32 >> 20;
+    let round_bit = (mant32 >> 19) & 1;
+    let sticky = (mant32 & 0x7_ffff) != 0;
+    let m = trunc + (round_bit & (sticky as u32 | (trunc & 1)));
+    if m >= 8 {
+        let exp8 = exp8 + 1;
+        if exp8 >= 0xf {
+            return s | 0x7e;
+        }
+        return s | ((exp8 as u8 & 0x0f) << 3);
+    }
+    s | ((exp8 as u8 & 0x0f) << 3) | (m as u8 & 0x07)
 }
 
 fn upload_fp8_from(

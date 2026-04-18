@@ -1,90 +1,26 @@
-title:
+that's a big claim, i know. 
+https://github.com/m0at/rvllm
+web: https://docs.solidsf.com/docs/bench
+proud to announce: WE DID IT!!!!  
 
-finally did it - 20% faster inference with rvLLM 0.3.0
+we're outperforming vLLM on raw engine throughput, using a new 31B model from google, while also reducing VRAM required by 9.5x - enabling on-card tensor parallelism for even crazier speedups on the same hardware
 
+when i first posted, it wasn't ready, i needed help, and thanks to the amazing power of twitter i got connected with world-class engineers that gave me some tips and guidance along the way. the encouragement to keep going was also fundamental in my commitment to getting past stoppage points. you guys made all the difference, you know who you are, thank you, each of you, so very very much.
 
-article:
+so what happened? rvLLM didn't work? it worked? i didn't understand what that was all about!!  
 
-rvLLM 0.3.0 is a single-GPU Rust inference engine that ships in ~90 MB and beats vLLM 0.19 by 12–40% on Qwen2.5-7B FP8 at every batch from N=64 to N=512 on a single H100. Full 7-batch sweep below — no cherry-picking.
+parts of rvLLM worked the whole time, just depending what you were looking for. throughput and perplexity were shot though, and i was trying to do too much. people forked it for the loading speedup and it's out there in use already which is great, but i went all the way with it, including trying to beat cublast (dumb!).
 
-[IMAGE: 7-batch rvLLM vs vLLM chart]
+also, i got into TPUs i guess? shoutout adam lol  so yeah, now you can:  rvLLM-xla to run your inference on google TPU lol, i suggest using v6e-4 for the 31B, it's insane and cheap
 
-Honest caveat up front: vLLM is still faster at N=1–16. My per-step fixed cost (339 kernel launches + metadata upload) dominates at small batch; vLLM's tighter small-batch path wins there. Crossover sits around N=32–64. I'm hunting it — CUTLASS EVT prologue fusion is in flight and specifically targets that regime.
+Provide a caption (optional)
+https://docs.solidsf.com/docs/bench
 
-Same GPU, same Qwen2.5-7B-Instruct, same FP8 E4M3 weights + FP8 E4M3 KV, CUDA graphs on both. 16 input tokens, 512 output tokens per request. Real prefill on both. Cold = first request at that shape, hot = second request with heuristics cached.
-
-  N        rvLLM 0.3.0    vLLM 0.19 (hot)     Δ
-  1        137            223                 vLLM +62%
-  8        1,095          1,712               vLLM +56%
-  16       2,318          3,342               vLLM +44%
-  64       12,477         11,151              rvLLM +12%
-  128      21,946         17,778              rvLLM +23%
-  256      33,968         24,270              rvLLM +40%
-  512      41,560         31,485              rvLLM +32%
-
-TTFT (hot cache, per-request latency) at N=128: rvLLM 83 ms vs vLLM 348 ms — 4.2× faster. At N=512: 132 ms vs 880 ms — 6.7× faster. Full TTFT matrix is in the repo.
-
-Deployment footprint:
-
-• rvLLM: 9.2 MB Rust binary + 81 MB CUDA kernels (cutlass 18.5, fa3 38, w4a8 3.4). Total: ~90 MB.
-• vLLM: 11 GB conda env (torch 1.8 GB + vllm 1.2 GB + the rest).
-• rvLLM is 122× smaller to deploy. One COPY into a slim CUDA container and you're serving.
-
-VRAM on an 80 GB H100 serving Qwen2.5-7B FP8:
-
-• rvLLM: 7.8 GB used. 72 GB left on the card — room for a second model, longer context, larger batch.
-• vLLM: 74 GB reserved at server start (paged-KV pool sized for a burst of admissions, not per-request need).
-
-I'm not claiming idle memory makes vLLM slower — it doesn't. But rvLLM giving you back 90% of the card as actually-free HBM matters when you want to do anything else on the GPU.
-
-Cold start (model load → first token ready):
-
-• rvLLM: 72–77 sec
-       ~60 sec: safetensors mmap to HBM + CPU-path FP16 to FP8
-       ~12 sec: kernel module load + cuBLASLt init + CUDA graph capture
-       <100 ms: Rust binary start (no interpreter, no import graph)
-
-• vLLM: 90–130 sec typical
-         ~2 sec: Python startup + import chain (torch, etc: ~500 modules)
-         ~60-80 sec: weight load + on-the-fly FP8 quant
-         ~30-50 sec: Triton JIT of attention / quant kernels (cache after)
-         2-5 sec: Python dispatch overhead accumulating through engine init
-
-The 20–60 sec first-launch win is mostly the Python import graph + Triton JIT being gone. Subsequent launches narrow as the JIT caches. Rust binary starts in <10 ms; vLLM's import chain is ~3–5 sec before vllm.LLM(...) even exists.
-
-How this is achieved:
-
-• zero Python in the hot path. single binary, static-linked kernel pointers, no module resolution.
-• no JIT. PTX + .so are SHA-pinned at deploy, engine refuses to start if any kernel is missing.
-• one CUDA stream, one captured graph pool. no per-worker IPC.
-• FA3 Hopper FP8 paged attention + cuBLASLt FP8 on all 5 linears (QKV, O, gate_up, down, lm_head) with fused bias / residual epilogues. Full step = one cuGraphLaunch.
-• FP8 E4M3 KV cache end-to-end — halves KV bandwidth, doubles fit.
-
-What's coming:
-
-W4A8 weight quant (LiquidGEMM-pattern) — weights 7 GB → 3.5 GB, projected +25–40% at bandwidth-bound batches. CUTLASS EVT prologue fusion — closes the small-batch gap. FA3 FP8-O output — +2–4% by eliminating one post-attention quantize. All staged behind feature flags on main.
-
-benchmark tests:
-
-A) Throughput: ask the engine to generate 512 tokens for each of N prompts at once (N=1/8/16/64/128/256/512 prompts running in parallel). Once the first prompt has been consumed and decoding is steady, count tokens/sec across the whole batch. Higher = more users served per GPU per second.
-
-B) Time to first token: start a clock the moment the prompt arrives, stop it the instant the first generated token comes back. Higher N here means many users hit the engine simultaneously. Lower TTFT = more responsive chat, lower perceived latency.
-
-Context:
-
-This is the result of two complete refactors and a lot of Twitter DMs from engineers better than me. When I first posted, feature parity with vLLM wasn't there and the bench wasn't fair — and I got called on it, rightly. The people who sent tips, reviewed code, and pushed me to keep going — you know who you are. Thank you.
-
-this was legitimately difficult to pull off. even with frontier models doing the bulk of the coding, steering and debugging properly failed at multiple junctures. so if you're in a similar place, simply do not quit, keep going strong, and it will all work out.
-
-Call to action:
-
-fork it. run the bench on your own H100. break it. file a PR or an issue. i'm actively working in the open on main; tag at v0.3.0. if you find a flaw in the methodology i want to hear it — benchmarking is hard and i'd rather the numbers be right than flattering.
-
-constructive criticism is super welcome, please try to prove my bench results wrong. would love to see more people give this a shot on proper hardware. if you do find errors, we are better together than apart — let me know via PR/git issue, i'll jump on it, i'm financially invested in getting this right.
-
-next steps: this project is continuing forward, getting more serious, and will support every model i have compute credits for. i'm happy it came together, and thankful to have made some friends in the process.
-
-cheers,
-
-andy
+Provide a caption (optional)
+i think things will get a lot more active with this release - exciting times!
+constructive criticism is super welcome, please try to prove my bench results wrong. would love to see more people give this a shot on proper hardware.
+if you do find errors, we are better together than apart - let me know via PR/git issue, i'll jump on it, i'm financially invested in getting this right. try to be clear in your findings, be verbose, i prefer excessive wordiness with this stuff as interpretations are not always the same across every concept
+next steps: this project is continuing forward, getting more serious, and will support every model i have compute credits for. i'm happy it came together, and thankful to have made some friends in the process.  
+cheers,  
+andy  
 https://github.com/m0at/rvllm

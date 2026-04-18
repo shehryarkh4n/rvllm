@@ -778,14 +778,31 @@ fn fp8_e4m3_encode(v: f32) -> u8 {
     let exp8 = exp32 + 7;
     if exp8 <= 0 {
         let shift = 1 - exp8;
-        let m = (mant32 | (1 << 23)) >> (21 + shift);
+        let full = (mant32 | (1 << 23)) as u32;
+        let rshift = 21 + shift as u32;
+        let m = full >> rshift;
+        let round_bit = if rshift > 0 { (full >> (rshift - 1)) & 1 } else { 0 };
+        let sticky = if rshift > 1 { (full & ((1 << (rshift - 1)) - 1) != 0) as u32 } else { 0 };
+        let m = m + ((round_bit & (sticky | (m & 1))) as u32);
         return s | (m as u8 & 0x07);
     }
     if exp8 >= 0xf {
         return s | 0x7e;
     }
-    let m = (mant32 >> 20) as u8 & 0x07;
-    s | ((exp8 as u8 & 0x0f) << 3) | m
+    // round-to-nearest-even: 20 bits dropped from f32 mantissa
+    let trunc = mant32 >> 20;
+    let round_bit = (mant32 >> 19) & 1;
+    let sticky = (mant32 & 0x7_ffff) != 0;
+    let m = trunc + (round_bit & (sticky as u32 | (trunc & 1)));
+    if m >= 8 {
+        // mantissa overflow, bump exponent
+        let exp8 = exp8 + 1;
+        if exp8 >= 0xf {
+            return s | 0x7e;
+        }
+        return s | ((exp8 as u8 & 0x0f) << 3);
+    }
+    s | ((exp8 as u8 & 0x0f) << 3) | (m as u8 & 0x07)
 }
 
 fn fp8_e4m3_to_f32(b: u8) -> f32 {
