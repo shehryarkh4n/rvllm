@@ -99,6 +99,7 @@ pub struct Gemma4LayerScratch {
     pub gate_up_scale: u64,
     pub mlp_out_fp8: u64,
     pub mlp_out_scale: u64,
+    pub gemm_f32_tmp: u64,
     pub cutlass_workspace: u64,
     pub cutlass_workspace_bytes: usize,
     pub fa3_workspace: u64,
@@ -136,6 +137,8 @@ pub struct Gemma4LayerKernels {
     pub bf16_to_f16_sat: KernelFn,
     pub rmsnorm_inplace_bf16: KernelFn,
     pub vector_add_bf16_to_f16: KernelFn,
+    pub f32_to_bf16: KernelFn,
+    pub f32_to_f16_sat: KernelFn,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -225,12 +228,12 @@ pub unsafe fn gemma4_forward(
     #[cfg(feature = "cuda")]
     probe!("after_step1_residual", residual, dims.hidden);
 
-    // 2. Q||K||V projection (cuBLASLt FP8 GEMM)
+    // 2. Q||K||V projection (cuBLASLt FP8 GEMM -> F32 -> F16)
     #[cfg(feature = "cuda")]
-    cublaslt.fp8_gemm(
+    cublaslt.fp8_gemm_f32(
         scratch.hidden_fp8,
         weights.qkv_fp8,
-        scratch.q_out,
+        scratch.gemm_f32_tmp,
         dims.num_tokens as i32,
         qkv_rows as i32,
         dims.hidden as i32,
@@ -238,6 +241,9 @@ pub unsafe fn gemma4_forward(
         weights.qkv_scale,
         stream,
     )?;
+    #[cfg(feature = "cuda")]
+    gemma4_launcher::Bf16ToF16SatLaunch { n: dims.num_tokens * qkv_rows }
+        .launch(kernels.f32_to_f16_sat, scratch.q_out, scratch.gemm_f32_tmp, stream)?;
 
     // 2b. V-norm: parameter-free RMS normalization on V heads.
     gemma4_launcher::VnormF16Launch {
@@ -350,12 +356,12 @@ pub unsafe fn gemma4_forward(
         stream,
     )?;
 
-    // 7. O proj -> delta buffer (bf16 output to avoid f16 overflow)
+    // 7. O proj -> F32 tmp -> BF16 delta buffer
     #[cfg(feature = "cuda")]
-    cublaslt.fp8_gemm_bf16(
+    cublaslt.fp8_gemm_f32(
         scratch.attn_out_fp8,
         weights.o_fp8,
-        scratch.delta_f16,
+        scratch.gemm_f32_tmp,
         dims.num_tokens as i32,
         dims.hidden as i32,
         q_dim as i32,
@@ -363,6 +369,9 @@ pub unsafe fn gemma4_forward(
         weights.o_scale,
         stream,
     )?;
+    #[cfg(feature = "cuda")]
+    gemma4_launcher::Bf16ToF16SatLaunch { n: dims.num_tokens * dims.hidden }
+        .launch(kernels.f32_to_bf16, scratch.delta_f16, scratch.gemm_f32_tmp, stream)?;
 
     // 8. post_attention_layernorm on the DELTA (bf16 in-place)
     gemma4_launcher::RmsnormInplaceLaunch {
@@ -406,12 +415,12 @@ pub unsafe fn gemma4_forward(
     #[cfg(feature = "cuda")]
     probe_f32!("step9_gate_up_wscale", weights.gate_up_scale);
 
-    // 10. gate||up projection (cuBLASLt)
+    // 10. gate||up projection (cuBLASLt FP8 -> F32 -> F16)
     #[cfg(feature = "cuda")]
-    cublaslt.fp8_gemm(
+    cublaslt.fp8_gemm_f32(
         scratch.hidden_fp8,
         weights.gate_up_fp8,
-        scratch.gate_up_out,
+        scratch.gemm_f32_tmp,
         dims.num_tokens as i32,
         (2 * dims.intermediate) as i32,
         dims.hidden as i32,
@@ -419,6 +428,9 @@ pub unsafe fn gemma4_forward(
         weights.gate_up_scale,
         stream,
     )?;
+    #[cfg(feature = "cuda")]
+    gemma4_launcher::Bf16ToF16SatLaunch { n: dims.num_tokens * 2 * dims.intermediate }
+        .launch(kernels.f32_to_f16_sat, scratch.gate_up_out, scratch.gemm_f32_tmp, stream)?;
 
     #[cfg(feature = "cuda")]
     probe!("step10_gate_up_out", scratch.gate_up_out, dims.intermediate);
@@ -439,12 +451,12 @@ pub unsafe fn gemma4_forward(
     #[cfg(feature = "cuda")]
     probe_f32!("step11_mlp_out_scale", scratch.mlp_out_scale);
 
-    // 12. Down proj -> delta buffer (bf16 output, then convert to f16 with saturation)
+    // 12. Down proj -> F32 tmp -> BF16 delta buffer
     #[cfg(feature = "cuda")]
-    cublaslt.fp8_gemm_bf16(
+    cublaslt.fp8_gemm_f32(
         scratch.mlp_out_fp8,
         weights.down_fp8,
-        scratch.delta_f16,
+        scratch.gemm_f32_tmp,
         dims.num_tokens as i32,
         dims.hidden as i32,
         dims.intermediate as i32,
@@ -452,6 +464,9 @@ pub unsafe fn gemma4_forward(
         weights.down_scale,
         stream,
     )?;
+    #[cfg(feature = "cuda")]
+    gemma4_launcher::Bf16ToF16SatLaunch { n: dims.num_tokens * dims.hidden }
+        .launch(kernels.f32_to_bf16, scratch.delta_f16, scratch.gemm_f32_tmp, stream)?;
 
     #[cfg(feature = "cuda")]
     probe!("step12_delta_bf16", scratch.delta_f16, dims.hidden);

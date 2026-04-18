@@ -30,6 +30,8 @@ NAME_TO_FILE = {
     "vnorm_f16": "vnorm_f16.ptx",
     "vector_add_f16": "vector_add_f16.ptx",
     "bf16_to_f16_sat": "bf16_to_f16_sat.ptx",
+    "f32_to_bf16": "f32_to_bf16.ptx",
+    "f32_to_f16_sat": "f32_to_f16_sat.ptx",
     "rmsnorm_inplace_bf16": "rmsnorm_inplace_bf16.ptx",
     "vector_add_bf16_to_f16": "vector_add_bf16_to_f16.ptx",
 }

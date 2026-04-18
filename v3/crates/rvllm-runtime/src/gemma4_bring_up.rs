@@ -43,6 +43,8 @@ pub struct Gemma4FusedModules {
     pub bf16_to_f16_sat_mod: LoadedModule,
     pub rmsnorm_inplace_bf16_mod: LoadedModule,
     pub vector_add_bf16_to_f16_mod: LoadedModule,
+    pub f32_to_bf16_mod: LoadedModule,
+    pub f32_to_f16_sat_mod: LoadedModule,
     pub fn_rmsnorm: KernelFn,
     pub fn_rmsnorm_fp8_quant: KernelFn,
     pub fn_quantize: KernelFn,
@@ -57,6 +59,8 @@ pub struct Gemma4FusedModules {
     pub fn_bf16_to_f16_sat: KernelFn,
     pub fn_rmsnorm_inplace_bf16: KernelFn,
     pub fn_vector_add_bf16_to_f16: KernelFn,
+    pub fn_f32_to_bf16: KernelFn,
+    pub fn_f32_to_f16_sat: KernelFn,
 }
 
 pub struct Gemma4Bringup {
@@ -196,6 +200,8 @@ impl Gemma4Bringup {
         let mlp_out_fp8 = arena.region("mlp_out_fp8", (num_seqs * inter) as usize, 16).unwrap();
         let mlp_out_scale = arena.region("mlp_out_scale", (num_seqs * 4) as usize, 16).unwrap();
         let delta_f16 = arena.region("delta_f16", (num_seqs * hidden * 2) as usize, 16).unwrap();
+        let gemm_f32_max_n = std::cmp::max(max_qkv_rows, 2 * inter);
+        let gemm_f32_tmp = arena.region("gemm_f32_tmp", (num_seqs * gemm_f32_max_n * 4) as usize, 16).unwrap();
 
         // Uniform KV dim across layer types (sliding 16*256=4096, global 4*512=2048 but
         // k_eq_v doubles it back). Use max for allocation.
@@ -349,6 +355,7 @@ impl Gemma4Bringup {
                     gate_up_scale: gate_up_scale.device_ptr(),
                     mlp_out_fp8: mlp_out_fp8.device_ptr(),
                     mlp_out_scale: mlp_out_scale.device_ptr(),
+                    gemm_f32_tmp: gemm_f32_tmp.device_ptr(),
                     cutlass_workspace: cutlass_ws.device_ptr(),
                     cutlass_workspace_bytes: cutlass_ws_bytes,
                     fa3_workspace: fa3_ws.device_ptr(),
@@ -490,6 +497,8 @@ impl Gemma4Bringup {
         let mlp_out_fp8 = arena.region("mlp_out_fp8", (num_seqs * inter) as usize, 16)?;
         let mlp_out_scale = arena.region("mlp_out_scale", (num_seqs * 4) as usize, 16)?;
         let delta_f16 = arena.region("delta_f16_ppl", (num_seqs * hidden * 2) as usize, 16)?;
+        let gemm_f32_max_n = std::cmp::max(max_qkv_rows, 2 * inter);
+        let gemm_f32_tmp = arena.region("gemm_f32_tmp_ppl", (num_seqs * gemm_f32_max_n * 4) as usize, 16)?;
 
         let kv_elem_per_layer = 2 * num_blocks_total * block_size * max_nkvh * max_hd;
         let kv_cache = arena.region(
@@ -624,6 +633,7 @@ impl Gemma4Bringup {
                     gate_up_scale: gate_up_scale.device_ptr(),
                     mlp_out_fp8: mlp_out_fp8.device_ptr(),
                     mlp_out_scale: mlp_out_scale.device_ptr(),
+                    gemm_f32_tmp: gemm_f32_tmp.device_ptr(),
                     cutlass_workspace: cutlass_ws.device_ptr(),
                     cutlass_workspace_bytes: cutlass_ws_bytes,
                     fa3_workspace: fa3_ws.device_ptr(),
@@ -798,6 +808,8 @@ impl Gemma4Bringup {
             bf16_to_f16_sat: self.fused.fn_bf16_to_f16_sat,
             rmsnorm_inplace_bf16: self.fused.fn_rmsnorm_inplace_bf16,
             vector_add_bf16_to_f16: self.fused.fn_vector_add_bf16_to_f16,
+            f32_to_bf16: self.fused.fn_f32_to_bf16,
+            f32_to_f16_sat: self.fused.fn_f32_to_f16_sat,
         }
     }
 }
@@ -819,6 +831,8 @@ fn load_gemma4_fused(loader: &KernelLoader) -> Result<Gemma4FusedModules> {
     let bf16_to_f16_sat_mod = loader.load_ptx("bf16_to_f16_sat")?;
     let rmsnorm_inplace_bf16_mod = loader.load_ptx("rmsnorm_inplace_bf16")?;
     let vector_add_bf16_to_f16_mod = loader.load_ptx("vector_add_bf16_to_f16")?;
+    let f32_to_bf16_mod = loader.load_ptx("f32_to_bf16")?;
+    let f32_to_f16_sat_mod = loader.load_ptx("f32_to_f16_sat")?;
 
     let rmsnorm_inplace_mod = loader.load_ptx("rmsnorm_inplace_f16")?;
     let fn_rmsnorm = rmsnorm_inplace_mod.get_function("rmsnorm_inplace_f16_kernel")?;
@@ -839,6 +853,8 @@ fn load_gemma4_fused(loader: &KernelLoader) -> Result<Gemma4FusedModules> {
     let fn_bf16_to_f16_sat = bf16_to_f16_sat_mod.get_function("bf16_to_f16_sat_kernel")?;
     let fn_rmsnorm_inplace_bf16 = rmsnorm_inplace_bf16_mod.get_function("rmsnorm_inplace_bf16_kernel")?;
     let fn_vector_add_bf16_to_f16 = vector_add_bf16_to_f16_mod.get_function("vector_add_bf16_to_f16_kernel")?;
+    let fn_f32_to_bf16 = f32_to_bf16_mod.get_function("f32_to_bf16_kernel")?;
+    let fn_f32_to_f16_sat = f32_to_f16_sat_mod.get_function("f32_to_f16_sat_kernel")?;
 
     Ok(Gemma4FusedModules {
         rmsnorm_mod,
@@ -854,6 +870,8 @@ fn load_gemma4_fused(loader: &KernelLoader) -> Result<Gemma4FusedModules> {
         bf16_to_f16_sat_mod,
         rmsnorm_inplace_bf16_mod,
         vector_add_bf16_to_f16_mod,
+        f32_to_bf16_mod,
+        f32_to_f16_sat_mod,
         fn_rmsnorm,
         fn_rmsnorm_fp8_quant,
         fn_quantize,
@@ -868,5 +886,7 @@ fn load_gemma4_fused(loader: &KernelLoader) -> Result<Gemma4FusedModules> {
         fn_bf16_to_f16_sat,
         fn_rmsnorm_inplace_bf16,
         fn_vector_add_bf16_to_f16,
+        fn_f32_to_bf16,
+        fn_f32_to_f16_sat,
     })
 }
