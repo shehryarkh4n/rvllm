@@ -15,6 +15,9 @@ rsync -a \
     --exclude='*.bbl' --exclude='*.blg' \
     "${REPO_ROOT}/docs/" "${SITE_DIR}/docs/"
 
+# Copy _headers into site root for Cloudflare cache control
+cp "${SCRIPT_DIR}/site-headers/_headers" "${SITE_DIR}/_headers"
+
 echo "Staged into ${SITE_DIR}:"
 du -sh "${SITE_DIR}"
 find "${SITE_DIR}" -maxdepth 3 -type f | sort

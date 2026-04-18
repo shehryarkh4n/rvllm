@@ -1,0 +1,3 @@
+/docs/*
+  Cache-Control: no-store
+  CDN-Cache-Control: no-store
