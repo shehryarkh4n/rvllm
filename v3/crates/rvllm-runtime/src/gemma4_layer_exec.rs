@@ -175,6 +175,17 @@ pub unsafe fn gemma4_forward(
             }
         };
     }
+    #[cfg(feature = "cuda")]
+    macro_rules! probe_f32 {
+        ($label:expr, $ptr:expr) => {
+            if dbg_layer >= 0 {
+                cudarc::driver::sys::cuStreamSynchronize(stream as _);
+                let mut v = [0.0f32; 1];
+                cudarc::driver::sys::cuMemcpyDtoH_v2(v.as_mut_ptr() as *mut _, $ptr, 4);
+                eprintln!("    [L{} {}] = {:.6e}", dbg_layer, $label, v[0]);
+            }
+        };
+    }
 
     // 1. input_layernorm -> FP8 quant
     FusedRmsnormFp8QuantLaunch {
@@ -371,6 +382,11 @@ pub unsafe fn gemma4_forward(
         stream,
     )?;
 
+    #[cfg(feature = "cuda")]
+    probe_f32!("step9_hidden_scale", scratch.hidden_scale);
+    #[cfg(feature = "cuda")]
+    probe_f32!("step9_gate_up_wscale", weights.gate_up_scale);
+
     // 10. gate||up projection (cuBLASLt)
     #[cfg(feature = "cuda")]
     cublaslt.fp8_gemm(
@@ -385,6 +401,9 @@ pub unsafe fn gemma4_forward(
         stream,
     )?;
 
+    #[cfg(feature = "cuda")]
+    probe!("step10_gate_up_out", scratch.gate_up_out, dims.intermediate);
+
     // 11. GELU(tanh)(gate) * up -> FP8
     gemma4_launcher::FusedGeluMulFp8QuantLaunch {
         num_tokens: dims.num_tokens,
@@ -397,6 +416,9 @@ pub unsafe fn gemma4_forward(
         scratch.gate_up_out,
         stream,
     )?;
+
+    #[cfg(feature = "cuda")]
+    probe_f32!("step11_mlp_out_scale", scratch.mlp_out_scale);
 
     // 12. Down proj -> delta buffer (NOT residual)
     #[cfg(feature = "cuda")]
@@ -411,6 +433,9 @@ pub unsafe fn gemma4_forward(
         weights.down_scale,
         stream,
     )?;
+
+    #[cfg(feature = "cuda")]
+    probe!("step12_delta_f16", scratch.delta_f16, dims.hidden);
 
     // 13. post_feedforward_layernorm on the DELTA (not residual).
     // HF: hidden_states = post_ff_norm(mlp_output); residual += hidden_states
