@@ -296,9 +296,9 @@ impl CublasLt {
             n,
             k,
             kind: match (bias_f16 != 0, beta_one, d_out_type) {
-                (true, _, _) => 1i32,
-                (_, true, _) => 2 + d_out_type as i32,
-                _ => 10 + d_out_type as i32,
+                (true, _, _) => 1u8,
+                (_, true, _) => 2 + d_out_type,
+                _ => 10 + d_out_type,
             },
         };
         let cached_algo = self
