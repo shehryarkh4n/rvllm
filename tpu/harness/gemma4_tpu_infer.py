@@ -123,79 +123,112 @@ def _global_attn(q_flat, k_flat, v_flat, qn, kn, cos_g, sin_g, kc, vc, pos, ctx,
     out = jnp.einsum('bght,tgd->bghd', p, v_ctx).reshape(B, G_Q)
     return out, kc, vc
 
-# ── flat scan body ──
+# ── sliding layer (no cond, native shapes) ──
 
-def one_layer(carry, xs):
-    x, pos, ctx, cos_s, sin_s, cos_g, sin_g = carry
-    max_ctx = xs['kc'].shape[0]
-
+def _sliding_layer(x, pos, ctx, cos_s, sin_s, ws, skc, svc):
+    max_ctx = skc.shape[0]
     residual = x
-    h = rms_norm(x, xs['ln1'])
-
-    q_flat = int8_matmul(h, xs['qw'], xs['qw_s'])
-    k_flat = int8_matmul(h, xs['kw'], xs['kw_s'])
-    v_flat = int8_matmul(h, xs['vw'], xs['vw_s'])
-
-    ig = xs['ig']
-
-    def do_sliding(args):
-        q, k, v, qn, kn, kc, vc = args
-        out, kc2, vc2 = _sliding_attn(q, k, v, qn, kn, cos_s, sin_s, kc, vc, pos, ctx, max_ctx)
-        # Pad attn output to MAX_Q
-        return jnp.pad(out, ((0,0),(0, MAX_Q - S_Q))), kc2, vc2
-
-    def do_global(args):
-        q, k, v, qn, kn, kc, vc = args
-        out, kc2, vc2 = _global_attn(q, k, v, qn, kn, cos_g, sin_g, kc, vc, pos, ctx, max_ctx)
-        return out, kc2, vc2  # already MAX_Q size
-
-    attn_out, kc, vc = jax.lax.cond(
-        ig, do_global, do_sliding,
-        (q_flat, k_flat, v_flat, xs['qn'], xs['kn'], xs['kc'], xs['vc']))
-
-    o_out = int8_matmul(attn_out, xs['ow'], xs['ow_s'])
-
-    h = o_out
-    h = rms_norm(h, xs['ln2'])
+    h = rms_norm(x, ws['ln1'])
+    q_flat = int8_matmul(h, ws['sqw'], ws['sqw_s'])
+    k_flat = int8_matmul(h, ws['skw'], ws['skw_s'])
+    v_flat = int8_matmul(h, ws['svw'], ws['svw_s'])
+    out, skc, svc = _sliding_attn(q_flat, k_flat, v_flat, ws['sqn'], ws['skn'],
+                                   cos_s, sin_s, skc, svc, pos, ctx, max_ctx)
+    h = int8_matmul(out.reshape(B, S_Q), ws['sow'], ws['sow_s'])
+    h = rms_norm(h, ws['ln2'])
     x = residual + h
-
     residual = x
-    h = rms_norm(x, xs['ln3'])
-    gate = int8_matmul(h, xs['gw'], xs['gw_s'])
-    up = int8_matmul(h, xs['uw'], xs['uw_s'])
+    h = rms_norm(x, ws['ln3'])
+    gate = int8_matmul(h, ws['gw'], ws['gw_s'])
+    up = int8_matmul(h, ws['uw'], ws['uw_s'])
     h = jax.nn.gelu(gate, approximate=True) * up
-    h = int8_matmul(h, xs['dw'], xs['dw_s'])
-    h = rms_norm(h, xs['ln4'])
-    x = (residual + h) * xs['ls']
+    h = int8_matmul(h, ws['dw'], ws['dw_s'])
+    h = rms_norm(h, ws['ln4'])
+    x = (residual + h) * ws['ls']
+    return x, skc, svc
 
-    return (x, pos, ctx, cos_s, sin_s, cos_g, sin_g), {'kc': kc, 'vc': vc}
+# ── global layer (no cond, native shapes) ──
+
+def _global_layer(x, pos, ctx, cos_g, sin_g, wg, gkc, gvc):
+    max_ctx = gkc.shape[0]
+    residual = x
+    h = rms_norm(x, wg['ln1'])
+    q_flat = int8_matmul(h, wg['gqw'], wg['gqw_s'])
+    k_flat = int8_matmul(h, wg['gkw'], wg['gkw_s'])
+    out, gkc, gvc = _global_attn(q_flat, k_flat, jnp.zeros_like(k_flat), wg['gqn'], wg['gkn'],
+                                  cos_g, sin_g, gkc, gvc, pos, ctx, max_ctx)
+    h = int8_matmul(out.reshape(B, G_Q), wg['gow'], wg['gow_s'])
+    h = rms_norm(h, wg['ln2'])
+    x = residual + h
+    residual = x
+    h = rms_norm(x, wg['ln3'])
+    gate = int8_matmul(h, wg['gw'], wg['gw_s'])
+    up = int8_matmul(h, wg['uw'], wg['uw_s'])
+    h = jax.nn.gelu(gate, approximate=True) * up
+    h = int8_matmul(h, wg['dw'], wg['dw_s'])
+    h = rms_norm(h, wg['ln4'])
+    x = (residual + h) * wg['ls']
+    return x, gkc, gvc
+
+# ── one period: 5 sliding + 1 global, unrolled, no cond ──
+
+N_GROUPS = 10
+
+def _slice_layer(d, i):
+    return jax.tree.map(lambda a: a[i], d)
+
+def one_period(carry, period_xs):
+    x, pos, ctx, cos_s, sin_s, cos_g, sin_g = carry
+    sw = period_xs['sliding']
+    gw = period_xs['global']
+
+    skc0, svc0 = period_xs['skc'][0], period_xs['svc'][0]
+    skc1, svc1 = period_xs['skc'][1], period_xs['svc'][1]
+    skc2, svc2 = period_xs['skc'][2], period_xs['svc'][2]
+    skc3, svc3 = period_xs['skc'][3], period_xs['svc'][3]
+    skc4, svc4 = period_xs['skc'][4], period_xs['svc'][4]
+    gkc, gvc = period_xs['gkc'], period_xs['gvc']
+
+    x, skc0, svc0 = _sliding_layer(x, pos, ctx, cos_s, sin_s, _slice_layer(sw, 0), skc0, svc0)
+    x, skc1, svc1 = _sliding_layer(x, pos, ctx, cos_s, sin_s, _slice_layer(sw, 1), skc1, svc1)
+    x, skc2, svc2 = _sliding_layer(x, pos, ctx, cos_s, sin_s, _slice_layer(sw, 2), skc2, svc2)
+    x, skc3, svc3 = _sliding_layer(x, pos, ctx, cos_s, sin_s, _slice_layer(sw, 3), skc3, svc3)
+    x, skc4, svc4 = _sliding_layer(x, pos, ctx, cos_s, sin_s, _slice_layer(sw, 4), skc4, svc4)
+    x, gkc, gvc = _global_layer(x, pos, ctx, cos_g, sin_g, gw, gkc, gvc)
+
+    new_skc = jnp.stack([skc0, skc1, skc2, skc3, skc4])
+    new_svc = jnp.stack([svc0, svc1, svc2, svc3, svc4])
+
+    return (x, pos, ctx, cos_s, sin_s, cos_g, sin_g), {
+        'skc': new_skc, 'svc': new_svc, 'gkc': gkc, 'gvc': gvc}
 
 # ── forward ──
 
 def forward(token_id, pos, ctx, embed, final_norm, weights, caches, cos_s, sin_s, cos_g, sin_g):
     x = embed[token_id].reshape(B, H) * jnp.sqrt(jnp.float32(H))
     init = (x, pos, ctx, cos_s, sin_s, cos_g, sin_g)
-
-    layer_xs = {**weights, 'kc': caches['kc'], 'vc': caches['vc']}
-    final, scan_out = jax.lax.scan(one_layer, init, layer_xs)
+    groups = {**weights, **caches}
+    final, scan_out = jax.lax.scan(one_period, init, groups)
     x = final[0]
     x = rms_norm(x, final_norm)
     logits = x.astype(jnp.float32) @ embed.astype(jnp.float32).T
     logits = SOFTCAP_VAL * jnp.tanh(logits / SOFTCAP_VAL)
     log_probs = jax.nn.log_softmax(logits, axis=-1)
-    new_caches = {'kc': scan_out['kc'], 'vc': scan_out['vc']}
+    new_caches = {'skc': scan_out['skc'], 'svc': scan_out['svc'],
+                  'gkc': scan_out['gkc'], 'gvc': scan_out['gvc']}
     return jnp.argmax(logits, axis=-1).astype(jnp.int32), log_probs, new_caches
 
 def forward_step(token_id, pos, ctx, embed, final_norm, weights, caches, cos_s, sin_s, cos_g, sin_g):
     x = embed[token_id].reshape(B, H) * jnp.sqrt(jnp.float32(H))
     init = (x, pos, ctx, cos_s, sin_s, cos_g, sin_g)
-    layer_xs = {**weights, 'kc': caches['kc'], 'vc': caches['vc']}
-    final, scan_out = jax.lax.scan(one_layer, init, layer_xs)
+    groups = {**weights, **caches}
+    final, scan_out = jax.lax.scan(one_period, init, groups)
     x = final[0]
     x = rms_norm(x, final_norm)
     logits = x.astype(jnp.float32) @ embed.astype(jnp.float32).T
     logits = SOFTCAP_VAL * jnp.tanh(logits / SOFTCAP_VAL)
-    new_caches = {'kc': scan_out['kc'], 'vc': scan_out['vc']}
+    new_caches = {'skc': scan_out['skc'], 'svc': scan_out['svc'],
+                  'gkc': scan_out['gkc'], 'gvc': scan_out['gvc']}
     return jnp.argmax(logits, axis=-1).astype(jnp.int32), new_caches
 
 def make_decode_loop(num_prompt, total):
