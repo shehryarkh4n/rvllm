@@ -255,13 +255,6 @@ td.pending{color:#b6a1e5;font-style:italic}
   <strong>Why quality matters alongside throughput.</strong> A faster engine is meaningless if its FP8 quantization degrades output quality. We measure perplexity (lower = better next-token prediction, directly tests the forward pass) and MMLU accuracy (higher = better general knowledge). Both compare against a BF16 baseline to isolate quantization loss from model capability.
 </div>
 
-<div class="chart-box">
-  <div class="chart-title"><strong>Perplexity &amp; accuracy by quantization config</strong>
-    <div class="note">WikiText-2 perplexity (word-level, 200 samples) and MMLU accuracy (500 samples per subject). BF16 = no quantization baseline. FP8 = FP8 E4M3 weights with FP16 KV cache (the working config). Lower perplexity = better; higher MMLU = better.</div>
-  </div>
-  <div id="chart-quality" style="height:280px"></div>
-</div>
-
 <table>
 <thead><tr><th>Config</th><th class="r">Perplexity (WikiText-2)</th><th class="r">MMLU accuracy</th><th class="r">Source</th></tr></thead>
 <tbody>
