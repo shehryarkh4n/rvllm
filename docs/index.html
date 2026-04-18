@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>rvLLM -- High-Performance LLM Inference in Rust</title>
+<title>rvLLM -- High-Performance LLM Inference</title>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
 <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
 <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"
@@ -136,7 +136,7 @@ footer a:hover{color:#999}
 
 <header>
   <h1>rvLLM</h1>
-  <p class="sub">Single-GPU, FP8, graph-captured LLM inference in Rust. No Python in the hot path. No fallbacks. Missing artifacts refuse to start.</p>
+  <p class="sub">LLM inference engine. JAX+XLA on TPU, Rust+CUDA on GPU. Primary model: Gemma 4 31B.</p>
   <p class="links">
     <a href="https://github.com/m0at/rvllm">GitHub</a>
     <a href="bench.html">Bench results</a>
@@ -147,84 +147,84 @@ footer a:hover{color:#999}
 </header>
 
 <div class="hero">
-  <div class="big">42,030 tok/s</div>
-  <div class="sub">Qwen2.5-7B FP8 on a single H100 SXM 80GB. N=512, greedy, CUDA graph captured, FP8 E4M3 KV cache, real FA3 paged-prefill, full decode + final RMSnorm + LM head + argmax. <strong>+16.4% vs vLLM 0.19 at the same batch on the same box.</strong> Consistently 14&ndash;23% faster than vLLM across N=128 / 256 / 512. TTFT 63.8 ms at N=128. Detail below.</div>
+  <div class="big">13,943 tok/s</div>
+  <div class="sub">Gemma 4 31B on TPU v6e-4. Int8 quantized, B=768, TP=4 SPMD. <strong>2,681 tok/s per dollar.</strong> Zero custom kernels &mdash; ~500 lines of JAX, XLA compiles everything. PPL 25.51 (verified vs HuggingFace). 5 minutes to deploy, one pip install, one Python file.</div>
   <div class="cta-row">
     <a class="cta-btn primary" href="bench.html">See the full benchmark <span class="arrow">&rarr;</span></a>
     <a class="cta-btn ghost" href="https://github.com/m0at/rvllm">GitHub</a>
     <a class="cta-btn ghost" href="paper/rvllm.pdf">Paper</a>
   </div>
   <div class="hero-graphic">
-    <div class="hero-graphic-title">Throughput by Batch Size</div>
-    <div class="hero-graphic-sub">Same GPU, same model, same FP8 path. Greedy decode, 512 output tokens, CUDA graphs on.</div>
-    <div class="hero-chart-root" aria-label="rvLLM throughput by batch size">
+    <div class="hero-graphic-title">Gemma 4 31B &mdash; TPU v6e-4 Batch Scaling</div>
+    <div class="hero-graphic-sub">Int8 per-channel quantized weights, bf16 activations, TP=4 SPMD across 4 chips, fused on-chip decode loop.</div>
+    <div class="hero-chart-root" aria-label="rvLLM TPU batch scaling">
       <div class="hero-chart-grid">
         <div class="hero-chart-card">
           <div class="hero-chart-head">
             <div>
-              <h3>Qwen2.5-7B FP8, H100 SXM 80GB, CUDA graphs, greedy decode</h3>
-              <p>v3 vs vLLM 0.19 V1 on the same box. Both report steady-state decode tokens per second at ITERS=512.</p>
+              <h3>Batch scaling: B=1 to B=768 (peak)</h3>
+              <p>Near-linear scaling from bandwidth-bound (B=1) to compute saturation (B=768). LIBTPU async collective fusion enabled.</p>
             </div>
           </div>
           <div class="hero-static-block">
             <div class="hero-static-row">
-              <div class="hero-static-label"><strong>N=512 v3</strong></div>
+              <div class="hero-static-label"><strong>B=768</strong></div>
               <div class="hero-static-bars">
                 <div class="hero-static-track"><div class="hero-static-fill" style="width:100%;background:#84E6B7"></div></div>
-                <div class="hero-static-meta"><span class="hero-static-series"><i style="background:#84E6B7"></i><strong>42,030 tok/s</strong></span></div>
+                <div class="hero-static-meta"><span class="hero-static-series"><i style="background:#84E6B7"></i><strong>13,943 tok/s</strong> &nbsp; 55.1 ms/step &nbsp; 174.5x</span></div>
               </div>
             </div>
             <div class="hero-static-row">
-              <div class="hero-static-label">N=512 vLLM</div>
+              <div class="hero-static-label"><strong>B=512</strong></div>
               <div class="hero-static-bars">
-                <div class="hero-static-track"><div class="hero-static-fill" style="width:85.9%;background:#5a8bd4"></div></div>
-                <div class="hero-static-meta"><span class="hero-static-series"><i style="background:#5a8bd4"></i>36,097 tok/s &nbsp; v3 +16.4%</span></div>
+                <div class="hero-static-track"><div class="hero-static-fill" style="width:92.7%;background:#84E6B7"></div></div>
+                <div class="hero-static-meta"><span class="hero-static-series"><i style="background:#84E6B7"></i><strong>12,932 tok/s</strong> &nbsp; 39.6 ms/step</span></div>
               </div>
             </div>
             <div class="hero-static-row">
-              <div class="hero-static-label"><strong>N=256 v3</strong></div>
+              <div class="hero-static-label"><strong>B=256</strong></div>
               <div class="hero-static-bars">
-                <div class="hero-static-track"><div class="hero-static-fill" style="width:81.8%;background:#84E6B7"></div></div>
-                <div class="hero-static-meta"><span class="hero-static-series"><i style="background:#84E6B7"></i><strong>34,364 tok/s</strong></span></div>
+                <div class="hero-static-track"><div class="hero-static-fill" style="width:75.6%;background:#84E6B7"></div></div>
+                <div class="hero-static-meta"><span class="hero-static-series"><i style="background:#84E6B7"></i><strong>10,536 tok/s</strong> &nbsp; 24.3 ms/step</span></div>
               </div>
             </div>
             <div class="hero-static-row">
-              <div class="hero-static-label">N=256 vLLM</div>
+              <div class="hero-static-label"><strong>B=128</strong></div>
               <div class="hero-static-bars">
-                <div class="hero-static-track"><div class="hero-static-fill" style="width:66.6%;background:#5a8bd4"></div></div>
-                <div class="hero-static-meta"><span class="hero-static-series"><i style="background:#5a8bd4"></i>27,996 tok/s &nbsp; v3 +22.8%</span></div>
+                <div class="hero-static-track"><div class="hero-static-fill" style="width:49%;background:#84E6B7"></div></div>
+                <div class="hero-static-meta"><span class="hero-static-series"><i style="background:#84E6B7"></i><strong>6,831 tok/s</strong> &nbsp; 18.7 ms/step</span></div>
               </div>
             </div>
             <div class="hero-static-row">
-              <div class="hero-static-label"><strong>N=128 v3</strong></div>
+              <div class="hero-static-label"><strong>B=64</strong></div>
               <div class="hero-static-bars">
-                <div class="hero-static-track"><div class="hero-static-fill" style="width:52.5%;background:#84E6B7"></div></div>
-                <div class="hero-static-meta"><span class="hero-static-series"><i style="background:#84E6B7"></i><strong>22,069 tok/s</strong></span></div>
+                <div class="hero-static-track"><div class="hero-static-fill" style="width:30.3%;background:#84E6B7"></div></div>
+                <div class="hero-static-meta"><span class="hero-static-series"><i style="background:#84E6B7"></i><strong>4,220 tok/s</strong> &nbsp; 15.2 ms/step</span></div>
               </div>
             </div>
             <div class="hero-static-row">
-              <div class="hero-static-label">N=128 vLLM</div>
+              <div class="hero-static-label">B=1</div>
               <div class="hero-static-bars">
-                <div class="hero-static-track"><div class="hero-static-fill" style="width:46.2%;background:#5a8bd4"></div></div>
-                <div class="hero-static-meta"><span class="hero-static-series"><i style="background:#5a8bd4"></i>19,399 tok/s &nbsp; v3 +13.8%</span></div>
+                <div class="hero-static-track"><div class="hero-static-fill" style="width:0.6%;background:#5a8bd4"></div></div>
+                <div class="hero-static-meta"><span class="hero-static-series"><i style="background:#5a8bd4"></i>79.9 tok/s &nbsp; 12.5 ms/step &nbsp; p99: 14.8 ms</span></div>
               </div>
             </div>
           </div>
-          <p style="color:#888;font-size:0.85rem;margin-top:0.5rem">Both engines: Qwen2.5-7B-Instruct, FP8 E4M3, CUDA graphs on, <code>Avg generation throughput</code> (prefill excluded), single H100 SXM 80GB. vLLM invoked with <code>vllm bench latency --quantization fp8 --input-len 16 --output-len 512</code>.</p>
+          <p style="color:#888;font-size:0.85rem;margin-top:0.5rem">Perplexity: 25.51 (verified against HuggingFace reference). Cost: $5.20/hr (v6e-4 on-demand). Cost efficiency at B=768: 2,681 tok/s/$.</p>
         </div>
       </div>
       <div class="hero-chart-notes">
         <div class="hero-chart-pill">
-          <strong>FP8 E4M3 KV cache</strong>
-          <code>libfa3_kernels.so</code> links FA3's hdim128 E4M3 paged instantiations. KV is 1 byte/element with per-tensor descale. Halves KV memory; unlocks N=256/512 on one H100 80GB. Per-token perf at matched N=128 is flat (FA3 dequant overhead), but the memory unlock is the headline win.
+          <strong>Zero custom kernels</strong>
+          XLA compiles the entire 60-layer forward pass from ~500 lines of JAX. One flat <code>jax.lax.scan</code> with <code>jax.lax.cond</code> for dual attention types. The decode loop runs entirely on-chip via <code>jax.lax.while_loop</code>.
         </div>
         <div class="hero-chart-pill">
-          <strong>cuBLASLt FP8 + fused epilogues</strong>
-          All 5 linears (QKV, O, gate_up, down, lm_head) route through <code>cublasLtMatmul</code>. QKV uses <code>CUBLASLT_EPILOGUE_BIAS</code>; O and down use &beta;=1 for residual-fused epilogue. Per-shape algo cache so the heuristic runs once.
+          <strong>5-minute deploy</strong>
+          <code>gcloud tpu create</code> + <code>pip install jax[tpu]</code> + <code>python3 gemma4_tpu_infer.py</code>. No Docker, no conda, no torch, no vLLM. One Python file.
         </div>
         <div class="hero-chart-pill">
-          <strong>One cuGraphLaunch per step</strong>
-          All layer + sampling kernels captured. Packed QKV = 1 GEMM (not 3). Metadata re-uploaded each step to match a real scheduler's per-step HtoD cost. No megakernels. No Python in the hot path.
+          <strong>3.5-8x better $/tok than GPU</strong>
+          TPU v6e-4 at $5.20/hr delivers 2,681 tok/s/$ vs H100 SXM at 600-750 tok/s/$. Higher aggregate bandwidth per dollar + near-perfect batch scaling on MXU.
         </div>
       </div>
     </div>
