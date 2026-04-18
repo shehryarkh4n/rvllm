@@ -474,6 +474,23 @@ impl Gemma4Bringup {
         let stream = self.stream.raw();
         let num_seqs: u32 = 1;
 
+        let max_layers: usize = std::env::var("RVLLM_MAX_LAYERS")
+            .ok().and_then(|s| s.parse().ok())
+            .unwrap_or(arch.num_hidden_layers);
+        let skip_softcap = std::env::var("RVLLM_NO_SOFTCAP").map_or(false, |v| v == "1");
+        let dbg_lmhead = std::env::var("RVLLM_DBG_LAYER").is_ok();
+        if max_layers < arch.num_hidden_layers {
+            eprintln!("[ppl] RVLLM_MAX_LAYERS={max_layers} (of {})", arch.num_hidden_layers);
+        }
+        if skip_softcap {
+            eprintln!("[ppl] RVLLM_NO_SOFTCAP=1: softcap disabled");
+        }
+
+        let skip_softcap = std::env::var("RVLLM_NO_SOFTCAP").map_or(false, |v| v == "1");
+        if skip_softcap {
+            eprintln!("[run_ppl] WARNING: RVLLM_NO_SOFTCAP=1 -- logit softcap DISABLED");
+        }
+
         let block_size: u32 = std::env::var("RVLLM_BLOCK_SIZE")
             .ok().and_then(|s| s.parse().ok()).unwrap_or(32);
         let num_blocks_total: u32 = std::env::var("RVLLM_NUM_BLOCKS")
@@ -553,9 +570,14 @@ impl Gemma4Bringup {
             down: Fp8GemmPlan::from_policy_residual(&self.policy, num_seqs, hidden, inter, rvllm_core::DType::Fp8E4M3)?,
         };
 
+        let max_layers: usize = std::env::var("RVLLM_MAX_LAYERS")
+            .ok().and_then(|s| s.parse().ok())
+            .unwrap_or(arch.num_hidden_layers);
+
         let step_counter = std::cell::Cell::new(0u32);
         let one_step = || -> Result<()> {
             for (layer_idx, layer) in self.model.layers.iter().enumerate() {
+                if layer_idx >= max_layers { break; }
                 let lt = arch.layer_types[layer_idx];
                 let hd = arch.head_dim_for_layer(layer_idx) as u32;
                 let nkvh = arch.num_kv_heads_for_layer(layer_idx) as u32;
@@ -699,6 +721,9 @@ impl Gemma4Bringup {
             }
 
             // LM head: final norm + FP8 quant + GEMM + softcap
+            let dbg_lmhead = step_counter.get() == 0
+                && std::env::var("RVLLM_DBG_LAYER").is_ok();
+
             rvllm_fused::FusedRmsnormFp8QuantLaunch {
                 num_tokens: num_seqs, hidden, eps: arch.rms_norm_eps,
             }.launch(
@@ -706,17 +731,60 @@ impl Gemma4Bringup {
                 hidden_fp8.device_ptr(), hidden_scale.device_ptr(),
                 residual_ptr, self.model.final_norm.offset_bytes, stream,
             )?;
+            if dbg_lmhead {
+                cudarc::driver::sys::cuStreamSynchronize(stream as _);
+                let mut sc = [0.0f32; 1];
+                cudarc::driver::sys::cuMemcpyDtoH_v2(
+                    sc.as_mut_ptr() as *mut _, hidden_scale.device_ptr(), 4,
+                );
+                let mut fp8 = [0u8; 4];
+                cudarc::driver::sys::cuMemcpyDtoH_v2(
+                    fp8.as_mut_ptr() as *mut _, hidden_fp8.device_ptr(), 4,
+                );
+                eprintln!("  [lm_head] after rmsnorm_fp8_quant: hidden_scale={:.6e} hidden_fp8={:?}", sc[0], fp8);
+            }
             self.cublaslt.fp8_gemm_f32(
                 hidden_fp8.device_ptr(), self.model.lm_head_fp8.offset_bytes,
                 logits_f32.device_ptr(), num_seqs as i32, vocab as i32, hidden as i32,
                 hidden_scale.device_ptr(), self.model.lm_head_fp8.scale_ptr, stream,
             )?;
+            if dbg_lmhead {
+                cudarc::driver::sys::cuStreamSynchronize(stream as _);
+                let total = (vocab as usize) * (num_seqs as usize);
+                let mut buf = vec![0.0f32; total];
+                cudarc::driver::sys::cuMemcpyDtoH_v2(
+                    buf.as_mut_ptr() as *mut _, logits_f32.device_ptr(), (total * 4) as _,
+                );
+                let amax = buf.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+                eprintln!("  [lm_head] raw_f32_logits first8={:.4?} amax={:.6e} (n={})",
+                    &buf[..8.min(total)], amax, total);
+            }
             rvllm_fused::gemma4_launcher::Bf16ToF16SatLaunch { n: num_seqs * vocab }
                 .launch(kernels.f32_to_f16_sat, logits.device_ptr(), logits_f32.device_ptr(), stream)?;
-            logit_softcap(
-                self.fused.fn_softcap, logits.device_ptr(),
-                num_seqs, vocab, arch.logit_softcap, stream,
-            )?;
+            if dbg_lmhead {
+                cudarc::driver::sys::cuStreamSynchronize(stream as _);
+                let mut s = [0u16; 4];
+                cudarc::driver::sys::cuMemcpyDtoH_v2(
+                    s.as_mut_ptr() as *mut _, logits.device_ptr(), 8,
+                );
+                let v: Vec<f32> = s.iter().map(|&x| f16_to_f32(x)).collect();
+                eprintln!("  [lm_head] after f32_to_f16_sat: logits_f16 first4={:.4?}", v);
+            }
+            if !skip_softcap {
+                logit_softcap(
+                    self.fused.fn_softcap, logits.device_ptr(),
+                    num_seqs, vocab, arch.logit_softcap, stream,
+                )?;
+            }
+            if dbg_lmhead {
+                cudarc::driver::sys::cuStreamSynchronize(stream as _);
+                let mut s = [0u16; 4];
+                cudarc::driver::sys::cuMemcpyDtoH_v2(
+                    s.as_mut_ptr() as *mut _, logits.device_ptr(), 8,
+                );
+                let v: Vec<f32> = s.iter().map(|&x| f16_to_f32(x)).collect();
+                eprintln!("  [lm_head] after softcap: logits_f16 first4={:.4?}", v);
+            }
             step_counter.set(step_counter.get() + 1);
             Ok(())
         };
