@@ -1343,6 +1343,14 @@ pub(crate) fn compute_nll_f16(logits_f16: &[u16], target: usize) -> f64 {
 }
 
 #[cfg(feature = "cuda")]
+pub(crate) fn compute_nll_f32(logits: &[f32], target: usize) -> f64 {
+    let max_val = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let sum_exp: f64 = logits.iter().map(|&v| ((v - max_val) as f64).exp()).sum();
+    let log_sum_exp = sum_exp.ln() + max_val as f64;
+    log_sum_exp - logits[target] as f64
+}
+
+#[cfg(feature = "cuda")]
 #[inline(always)]
 pub fn f16_to_f32(bits: u16) -> f32 {
     let sign = ((bits >> 15) & 1) as u32;

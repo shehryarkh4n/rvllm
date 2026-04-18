@@ -800,8 +800,8 @@ impl Gemma4Bringup {
         };
 
         let logits_row_elems = vocab as usize;
-        let logits_row_bytes = logits_row_elems * 2;
-        let mut logits_host: Vec<u16> = vec![0u16; logits_row_elems];
+        let logits_row_bytes_f32 = logits_row_elems * 4;
+        let mut logits_host_f32: Vec<f32> = vec![0.0f32; logits_row_elems];
         let mut total_nll: f64 = 0.0;
         let mut n_evaluated: usize = 0;
 
@@ -831,20 +831,27 @@ impl Gemma4Bringup {
 
             if t + 1 < token_ids.len() {
                 dtoh_async_sync(
-                    logits.device_ptr(),
-                    logits_host.as_mut_ptr() as *mut i32,
-                    logits_row_bytes, stream,
+                    logits_f32.device_ptr(),
+                    logits_host_f32.as_mut_ptr() as *mut i32,
+                    logits_row_bytes_f32, stream,
                 )?;
                 self.stream.fence()?;
 
+                let cap = arch.logit_softcap;
+                if !skip_softcap && cap > 0.0 {
+                    for x in logits_host_f32.iter_mut() {
+                        *x = cap * (*x / cap).tanh();
+                    }
+                }
+
                 let target = token_ids[t + 1] as usize;
                 if t == 0 {
-                    let first5: Vec<f32> = logits_host[..5].iter().map(|&b| f16_to_f32(b)).collect();
-                    let max_val = logits_host.iter().map(|&b| f16_to_f32(b)).filter(|v| !v.is_nan()).fold(f32::MIN, f32::max);
-                    let min_val = logits_host.iter().map(|&b| f16_to_f32(b)).filter(|v| !v.is_nan()).fold(f32::MAX, f32::min);
-                    eprintln!("  [ppl] logits: first5={:?} min={:.1} max={:.1}", first5, min_val, max_val);
+                    let first5: Vec<f32> = logits_host_f32[..5].to_vec();
+                    let max_val = logits_host_f32.iter().copied().filter(|v| !v.is_nan()).fold(f32::MIN, f32::max);
+                    let min_val = logits_host_f32.iter().copied().filter(|v| !v.is_nan()).fold(f32::MAX, f32::min);
+                    eprintln!("  [ppl] logits(f32+softcap): first5={:?} min={:.1} max={:.1}", first5, min_val, max_val);
                 }
-                let nll = compute_nll_f16(&logits_host, target);
+                let nll = crate::bring_up::compute_nll_f32(&logits_host_f32, target);
                 total_nll += nll;
                 n_evaluated += 1;
 
