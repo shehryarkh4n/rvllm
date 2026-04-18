@@ -98,16 +98,61 @@ fn run() -> Result<(), String> {
     if is_gemma4_model_dir(&model_dir)? {
         let g4_paths = Gemma4EnginePaths {
             model_dir: paths.model_dir,
-            kernels_dir: paths.kernels_dir,
+            kernels_dir: paths.kernels_dir.clone(),
             cutlass_so: paths.cutlass_so,
             fa3_so: paths.fa3_so,
             policy_json: paths.policy_json,
         };
-        let _g4 = Gemma4Bringup::load(g4_paths, arena_bytes)
+        let g4 = Gemma4Bringup::load(g4_paths, arena_bytes)
             .map_err(|e| format!("gemma4 bringup: {e}"))?;
-        return Err(
-            "Gemma 4 perplexity still needs the Gemma4 forward/logits path; this binary no longer falls back to the generic engine".into(),
-        );
+        eprintln!("bringup: {:.2}s", t0.elapsed().as_secs_f64());
+
+        let embed_mod = g4.kernels
+            .load_ptx("embedding_gather_f16")
+            .map_err(|e| format!("load embedding_gather_f16: {e}"))?;
+        let fn_embed = embed_mod
+            .get_function("embedding_gather_f16_kernel")
+            .map_err(|e| format!("get embedding_gather_f16_kernel: {e}"))?;
+
+        let mut chunks: Vec<&[u32]> = all_ids.chunks(chunk_len).collect();
+        if let Some(last) = chunks.last() {
+            if last.len() < chunk_len { chunks.pop(); }
+        }
+        if max_chunks > 0 && chunks.len() > max_chunks {
+            chunks.truncate(max_chunks);
+        }
+        if chunks.is_empty() {
+            return Err(format!("not enough tokens ({}) for chunk_len={chunk_len}", all_ids.len()));
+        }
+        eprintln!("evaluating {} chunks of {} tokens", chunks.len(), chunk_len);
+
+        let mut total_nll: f64 = 0.0;
+        let mut total_tokens: usize = 0;
+        let t_eval = Instant::now();
+
+        for (ci, chunk) in chunks.iter().enumerate() {
+            let chunk_t0 = Instant::now();
+            let result = unsafe { g4.run_ppl(fn_embed, chunk) }
+                .map_err(|e| format!("run_ppl chunk {ci}: {e}"))?;
+            total_nll += result.total_nll;
+            total_tokens += result.n_evaluated;
+            let running_ppl = (total_nll / total_tokens as f64).exp();
+            let chunk_ppl = if result.n_evaluated > 0 {
+                (result.total_nll / result.n_evaluated as f64).exp()
+            } else { 0.0 };
+            eprintln!(
+                "chunk {}/{}: chunk_ppl={:.4} running_ppl={:.4} ({:.1} tok/s, {:.1}s)",
+                ci + 1, chunks.len(), chunk_ppl, running_ppl,
+                chunk.len() as f64 / chunk_t0.elapsed().as_secs_f64(),
+                chunk_t0.elapsed().as_secs_f64()
+            );
+        }
+
+        let ppl = (total_nll / total_tokens as f64).exp();
+        let elapsed = t_eval.elapsed().as_secs_f64();
+        eprintln!("perplexity = {ppl:.4} ({total_tokens} tokens, {elapsed:.1}s)");
+        println!("{{\"perplexity\":{ppl:.4},\"tokens\":{total_tokens},\"chunk_len\":{chunk_len},\"elapsed_s\":{elapsed:.1}}}");
+        return Ok(());
     }
 
     let br = Bringup::load(paths, arena_bytes).map_err(|e| format!("bringup: {e}"))?;
