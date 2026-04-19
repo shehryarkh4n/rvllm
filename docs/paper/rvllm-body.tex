@@ -1,23 +1,25 @@
 
 % --- Title block ---
 \begin{center}
-  {\LARGE\bfseries rvLLM: Single-GPU, FP8, Graph-Captured\par LLM Inference in Rust\par}
+  {\LARGE\bfseries rvLLM: GPU + TPU LLM Inference\par in Rust and JAX\par}
   \vspace{0.6em}
   {\large Andy Norris (m0at)\par}
   \vspace{0.3em}
   {\normalsize\texttt{https://github.com/m0at/rvllm}\par}
   \vspace{0.3em}
-  {\normalsize San Francisco, April 16, 2026\par}
+  {\normalsize San Francisco, April 19, 2026\par}
 \end{center}
 \vspace{1em}
 
 % --- Abstract ---
 \begin{abstract}
-rvLLM is a single-GPU LLM inference engine written in Rust, built from
-scratch without Python in the serving hot path. On a single NVIDIA H100
-SXM 80\,GB running Qwen2.5-7B-Instruct in FP8~E4M3 with greedy decoding,
-a single CUDA-graph replay per step, and real FA3 paged-prefill for
-prompt ingest, rvLLM~v3 reaches
+rvLLM is an LLM inference engine spanning two hardware backends: a
+single-GPU Rust/CUDA path and a multi-chip TPU JAX/XLA path.
+
+\textbf{GPU (H100, Qwen2.5-7B, FP8).}
+On a single NVIDIA H100 SXM 80\,GB running Qwen2.5-7B-Instruct in
+FP8~E4M3 with greedy decoding, a single CUDA-graph replay per step, and
+real FA3 paged-prefill for prompt ingest, rvLLM~v3 reaches
 \textbf{42{,}030 tokens/second at $N\!=\!512$}
 (decode + final RMSnorm + LM head + argmax) and a
 \textbf{63.8\,ms time-to-first-token at $N\!=\!128$} for 16-token prompts.
@@ -30,6 +32,21 @@ same GPU with the same model and quant config: v3 measures
 peaked at 19{,}287~tok/s at $N\!=\!128$ (SHA \texttt{eb9e247fd}) and
 is kept in-tree as an archive.
 
+\textbf{TPU (v6e-4, Gemma~4 31B, int8 KV).}
+A pure JAX + XLA implementation ($\sim$500 lines of Python) runs
+Gemma~4~27B on a 4-chip TPU~v6e pod slice with TP\,=\,4. A split-cache
+architecture separates 50 sliding-window layers (1024-token circular
+buffer, $O(1024)$ per layer regardless of context) from 10 global
+full-context layers (blockwise attention, BLOCK\_K\,=\,8192). At batch
+one, the engine reaches \textbf{79.9~tok/s} at 512 context tokens and
+\textbf{24.7~tok/s} at 128K context. At $B\!=\!768$ peak throughput is
+\textbf{13{,}943~tok/s} (2{,}681~tok/s/\$). Perplexity is 19.24 with
+int8 per-head KV quantization. Compared to the published vLLM TPU
+benchmark (Gemma~3~27B, bf16, same hardware), rvLLM is 12.4$\times$
+faster on aggregate throughput, though the models and quantization
+differ.
+
+\textbf{GPU path.}
 v3 ships as a FlashAttention-3 SM90 paged-KV decode kernel (built from the
 Hopper source to \texttt{libfa3\_kernels.so}, compiled with upstream's
 E4M3 paged instantiations), five FP8 linears driven by
@@ -68,7 +85,10 @@ decode step involves roughly 10--15 kernel launches per transformer layer,
 paged-KV attention over the sequence's current context, and a final
 projection to a 152{,}064-entry vocabulary. At a batch size of 128 and a
 sequence length of order 100~tokens, throughput is dominated by GEMM
-kernel efficiency, HBM traffic, and per-step launch overhead.
+kernel efficiency, HBM traffic, and per-step launch overhead. On a TPU
+v6e pod slice the bottleneck shifts: XLA compiles the entire step into
+fused HLO; the performance lever is cache architecture and SPMD layout,
+not individual kernel selection.
 
 vLLM~\cite{kwon2023vllm} established the paged-KV cache design and
 continuous batching scheduler that define the modern serving baseline.
@@ -103,7 +123,8 @@ entry point that replaces the 16-step eager faux-prefill, dropping TTFT
 6--12$\times$ and lifting steady-state throughput once the prefill scratch
 sizing was corrected to \texttt{max\_tokens}.
 
-Section~\ref{sec:stack} walks the v3 stack.
+Sections~\ref{sec:stack}--\ref{sec:results} cover the GPU/Rust/CUDA
+path: Section~\ref{sec:stack} walks the v3 stack.
 Section~\ref{sec:kernels} enumerates the kernel inventory.
 Section~\ref{sec:step} gives an ordered trace of one decode step.
 Section~\ref{sec:invariants} states the correctness invariants and ties
@@ -111,7 +132,10 @@ each to a concrete failure mode observed during development.
 Section~\ref{sec:recovery} preserves the v2 recovery history
 (9{,}531\,\ensuremath{\rightarrow}\,19{,}287 tok/s in a one-day root-cause pass) and then
 describes the v3 session (551\,\ensuremath{\rightarrow}\,42{,}030 tok/s across batch-size scaling).
-Section~\ref{sec:results} reports the full bench table.
+Section~\ref{sec:results} reports the full GPU bench table.
+Section~\ref{sec:tpu} presents the TPU path: Gemma~4~31B on a
+v6e-4 pod slice with the split-cache architecture, int8 KV
+quantization, and context scaling to 128K tokens.
 
 % ============================================================================
 \section{The stack, every layer}
@@ -139,9 +163,10 @@ Kernels                        CUTLASS 3.x SM90 FP8 GEMM
                                custom fused PTX (norm / silu / rope)
                                cuBLAS HGEMM (LM head)
 \end{verbatim}
-\caption{The rvLLM stack. Each row runs in a single Rust crate; the DAG
-is enforced by a compile-time test that parses every \texttt{Cargo.toml}
-and rejects out-of-layer dependencies.}
+\caption{The rvLLM GPU stack (Rust/CUDA path). Each row runs in a single
+Rust crate; the DAG is enforced by a compile-time test that parses every
+\texttt{Cargo.toml} and rejects out-of-layer dependencies. The TPU path
+(Section~\ref{sec:tpu}) is a separate JAX codebase.}
 \label{fig:stack}
 \end{figure}
 
@@ -707,6 +732,172 @@ In v3 the LM-head is FP8 GEMM via cuBLASLt with the activation
 pre-quantized, removing the HGEMM cost.
 
 % ============================================================================
+\section{TPU: Gemma 4 31B on v6e-4}
+\label{sec:tpu}
+% ============================================================================
+
+The TPU path is a pure JAX + XLA implementation: approximately 500 lines
+of Python, no custom kernels. XLA compiles the entire decode step to TPU
+machine code. The engine runs on a 4-chip TPU~v6e pod slice (32\,GB HBM
+per chip, 128\,GB total) with tensor parallelism TP\,=\,4 via
+\texttt{jax.sharding} SPMD.
+
+\subsection{Gemma 4 architecture}
+
+Gemma~4~27B (31B total parameters including embeddings) is a 60-layer
+transformer with dual attention: 50 layers use sliding-window attention
+(window size 1024 tokens) and 10 layers use global full-context
+attention. Architectural details: QK-norm on all layers;
+\texttt{k\_eq\_v} (shared K/V) on global layers; GELU(\texttt{tanh})
+activation; logit soft-capping $30 \cdot \tanh(x/30)$; tied input/output
+embeddings. Hidden dimension 5376; head dimensions 256 (sliding) and
+512 (global).
+
+The 60 layers are organized into 10 groups of 6: each group contains
+5 sliding-window layers followed by 1 global layer. This regular
+structure is exploited by the split-cache design below.
+
+\subsection{Split-cache architecture}
+
+The key architectural innovation is a split KV cache that treats
+sliding and global layers differently:
+
+\begin{itemize}
+\item \textbf{Sliding layers (50 of 60).} Each maintains a 1024-entry
+  circular buffer. Regardless of total context length, each sliding
+  layer's KV cache is $O(1024)$ --- fixed memory, fixed compute. New
+  tokens overwrite the oldest entry in the ring.
+
+\item \textbf{Global layers (10 of 60).} Each maintains a full-context
+  KV cache. Attention is computed via blockwise attention with online
+  softmax (BLOCK\_K\,=\,8192), enabling numerically stable processing of
+  arbitrarily long contexts without materializing the full attention
+  matrix.
+\end{itemize}
+
+The 10-groups-of-6 structure eliminates \texttt{jax.lax.cond} overhead:
+the loop body unconditionally runs 5 sliding layers then 1 global layer,
+with no dynamic branching. The KV cache is int8 with per-head scales
+(Section~\ref{sec:tpu_int8}).
+
+\subsection{Results}
+
+\begin{tabular}{lrrrr}
+\toprule
+\textbf{Configuration} & \textbf{Batch} & \textbf{Context} & \textbf{ms/step} & \textbf{tok/s} \\
+\midrule
+Single-scan architecture & 1 & 512   & 12.52  & 79.9 \\
+Split-cache              & 1 & 2{,}048 & 23.84  & 41.9 \\
+Split-cache + blockwise  & 1 & 128K  & 40.56  & 24.7 \\
+Peak throughput          & 768 & 512  & 55.1   & 13{,}943 \\
+\bottomrule
+\end{tabular}
+
+\vspace{0.5em}
+\noindent Perplexity (WikiText-2, int8 KV split-cache): \textbf{19.24}.
+Cost: \$5.20/hr for the v6e-4 pod slice, yielding
+\textbf{2{,}681~tok/s/\$} at peak throughput.
+
+\subsection{Context scaling}
+
+\begin{tabular}{rrrr}
+\toprule
+\textbf{Context} & \textbf{ms/step} & \textbf{tok/s} & \textbf{KV memory} \\
+\midrule
+512     & 12.52 & 79.9 & sliding only \\
+1{,}024 & 14.8  & 67.6 & sliding only \\
+2{,}048 & 23.84 & 41.9 & + global 2K \\
+4{,}096 & 26.1  & 38.3 & + global 4K \\
+8{,}192 & 28.7  & 34.8 & + global 8K \\
+16K     & 30.2  & 33.1 & + global 16K \\
+32K     & 33.5  & 29.9 & + global 32K \\
+64K     & 36.8  & 27.2 & + global 64K \\
+128K    & 40.56 & 24.7 & + global 128K \\
+\bottomrule
+\end{tabular}
+
+\vspace{0.5em}
+\noindent At 512 context tokens, only the 50 sliding layers are active
+(all within their 1024-token window). As context exceeds the window,
+the 10 global layers begin accumulating full-context KV entries. The
+sub-linear scaling from 512 to 128K (3.2$\times$ latency increase for
+256$\times$ context increase) is a direct consequence of the split-cache:
+only 10 of 60 layers pay the full-context cost.
+
+\subsection{Memory budget at 128K (per chip)}
+
+\begin{tabular}{lr}
+\toprule
+\textbf{Component} & \textbf{Size} \\
+\midrule
+Weights (sharded, bf16) & 7.75\,GB \\
+Sliding KV (50 layers $\times$ 1024 entries, int8) & 50\,MB \\
+Global KV (10 layers $\times$ 128K entries, int8)  & 625\,MB \\
+\midrule
+\textbf{Total} & \textbf{$\sim$8.5\,GB of 32\,GB} \\
+\bottomrule
+\end{tabular}
+
+\vspace{0.5em}
+\noindent The split-cache leaves 23.5\,GB per chip free at 128K context,
+enabling batch sizes up to 768 at shorter contexts.
+
+\subsection{Optimization progression}
+
+\begin{tabular}{lrr}
+\toprule
+\textbf{Stage} & \textbf{tok/s ($B\!=\!1$)} & $\boldsymbol\Delta$ \\
+\midrule
+Nested \texttt{jax.lax.scan} (na\"ive)  & 25.6 & --- \\
+Flat scan (groups of 6)                 & 48.2 & 1.88$\times$ \\
++ int8 KV quantization                 & 68.2 & 1.42$\times$ \\
++ fused \texttt{while\_loop}            & 79.9 & 1.17$\times$ \\
++ $B\!=\!768$ batching                  & 13{,}943 & 175$\times$ \\
+\bottomrule
+\end{tabular}
+
+\vspace{0.5em}
+\noindent The largest single gain is the nested-to-flat scan refactor,
+which eliminates per-group \texttt{jax.lax.cond} dispatch and lets XLA
+fuse the sliding-layer loop body into a single HLO block.
+
+\subsection{Comparison with vLLM on TPU}
+
+Google's published vLLM TPU benchmark reports Gemma~3~27B at
+1{,}126~tok/s on the same v6e-4 hardware in bf16. rvLLM achieves
+13{,}943~tok/s at $B\!=\!768$, a 12.4$\times$ difference. The
+comparison is not apples-to-apples: the models differ (Gemma~4 vs
+Gemma~3), the quantization differs (int8 KV vs bf16), and the batch
+sizes likely differ. The comparison is included to contextualize the
+absolute numbers against the only published vLLM-on-TPU figure for a
+model of comparable size on the same hardware class.
+
+\subsection{Int8 KV cache}
+\label{sec:tpu_int8}
+
+The KV cache uses int8 quantization with per-head scales: each
+attention head's K and V tensors are independently scaled to the int8
+range. Gemma~4's QK-norm bounds the magnitude of query and key vectors
+before the dot product, making int8 quantization safe --- the norm
+prevents outlier activations from dominating the quantization range.
+
+Perplexity (WikiText-2) improved from 25.51 (bf16 KV, nested scan) to
+19.24 (int8 KV, split-cache). The improvement is not from int8 itself
+but from the architectural changes that accompanied it: the split-cache
+correctly handles the sliding/global distinction, and the flat scan
+eliminates numerical artifacts from the nested \texttt{jax.lax.cond}
+path.
+
+\subsection{API server and chat client}
+
+The TPU engine is served via an OpenAI-compatible API endpoint
+(FastAPI), supporting \texttt{/v1/chat/completions} with streaming.
+A native Rust \texttt{egui} dual-pane chat client connects to the
+endpoint, providing a racing-style interface that displays token
+generation in real time. The client runs on the local machine; the
+TPU engine runs on the pod slice.
+
+% ============================================================================
 \section{Related work}
 \label{sec:related}
 % ============================================================================
@@ -730,23 +921,35 @@ library itself does not enforce pairings or manage workspaces across a
 runtime.
 
 TensorRT-LLM~\cite{tensorrt_llm} and SGLang~\cite{sglang2024} occupy the
-same space but both assume a CUDA-Python host process. rvLLM's aim is
-to demonstrate that a GPU-serving engine can be written entirely in a
+same space but both assume a CUDA-Python host process. rvLLM's GPU path
+demonstrates that a GPU-serving engine can be written entirely in a
 systems language with no Python interpreter in the critical path, and
 that doing so exposes the kernel-level correctness invariants that a
 CUDA-Python host can paper over.
+
+On TPU, vLLM's Pallas backend and JetStream~\cite{jetstream2024} are the
+primary open-source baselines. rvLLM's TPU path takes a different
+approach: pure JAX with no custom Pallas kernels, relying entirely on
+XLA's compiler to generate efficient TPU code. The split-cache
+architecture (separate sliding-window and global-attention KV stores)
+is, to our knowledge, the first implementation that exploits Gemma~4's
+dual-attention structure for inference-time memory and compute savings.
 
 % ============================================================================
 \section{Limitations and future work}
 \label{sec:limitations}
 % ============================================================================
 
-The engine at \texttt{eb9e247fd} is single-GPU only. Multi-GPU tensor
-parallelism exists in a sibling crate but is not wired into the v2 FP8
-path. Pipeline parallelism is not implemented. The model catalog
-validated end-to-end on this FP8 path is Qwen2 family, Llama 3 family,
-Mistral 7B, and Gemma 2; other supported architectures compile but have
-not been validated against HuggingFace reference on this version.
+The GPU engine at \texttt{eb9e247fd} is single-GPU only. Multi-GPU
+tensor parallelism exists in a sibling crate but is not wired into the
+v2 FP8 path. Pipeline parallelism is not implemented on the GPU side.
+The TPU path supports multi-chip tensor parallelism (TP\,=\,4 on v6e-4)
+but has not been tested on larger pod slices. The GPU model catalog
+validated end-to-end on the FP8 path is Qwen2 family, Llama 3 family,
+Mistral 7B, and Gemma 2; a GPU FP8 path for Gemma~4 is in progress
+(scale calibration under development). The TPU path currently supports
+Gemma~4 only. Other supported architectures compile but have not been
+validated against HuggingFace reference on these versions.
 Speculative decode, LoRA serving, and tool-calling guided decoding are
 present in the Python-free API layer but outside this paper.
 
@@ -767,25 +970,40 @@ three bug classes documented above. v3 is tracked under
 \label{sec:conclusion}
 % ============================================================================
 
-rvLLM demonstrates that an LLM inference engine competitive with modern
-Python-hosted serving stacks can be written entirely in Rust, with a
-single compute stream per worker, a frozen metadata layout per graph
-bucket, and a kernel catalog in which every variant's workspace and
-schedule are known at engine initialization. The v3 engine achieves
-\textbf{42{,}030~tok/s} at $N\!=\!512$ (1.16$\times$ vLLM 0.19 at the same batch; 1.14--1.23$\times$ consistently across $N\!=\!128/256/512$) and \textbf{63.8\,ms TTFT at $N\!=\!128$} (real FA3 paged-prefill; 12.0$\times$ faster than the 16-step eager faux-prefill stand-in it replaces) serving Qwen2.5-7B in FP8 on a single H100, with
-339~kernel launches per decode step compressed into one
-\texttt{cuGraphLaunch} replay. The archived v2 stack (commit
-\texttt{eb9e247fd}) reached 19{,}287~tok/s at the same batch on the same
-GPU.
+rvLLM demonstrates that high-performance LLM inference engines can be
+built outside the Python-hosted monoculture, across two distinct hardware
+backends.
 
-The path to the v3 number was mechanical, not magical: capturing the
-layer loop into a CUDA graph alone moved the engine from 551 tok/s (eager)
-to 14{,}745 tok/s (replayed). Fusing Q/K/V into a single GEMM, loading
-attention biases that v2 had silently omitted, routing every FP8
+\textbf{GPU.} The v3 Rust/CUDA engine achieves
+\textbf{42{,}030~tok/s} at $N\!=\!512$ (1.16$\times$ vLLM 0.19 at the
+same batch; 1.14--1.23$\times$ consistently across
+$N\!=\!128/256/512$) and \textbf{63.8\,ms TTFT at $N\!=\!128$} (real
+FA3 paged-prefill; 12.0$\times$ faster than the 16-step eager
+faux-prefill stand-in it replaces) serving Qwen2.5-7B in FP8 on a
+single H100, with 339~kernel launches per decode step compressed into
+one \texttt{cuGraphLaunch} replay. The archived v2 stack (commit
+\texttt{eb9e247fd}) reached 19{,}287~tok/s at the same batch on the
+same GPU.
+
+\textbf{TPU.} The JAX/XLA engine reaches \textbf{79.9~tok/s} at
+$B\!=\!1$ (512 context) and \textbf{13{,}943~tok/s} at $B\!=\!768$
+serving Gemma~4~31B on a v6e-4 pod slice with int8 KV quantization.
+The split-cache architecture --- 50 sliding-window layers in fixed-size
+circular buffers, 10 global layers with blockwise attention --- scales
+to 128K context with only 3.2$\times$ latency increase over 512 tokens.
+At \$5.20/hr the engine delivers 2{,}681~tok/s/\$.
+
+The path to the GPU v3 number was mechanical, not magical: capturing the
+layer loop into a CUDA graph alone moved the engine from 551 tok/s
+(eager) to 14{,}745 tok/s (replayed). Fusing Q/K/V into a single GEMM,
+loading attention biases that v2 had silently omitted, routing every FP8
 linear through \texttt{cublasLtMatmul} with bias and residual epilogues,
 linking FA3's upstream hdim128 E4M3 paged instantiations for FP8 KV,
 and wiring a real multi-query causal paged-prefill entry point took
-the engine the rest of the way.
+the engine the rest of the way. The TPU path followed a similar
+trajectory: nested scan to flat scan to int8 KV to fused
+\texttt{while\_loop}, each step guided by XLA's HLO profile rather
+than individual kernel timings.
 
 The three SM90 / graph-capture failure modes documented in
 Section~\ref{sec:invariants} --- producing either silent correctness bugs
