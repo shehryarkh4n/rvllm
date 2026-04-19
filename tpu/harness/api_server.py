@@ -13,6 +13,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 import jax
 import jax.numpy as jnp
 import numpy as np
+import ml_dtypes
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -36,7 +37,7 @@ MAX_CTX = 2048
 GEN_LOCK = threading.Lock()
 
 BOS_TOKEN = 2
-EOS_TOKENS = {1, 2, 107}
+EOS_TOKENS = {1, 2}
 TURN_TOKENS = None  # populated after tokenizer loads
 
 

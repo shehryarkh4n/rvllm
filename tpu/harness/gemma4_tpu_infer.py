@@ -23,7 +23,7 @@ INTER  = 21504
 VOCAB  = 262144
 NL     = 60
 WINDOW = 1024
-BLOCK_K = 1024
+BLOCK_K = 8192
 SOFTCAP_VAL = 30.0
 EPS    = 1e-6
 B      = 1  # batch size; set via --batch flag
@@ -158,19 +158,20 @@ def _global_attn(q_flat, k_flat, v_flat, qn, kn, cos_g, sin_g, kc, vc, kc_s, vc_
     kc_s = kc_s.at[pos].set(ks)
     vc_s = vc_s.at[pos].set(vs)
     q_g = q.reshape(B, G_KVH, G_GQA, G_HD)
-    num_blocks = max_ctx // BLOCK_K
+    eff_block = min(BLOCK_K, max_ctx)
+    num_blocks = max_ctx // eff_block
 
     def block_fn(carry, block_idx):
         m_prev, l_prev, o_prev = carry
-        start = block_idx * BLOCK_K
-        kb = jax.lax.dynamic_slice(kc, [start, 0], [BLOCK_K, G_KV])
-        vb = jax.lax.dynamic_slice(vc, [start, 0], [BLOCK_K, G_KV])
-        kbs = jax.lax.dynamic_slice(kc_s, [start, 0], [BLOCK_K, G_KVH])
-        vbs = jax.lax.dynamic_slice(vc_s, [start, 0], [BLOCK_K, G_KVH])
-        k_block = _dequant_kv(kb.reshape(BLOCK_K, G_KVH, G_HD), kbs)
-        v_block = _dequant_kv(vb.reshape(BLOCK_K, G_KVH, G_HD), vbs)
+        start = block_idx * eff_block
+        kb = jax.lax.dynamic_slice(kc, [start, 0], [eff_block, G_KV])
+        vb = jax.lax.dynamic_slice(vc, [start, 0], [eff_block, G_KV])
+        kbs = jax.lax.dynamic_slice(kc_s, [start, 0], [eff_block, G_KVH])
+        vbs = jax.lax.dynamic_slice(vc_s, [start, 0], [eff_block, G_KVH])
+        k_block = _dequant_kv(kb.reshape(eff_block, G_KVH, G_HD), kbs)
+        v_block = _dequant_kv(vb.reshape(eff_block, G_KVH, G_HD), vbs)
         sc = jnp.einsum('bghd,tgd->bght', q_g.astype(jnp.float32), k_block.astype(jnp.float32))
-        abs_pos = start + jnp.arange(BLOCK_K)
+        abs_pos = start + jnp.arange(eff_block)
         valid = abs_pos < ctx
         sc = jnp.where(valid[None, None, None, :], sc, jnp.float32(-1e9))
         m_new = jnp.maximum(m_prev, jnp.max(sc, axis=-1, keepdims=True))
@@ -833,7 +834,9 @@ def main():
     print(f"mesh: {mesh}", file=sys.stderr)
 
     max_ctx = args.max_ctx
-    assert max_ctx % BLOCK_K == 0, f"max_ctx={max_ctx} must be divisible by BLOCK_K={BLOCK_K}"
+    if max_ctx % BLOCK_K != 0:
+        max_ctx = ((max_ctx + BLOCK_K - 1) // BLOCK_K) * BLOCK_K
+        print(f"  rounded max_ctx to {max_ctx} (multiple of BLOCK_K={BLOCK_K})", file=sys.stderr)
     embed, final_norm, sliding_weights, global_weights, sliding_caches, global_caches = load_model(args.model_dir, mesh, max_ctx)
 
     # Sliding RoPE only needs WINDOW+1 positions (circular buffer), but precompute up to max_ctx for simplicity
