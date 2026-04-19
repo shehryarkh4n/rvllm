@@ -5,22 +5,13 @@
 //   rmsnorm_inplace_bf16(delta, gamma)
 //   vector_add_bf16_to_f16(residual += delta)
 //
+// Single-pass: read gemm_out once into shared memory (as bf16-rounded f32),
+// compute RMSNorm sum-of-squares, then normalize + add to residual.
+//
 // Grid: (num_tokens), Block: (min(hidden, 1024))
+// Shared memory: hidden * sizeof(float) for caching rounded values
 
 #include <cuda_fp16.h>
-
-static __device__ __forceinline__ float bf16_round(float v) {
-    v = fminf(fmaxf(v, -3.3895314e+38f), 3.3895314e+38f);
-    unsigned int bits;
-    memcpy(&bits, &v, 4);
-    // Round to nearest even (IEEE 754)
-    unsigned int lsb = (bits >> 16) & 1u;
-    bits += 0x7FFFu + lsb;
-    bits &= 0xFFFF0000u;
-    float r;
-    memcpy(&r, &bits, 4);
-    return r;
-}
 
 extern "C" __global__ void fused_norm_add_residual_kernel(
     const float* __restrict__ gemm_out,
@@ -29,6 +20,8 @@ extern "C" __global__ void fused_norm_add_residual_kernel(
     int hidden,
     float eps
 ) {
+    extern __shared__ float svals[];
+
     int token = blockIdx.x;
     int tid = threadIdx.x;
     int stride = blockDim.x;
@@ -36,10 +29,18 @@ extern "C" __global__ void fused_norm_add_residual_kernel(
     const float* row = gemm_out + (size_t)token * hidden;
     half* res = residual + (size_t)token * hidden;
 
-    // Pass 1: sum of squares (bf16-truncated values)
+    // Pass 1: read f32, round to bf16 precision, cache in smem, accumulate sum_sq
     float local_ss = 0.0f;
     for (int i = tid; i < hidden; i += stride) {
-        float v = bf16_round(row[i]);
+        float v = row[i];
+        v = fminf(fmaxf(v, -3.3895314e+38f), 3.3895314e+38f);
+        unsigned int bits;
+        memcpy(&bits, &v, 4);
+        unsigned int lsb = (bits >> 16) & 1u;
+        bits += 0x7FFFu + lsb;
+        bits &= 0xFFFF0000u;
+        memcpy(&v, &bits, 4);
+        svals[i] = v;
         local_ss += v * v;
     }
 
@@ -47,26 +48,25 @@ extern "C" __global__ void fused_norm_add_residual_kernel(
     for (int offset = warpSize / 2; offset > 0; offset >>= 1)
         local_ss += __shfl_xor_sync(0xffffffff, local_ss, offset);
 
-    __shared__ float smem[32];
+    // Cross-warp reduce via shared memory (reuse last 32 floats)
+    __shared__ float warp_ss[32];
     int warp_id = tid / warpSize;
     int lane = tid % warpSize;
-    if (lane == 0) smem[warp_id] = local_ss;
+    if (lane == 0) warp_ss[warp_id] = local_ss;
     __syncthreads();
 
-    float total_ss;
     if (tid == 0) {
         int nw = (stride + warpSize - 1) / warpSize;
-        total_ss = 0.0f;
-        for (int w = 0; w < nw; w++) total_ss += smem[w];
-        smem[0] = total_ss;
+        float total = 0.0f;
+        for (int w = 0; w < nw; w++) total += warp_ss[w];
+        warp_ss[0] = total;
     }
     __syncthreads();
-    float rms_inv = rsqrtf(smem[0] / (float)hidden + eps);
+    float rms_inv = rsqrtf(warp_ss[0] / (float)hidden + eps);
 
-    // Pass 2: normalize, scale by gamma, add to residual
+    // Pass 2: read cached bf16 values from smem, normalize, add to residual
     for (int i = tid; i < hidden; i += stride) {
-        float v = bf16_round(row[i]);
-        float normed = v * rms_inv * __half2float(gamma[i]);
+        float normed = svals[i] * rms_inv * __half2float(gamma[i]);
         float r = __half2float(res[i]) + normed;
         res[i] = __float2half(r);
     }

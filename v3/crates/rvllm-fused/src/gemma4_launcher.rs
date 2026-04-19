@@ -455,7 +455,8 @@ impl FusedNormAddResidualLaunch {
         ];
         let block = (self.hidden.min(1024), 1, 1);
         let grid = (self.num_tokens, 1, 1);
-        launch_raw(kernel, grid, block, 0, stream, &args)
+        let smem = self.hidden * 4; // cache bf16-rounded f32 values
+        launch_raw(kernel, grid, block, smem, stream, &args)
     }
 }
 
