@@ -155,6 +155,7 @@ pub struct Gemma4LayerKernels {
     pub fused_rope_partial_f16kv: KernelFn,
     pub fused_norm_add_residual: KernelFn,
     pub fused_norm_add_residual_f16: KernelFn,
+    pub fused_qkv_rmsnorm: KernelFn,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -428,20 +429,8 @@ pub unsafe fn gemma4_forward_phase(
         }
     }
 
-    // 2b. V-norm: parameter-free RMS normalization on V heads.
-    gemma4_launcher::VnormF16Launch {
-        num_tokens: dims.num_tokens,
-        num_kv_heads: dims.num_kv_heads,
-        head_dim: dims.head_dim,
-        eps: dims.rms_eps,
-    }
-    .launch(kernels.vnorm_f16, scratch.v_out, stream)?;
-
-    // 3. QK-norm: RMSNorm on each Q head and each K head independently.
-    // Input: q_out [num_tokens, num_heads, head_dim], k_out [num_tokens, num_kv_heads, head_dim]
-    // q_norm_gamma, k_norm_gamma are [head_dim] vectors.
-    // Output: q_normed, k_normed (f16, same shape)
-    gemma4_launcher::FusedQkRmsnormLaunch {
+    // 2b+3. Fused QKV-norm: Q/K with learned gamma, V parameter-free
+    gemma4_launcher::FusedQkvRmsnormLaunch {
         num_tokens: dims.num_tokens,
         num_heads: dims.num_heads,
         num_kv_heads: dims.num_kv_heads,
@@ -449,9 +438,10 @@ pub unsafe fn gemma4_forward_phase(
         eps: dims.rms_eps,
     }
     .launch(
-        kernels.fused_qk_rmsnorm,
+        kernels.fused_qkv_rmsnorm,
         scratch.q_out,
         scratch.k_out,
+        scratch.v_out,
         scratch.q_normed,
         scratch.k_normed,
         weights.q_norm_gamma,

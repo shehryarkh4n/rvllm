@@ -148,6 +148,66 @@ impl FusedQkRmsnormLaunch {
 }
 
 // ---------------------------------------------------------------------------
+// fused_qkv_rmsnorm: QK-norm (with gamma) + V-norm (parameter-free) in one launch
+// ---------------------------------------------------------------------------
+
+pub struct FusedQkvRmsnormLaunch {
+    pub num_tokens: u32,
+    pub num_heads: u32,
+    pub num_kv_heads: u32,
+    pub head_dim: u32,
+    pub eps: f32,
+}
+
+impl FusedQkvRmsnormLaunch {
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch(
+        &self,
+        kernel: KernelFn,
+        q_in: u64,
+        k_in: u64,
+        v_inout: u64,
+        q_out: u64,
+        k_out: u64,
+        q_gamma: u64,
+        k_gamma: u64,
+        stream: u64,
+    ) -> Result<()> {
+        let mut q_in = q_in;
+        let mut k_in = k_in;
+        let mut v_inout = v_inout;
+        let mut q_out = q_out;
+        let mut k_out = k_out;
+        let mut q_gamma = q_gamma;
+        let mut k_gamma = k_gamma;
+        let mut num_tokens = self.num_tokens as i32;
+        let mut num_heads = self.num_heads as i32;
+        let mut num_kv_heads = self.num_kv_heads as i32;
+        let mut head_dim = self.head_dim as i32;
+        let mut eps = self.eps;
+        let args = [
+            (&mut q_in) as *mut u64 as *mut core::ffi::c_void,
+            (&mut k_in) as *mut u64 as *mut core::ffi::c_void,
+            (&mut v_inout) as *mut u64 as *mut core::ffi::c_void,
+            (&mut q_out) as *mut u64 as *mut core::ffi::c_void,
+            (&mut k_out) as *mut u64 as *mut core::ffi::c_void,
+            (&mut q_gamma) as *mut u64 as *mut core::ffi::c_void,
+            (&mut k_gamma) as *mut u64 as *mut core::ffi::c_void,
+            (&mut num_tokens) as *mut i32 as *mut core::ffi::c_void,
+            (&mut num_heads) as *mut i32 as *mut core::ffi::c_void,
+            (&mut num_kv_heads) as *mut i32 as *mut core::ffi::c_void,
+            (&mut head_dim) as *mut i32 as *mut core::ffi::c_void,
+            (&mut eps) as *mut f32 as *mut core::ffi::c_void,
+        ];
+        let total_heads = self.num_heads + 2 * self.num_kv_heads;
+        let grid = (self.num_tokens, total_heads, 1);
+        let block = (self.head_dim.min(1024), 1, 1);
+        const SMEM: u32 = 32 * 4;
+        launch_raw(kernel, grid, block, SMEM, stream, &args)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // fused_rope_partial_fp8kv
 // ---------------------------------------------------------------------------
 
