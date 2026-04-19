@@ -72,7 +72,9 @@ fused_rmsnorm_fp8_quant_kernel(
         local_ss += v * v;
     }
     float sum_sq = block_reduce_sum(local_ss, smem);
+    if (threadIdx.x == 0) smem[0] = sum_sq;
     __syncthreads();
+    sum_sq = smem[0];
 
     float rms = rsqrtf(sum_sq / (float)hidden_size + eps);
 
@@ -83,7 +85,9 @@ fused_rmsnorm_fp8_quant_kernel(
         local_max = fmaxf(local_max, fabsf(v));
     }
     float absmax = block_reduce_max(local_max, smem);
+    if (threadIdx.x == 0) smem[0] = absmax;
     __syncthreads();
+    absmax = smem[0];
 
     // Compute scale
     float scale = absmax / FP8_E4M3_MAX;
@@ -127,7 +131,9 @@ fused_add_rmsnorm_fp8_quant_kernel(
         local_ss += v * v;
     }
     float sum_sq = block_reduce_sum(local_ss, smem);
+    if (threadIdx.x == 0) smem[0] = sum_sq;
     __syncthreads();
+    sum_sq = smem[0];
 
     float rms = rsqrtf(sum_sq / (float)hidden_size + eps);
 
@@ -138,7 +144,9 @@ fused_add_rmsnorm_fp8_quant_kernel(
         local_max = fmaxf(local_max, fabsf(v));
     }
     float absmax = block_reduce_max(local_max, smem);
+    if (threadIdx.x == 0) smem[0] = absmax;
     __syncthreads();
+    absmax = smem[0];
 
     float scale = absmax / FP8_E4M3_MAX;
     scale = fmaxf(scale, 1e-12f);
@@ -175,7 +183,9 @@ quantize_fp8_per_token_kernel(
         local_max = fmaxf(local_max, fabsf(__half2float(input[row_offset + i])));
     }
     float absmax = block_reduce_max(local_max, smem);
+    if (threadIdx.x == 0) smem[0] = absmax;
     __syncthreads();
+    absmax = smem[0];
 
     float scale = absmax / FP8_E4M3_MAX;
     scale = fmaxf(scale, 1e-12f);

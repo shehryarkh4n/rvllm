@@ -677,6 +677,7 @@ fn upload_fp8(
         scale: q.scale,
         clamp_ppm: q.clamp_ppm,
         dtype: DType::Fp8E4M3,
+        channelscale_ptr: None,
     })
 }
 
@@ -710,6 +711,7 @@ fn upload_fp8_direct(
         scale,
         clamp_ppm: 0.0,
         dtype: DType::Fp8E4M3,
+        channelscale_ptr: None,
     })
 }
 
@@ -760,6 +762,7 @@ fn upload_fp8_fused_direct(
         scale: max_scale,
         clamp_ppm: 0.0,
         dtype: DType::Fp8E4M3,
+        channelscale_ptr: None,
     })
 }
 

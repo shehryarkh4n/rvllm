@@ -93,7 +93,9 @@ fused_silu_mul_fp8_quant_kernel(
     }
 
     float row_absmax = block_reduce_max(local_max, smem);
+    if (threadIdx.x == 0) smem[0] = row_absmax;
     __syncthreads();
+    row_absmax = smem[0];
 
     // Cross-block per-tensor absmax
     float global_absmax = grid_absmax_barrier(row_absmax, output_scales, num_rows);

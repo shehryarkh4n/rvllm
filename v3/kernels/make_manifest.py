@@ -28,6 +28,7 @@ NAME_TO_FILE = {
     "logit_softcap": "logit_softcap.ptx",
     "residual_scale_f16": "residual_scale_f16.ptx",
     "vnorm_f16": "vnorm_f16.ptx",
+    "scale_cols_f32": "scale_cols_f32.ptx",
     "vector_add_f16": "vector_add_f16.ptx",
     "bf16_to_f16_sat": "bf16_to_f16_sat.ptx",
     "f32_to_bf16": "f32_to_bf16.ptx",

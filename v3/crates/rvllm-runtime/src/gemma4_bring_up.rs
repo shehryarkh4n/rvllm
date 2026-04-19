@@ -45,6 +45,7 @@ pub struct Gemma4FusedModules {
     pub vector_add_bf16_to_f16_mod: LoadedModule,
     pub f32_to_bf16_mod: LoadedModule,
     pub f32_to_f16_sat_mod: LoadedModule,
+    pub scale_cols_f32_mod: LoadedModule,
     pub fn_rmsnorm: KernelFn,
     pub fn_rmsnorm_fp8_quant: KernelFn,
     pub fn_quantize: KernelFn,
@@ -61,6 +62,7 @@ pub struct Gemma4FusedModules {
     pub fn_vector_add_bf16_to_f16: KernelFn,
     pub fn_f32_to_bf16: KernelFn,
     pub fn_f32_to_f16_sat: KernelFn,
+    pub fn_scale_cols_f32: KernelFn,
 }
 
 pub struct Gemma4Bringup {
@@ -293,7 +295,7 @@ impl Gemma4Bringup {
                     block_size,
                     max_blocks_per_seq,
                     num_blocks_total,
-                    attn_scale: 1.0, // Gemma 4 uses QK-norm, not 1/sqrt(d)
+                    attn_scale: 1.0,
                     rms_eps: arch.rms_norm_eps,
                     layer_type: lt,
                     sliding_window: arch.sliding_window_size as u32,
@@ -335,6 +337,10 @@ impl Gemma4Bringup {
                     o_f16: layer.o_proj_f16.as_ref().map_or(0, |w| w.offset_bytes),
                     gate_up_f16: layer.gate_up_f16.as_ref().map_or(0, |w| w.offset_bytes),
                     down_f16: layer.down_proj_f16.as_ref().map_or(0, |w| w.offset_bytes),
+                    qkv_chscale: layer.qkv.channelscale_ptr.unwrap_or(0),
+                    o_chscale: layer.o_proj.channelscale_ptr.unwrap_or(0),
+                    gate_up_chscale: layer.gate_up.channelscale_ptr.unwrap_or(0),
+                    down_chscale: layer.down_proj.channelscale_ptr.unwrap_or(0),
                 };
 
                 let scratch = Gemma4LayerScratch {
@@ -482,18 +488,13 @@ impl Gemma4Bringup {
             .ok().and_then(|s| s.parse().ok())
             .unwrap_or(arch.num_hidden_layers);
         let skip_softcap = std::env::var("RVLLM_NO_SOFTCAP").map_or(false, |v| v == "1");
-        let dbg_lmhead = std::env::var("RVLLM_DBG_LAYER").is_ok();
         if max_layers < arch.num_hidden_layers {
             eprintln!("[ppl] RVLLM_MAX_LAYERS={max_layers} (of {})", arch.num_hidden_layers);
         }
         if skip_softcap {
             eprintln!("[ppl] RVLLM_NO_SOFTCAP=1: softcap disabled");
         }
-
-        let skip_softcap = std::env::var("RVLLM_NO_SOFTCAP").map_or(false, |v| v == "1");
-        if skip_softcap {
-            eprintln!("[run_ppl] WARNING: RVLLM_NO_SOFTCAP=1 -- logit softcap DISABLED");
-        }
+        eprintln!("[ppl] attn_scale=1.0 (Gemma4 QK-norm, no query_pre_attn_scalar)");
 
         let block_size: u32 = std::env::var("RVLLM_BLOCK_SIZE")
             .ok().and_then(|s| s.parse().ok()).unwrap_or(32);
@@ -574,10 +575,6 @@ impl Gemma4Bringup {
             down: Fp8GemmPlan::from_policy_residual(&self.policy, num_seqs, hidden, inter, rvllm_core::DType::Fp8E4M3)?,
         };
 
-        let max_layers: usize = std::env::var("RVLLM_MAX_LAYERS")
-            .ok().and_then(|s| s.parse().ok())
-            .unwrap_or(arch.num_hidden_layers);
-
         let step_counter = std::cell::Cell::new(0u32);
         let one_step = || -> Result<()> {
             for (layer_idx, layer) in self.model.layers.iter().enumerate() {
@@ -640,6 +637,10 @@ impl Gemma4Bringup {
                     o_f16: layer.o_proj_f16.as_ref().map_or(0, |w| w.offset_bytes),
                     gate_up_f16: layer.gate_up_f16.as_ref().map_or(0, |w| w.offset_bytes),
                     down_f16: layer.down_proj_f16.as_ref().map_or(0, |w| w.offset_bytes),
+                    qkv_chscale: layer.qkv.channelscale_ptr.unwrap_or(0),
+                    o_chscale: layer.o_proj.channelscale_ptr.unwrap_or(0),
+                    gate_up_chscale: layer.gate_up.channelscale_ptr.unwrap_or(0),
+                    down_chscale: layer.down_proj.channelscale_ptr.unwrap_or(0),
                 };
 
                 let scratch = Gemma4LayerScratch {
@@ -825,7 +826,23 @@ impl Gemma4Bringup {
                     emb.as_mut_ptr() as *mut _, residual_ptr, 8,
                 );
                 let vals: Vec<f32> = emb.iter().map(|&x| f16_to_f32(x)).collect();
-                eprintln!("  [ppl] embed first4={:.4?}", vals);
+                eprintln!("  [ppl] embed first4={:.4?} (token_id={})", vals, tok_id);
+                // Read directly from embedding table for same token
+                let embed_offset = self.model.embedding.offset_bytes
+                    + (tok_id as u64) * (hidden as u64) * 2;
+                let mut raw_emb = [0u16; 4];
+                cudarc::driver::sys::cuMemcpyDtoH_v2(
+                    raw_emb.as_mut_ptr() as *mut _, embed_offset, 8,
+                );
+                let raw_vals: Vec<f32> = raw_emb.iter().map(|&x| f16_to_f32(x)).collect();
+                eprintln!("  [ppl] embed_table[{}] first4={:.4?}", tok_id, raw_vals);
+                // Also check row 0
+                let mut row0 = [0u16; 4];
+                cudarc::driver::sys::cuMemcpyDtoH_v2(
+                    row0.as_mut_ptr() as *mut _, self.model.embedding.offset_bytes, 8,
+                );
+                let r0: Vec<f32> = row0.iter().map(|&x| f16_to_f32(x)).collect();
+                eprintln!("  [ppl] embed_table[0] first4={:.4?} (should be scaled)", r0);
             }
 
             set_step_meta(t as i32)?;
@@ -890,6 +907,7 @@ impl Gemma4Bringup {
             vector_add_bf16_to_f16: self.fused.fn_vector_add_bf16_to_f16,
             f32_to_bf16: self.fused.fn_f32_to_bf16,
             f32_to_f16_sat: self.fused.fn_f32_to_f16_sat,
+            scale_cols_f32: self.fused.fn_scale_cols_f32,
         }
     }
 }
@@ -936,6 +954,9 @@ fn load_gemma4_fused(loader: &KernelLoader) -> Result<Gemma4FusedModules> {
     let fn_f32_to_bf16 = f32_to_bf16_mod.get_function("f32_to_bf16_kernel")?;
     let fn_f32_to_f16_sat = f32_to_f16_sat_mod.get_function("f32_to_f16_sat_kernel")?;
 
+    let scale_cols_f32_mod = loader.load_ptx("scale_cols_f32")?;
+    let fn_scale_cols_f32 = scale_cols_f32_mod.get_function("scale_cols_f32_kernel")?;
+
     Ok(Gemma4FusedModules {
         rmsnorm_mod,
         rmsnorm_inplace_mod,
@@ -952,6 +973,7 @@ fn load_gemma4_fused(loader: &KernelLoader) -> Result<Gemma4FusedModules> {
         vector_add_bf16_to_f16_mod,
         f32_to_bf16_mod,
         f32_to_f16_sat_mod,
+        scale_cols_f32_mod,
         fn_rmsnorm,
         fn_rmsnorm_fp8_quant,
         fn_quantize,
@@ -968,5 +990,6 @@ fn load_gemma4_fused(loader: &KernelLoader) -> Result<Gemma4FusedModules> {
         fn_vector_add_bf16_to_f16,
         fn_f32_to_bf16,
         fn_f32_to_f16_sat,
+        fn_scale_cols_f32,
     })
 }

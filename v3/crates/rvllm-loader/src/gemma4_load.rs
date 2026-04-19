@@ -140,6 +140,13 @@ pub fn load_gemma4_model(
             buf[2*i] = out[0];
             buf[2*i+1] = out[1];
         }
+        {
+            let first4: Vec<f32> = (0..4).map(|i| {
+                let bits = u16::from_le_bytes([buf[2*i], buf[2*i+1]]);
+                f16::from_bits(bits).to_f32()
+            }).collect();
+            eprintln!("[loader] embed after sqrt(H) scale: first4={:.4?}", first4);
+        }
         let region = arena.region("embedding", buf.len(), 16)?;
         unsafe { region.copy_from_host(&buf)? };
         F16Weight {
@@ -158,7 +165,7 @@ pub fn load_gemma4_model(
         .map(|(_, e)| e.dtype == DType::Fp8E4M3)
         .unwrap_or(false);
     if fp8_prequant {
-        eprintln!("[loader] Gemma 4 FP8 pre-quantized mode: uploading weights directly with per-channel scale unification");
+        eprintln!("[loader] Gemma 4 FP8 pre-quantized mode: uploading weights directly with cuBLASLt per-channel scales");
     } else {
         eprintln!("[loader] Gemma 4 BF16 mode: CPU-quantizing to FP8 at load time");
     }
@@ -232,8 +239,20 @@ pub fn load_gemma4_model(
     //   Global:  q=[16384,5376] k=[2048,5376] NO v_proj    o=[5376,16384]
     // Global layers have attention_k_eq_v=true: K weight serves as both K and V.
 
-    let mut layers = Vec::with_capacity(arch.num_hidden_layers);
-    for l in 0..arch.num_hidden_layers {
+    let load_max_layers = std::env::var("RVLLM_MAX_LAYERS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|v| v.min(arch.num_hidden_layers))
+        .unwrap_or(arch.num_hidden_layers);
+    if load_max_layers < arch.num_hidden_layers {
+        eprintln!(
+            "[loader] RVLLM_MAX_LAYERS={load_max_layers}: loading only first {load_max_layers} of {} layers",
+            arch.num_hidden_layers
+        );
+    }
+
+    let mut layers = Vec::with_capacity(load_max_layers);
+    for l in 0..load_max_layers {
         let ln = |s: &str| format!("{prefix}.layers.{l}.{s}");
 
         let is_global = arch.layer_types[l] == crate::gemma4_arch::Gemma4LayerType::GlobalAttention;
@@ -483,10 +502,12 @@ fn rope_cos_sin_bytes(
     let half = rotary_dim / 2;
     let mut cos = Vec::with_capacity(max_pos * half * 2);
     let mut sin = Vec::with_capacity(max_pos * half * 2);
+    // Proportional RoPE: frequencies use head_dim as divisor, not rotary_dim.
+    // Only `half` frequencies are computed (partial rotation), but each
+    // frequency value is spaced as if the full head_dim were rotated.
     let inv_theta: Vec<f32> = (0..half)
-        .map(|i| 1.0 / theta.powf(2.0 * i as f32 / rotary_dim as f32))
+        .map(|i| 1.0 / theta.powf(2.0 * i as f32 / head_dim as f32))
         .collect();
-    let _ = head_dim;
     for pos in 0..max_pos {
         for &freq in &inv_theta {
             let angle = pos as f32 * freq;
@@ -591,6 +612,7 @@ fn upload_fp8(
         scale: q.scale,
         clamp_ppm: q.clamp_ppm,
         dtype: DType::Fp8E4M3,
+        channelscale_ptr: None,
     })
 }
 
@@ -633,10 +655,9 @@ fn read_channelscale_bf16(
     scales
 }
 
-/// Upload a pre-quantized FP8 weight with per-channel BF16 scales.
-///
-/// Converts per-channel scales to a single per-tensor scale by taking the
-/// max across channels, then rescales any rows whose scale differs.
+/// Upload pre-quantized FP8 weight with per-channel BF16 scales.
+/// Raw FP8 bytes go straight to GPU. Per-channel scales uploaded as f32
+/// vector. Weight scalar scale set to 1.0 -- channelscale applied post-GEMM.
 fn upload_fp8_direct_channelscale(
     arena: &HbmArena,
     region_name: &'static str,
@@ -650,45 +671,45 @@ fn upload_fp8_direct_channelscale(
         &s[start..start + entry.nbytes as usize]
     };
     let rows = entry.shape[0];
-    let cols = entry.nbytes as usize / rows;
-    let (unified_scale, fp8_bytes) = if let Some(se) = scale_entry {
-        use rayon::prelude::*;
+    let region = arena.region(region_name, raw.len(), 16)?;
+    unsafe { region.copy_from_host(raw)? };
+    if let Some(se) = scale_entry {
         let ch_scales = read_channelscale_bf16(se, shards);
-        let max_scale = ch_scales.iter().copied().fold(0.0f32, f32::max);
-        let out: Vec<u8> = raw
-            .par_chunks(cols)
-            .enumerate()
-            .flat_map_iter(|(r, row)| {
-                let rs = ch_scales[r];
-                if (rs - max_scale).abs() <= 1e-12 {
-                    row.to_vec()
-                } else {
-                    let ratio = rs / max_scale;
-                    row.iter().map(|&b| fp8_e4m3_encode(fp8_e4m3_to_f32(b) * ratio)).collect()
-                }
-            })
-            .collect();
-        (max_scale, out)
+        assert_eq!(ch_scales.len(), rows);
+        let scale_bytes: Vec<u8> = ch_scales.iter().flat_map(|s| s.to_le_bytes()).collect();
+        let cs_r = arena.region("fp8_chscale", scale_bytes.len(), 16)?;
+        unsafe { cs_r.copy_from_host(&scale_bytes)? };
+        let one = 1.0f32;
+        let one_r = arena.region("fp8_scale", 4, 4)?;
+        unsafe { one_r.copy_from_host(&one.to_le_bytes())? };
+        Ok(Fp8Weight {
+            offset_bytes: region.device_ptr(),
+            scale_ptr: one_r.device_ptr(),
+            shape: entry.shape.clone(),
+            scale: 1.0,
+            clamp_ppm: 0.0,
+            dtype: DType::Fp8E4M3,
+            channelscale_ptr: Some(cs_r.device_ptr()),
+        })
     } else {
-        (1.0 / 448.0, raw.to_vec())
-    };
-    let region = arena.region(region_name, fp8_bytes.len(), 16)?;
-    unsafe { region.copy_from_host(&fp8_bytes)? };
-    let scale_region = arena.region("fp8_scale", 4, 4)?;
-    unsafe { scale_region.copy_from_host(&unified_scale.to_le_bytes())? };
-    Ok(Fp8Weight {
-        offset_bytes: region.device_ptr(),
-        scale_ptr: scale_region.device_ptr(),
-        shape: entry.shape.clone(),
-        scale: unified_scale,
-        clamp_ppm: 0.0,
-        dtype: DType::Fp8E4M3,
-    })
+        let fallback = 1.0f32 / 448.0;
+        let sr = arena.region("fp8_scale", 4, 4)?;
+        unsafe { sr.copy_from_host(&fallback.to_le_bytes())? };
+        Ok(Fp8Weight {
+            offset_bytes: region.device_ptr(),
+            scale_ptr: sr.device_ptr(),
+            shape: entry.shape.clone(),
+            scale: fallback,
+            clamp_ppm: 0.0,
+            dtype: DType::Fp8E4M3,
+            channelscale_ptr: None,
+        })
+    }
 }
 
-/// Fuse multiple pre-quantized FP8 tensors (e.g. QKV, gate+up) with
-/// per-channel BF16 scales into one contiguous FP8 region with a
-/// single per-tensor scale.
+/// Fuse multiple pre-quantized FP8 tensors (QKV, gate+up) with per-channel
+/// scales. Raw FP8 bytes concatenated, per-channel scale vectors concatenated.
+/// Weight scalar scale = 1.0, channelscale applied post-GEMM.
 fn fuse_fp8_direct_channelscale(
     arena: &HbmArena,
     region_name: &'static str,
@@ -697,63 +718,50 @@ fn fuse_fp8_direct_channelscale(
     shards: &[ShardMap],
     fused_shape: &[usize],
 ) -> Result<Fp8Weight> {
-    // Collect all per-channel scales, find global max.
-    let mut all_ch_scales: Vec<Vec<f32>> = Vec::new();
-    let mut global_max = 0.0f32;
-    for se in scale_entries {
-        if let Some(s) = se {
-            let ch = read_channelscale_bf16(s, shards);
-            let m = ch.iter().copied().fold(0.0f32, f32::max);
-            if m > global_max { global_max = m; }
-            all_ch_scales.push(ch);
-        } else {
-            all_ch_scales.push(vec![]);
-        }
-    }
-    if global_max == 0.0 {
-        global_max = 1.0 / 448.0;
-    }
+    let mut fused_bytes = Vec::new();
+    let mut fused_scales: Vec<f32> = Vec::new();
+    let mut has_scales = false;
 
-    use rayon::prelude::*;
-    let mut fused = Vec::new();
     for (i, &(si, ref entry)) in parts.iter().enumerate() {
         let raw = &shards[*si].bytes()[entry.file_offset as usize..(entry.file_offset + entry.nbytes) as usize];
+        fused_bytes.extend_from_slice(raw);
         let rows = entry.shape[0];
-        let cols = entry.nbytes as usize / rows;
-        let ch_scales = &all_ch_scales[i];
-        if ch_scales.is_empty() {
-            fused.extend_from_slice(raw);
+        if let Some(se) = scale_entries.get(i).and_then(|x| x.as_ref()) {
+            let ch = read_channelscale_bf16(se, shards);
+            assert_eq!(ch.len(), rows);
+            fused_scales.extend_from_slice(&ch);
+            has_scales = true;
         } else {
-            let part: Vec<u8> = (0..rows)
-                .into_par_iter()
-                .flat_map_iter(|r| {
-                    let rs = ch_scales[r];
-                    let row_start = r * cols;
-                    let row_slice = &raw[row_start..row_start + cols];
-                    if (rs - global_max).abs() < 1e-12 {
-                        row_slice.to_vec()
-                    } else {
-                        let ratio = rs / global_max;
-                        row_slice.iter().map(|&b| {
-                            fp8_e4m3_encode(fp8_e4m3_to_f32(b) * ratio)
-                        }).collect()
-                    }
-                })
-                .collect();
-            fused.extend_from_slice(&part);
+            fused_scales.extend(std::iter::repeat(1.0 / 448.0).take(rows));
         }
     }
-    let region = arena.region(region_name, fused.len(), 16)?;
-    unsafe { region.copy_from_host(&fused)? };
-    let scale_region = arena.region("fp8_scale", 4, 4)?;
-    unsafe { scale_region.copy_from_host(&global_max.to_le_bytes())? };
+
+    let region = arena.region(region_name, fused_bytes.len(), 16)?;
+    unsafe { region.copy_from_host(&fused_bytes)? };
+
+    let (scale_ptr, channelscale_ptr) = if has_scales {
+        let scale_bytes: Vec<u8> = fused_scales.iter().flat_map(|s| s.to_le_bytes()).collect();
+        let cs_r = arena.region("fp8_chscale", scale_bytes.len(), 16)?;
+        unsafe { cs_r.copy_from_host(&scale_bytes)? };
+        let one = 1.0f32;
+        let one_r = arena.region("fp8_scale", 4, 4)?;
+        unsafe { one_r.copy_from_host(&one.to_le_bytes())? };
+        (one_r.device_ptr(), Some(cs_r.device_ptr()))
+    } else {
+        let fallback = 1.0f32 / 448.0;
+        let sr = arena.region("fp8_scale", 4, 4)?;
+        unsafe { sr.copy_from_host(&fallback.to_le_bytes())? };
+        (sr.device_ptr(), None)
+    };
+
     Ok(Fp8Weight {
         offset_bytes: region.device_ptr(),
-        scale_ptr: scale_region.device_ptr(),
+        scale_ptr,
         shape: fused_shape.to_vec(),
-        scale: global_max,
+        scale: 1.0,
         clamp_ppm: 0.0,
         dtype: DType::Fp8E4M3,
+        channelscale_ptr,
     })
 }
 
@@ -784,6 +792,9 @@ fn fp8_e4m3_encode(v: f32) -> u8 {
     let mut exp8 = exp32 + 7;
     if exp8 <= 0 {
         let shift = 1 - exp8;
+        if shift >= 12 {
+            return s;
+        }
         let full = (mant32 | (1 << 23)) as u32;
         let rshift = (20 + shift) as u32;
         let mut m = full >> rshift;
@@ -826,4 +837,180 @@ fn fp8_e4m3_to_f32(b: u8) -> f32 {
         f32::from_bits(((e as u32 + 120) << 23) | ((m as u32) << 20))
     };
     if s != 0 { -val } else { val }
+}
+
+#[cfg(test)]
+mod fp8_tests {
+    use super::*;
+
+    fn all_fp8_values() -> Vec<(u8, f32)> {
+        (0..=255u8)
+            .filter_map(|b| {
+                let v = fp8_e4m3_to_f32(b);
+                if v.is_nan() { None } else { Some((b, v)) }
+            })
+            .collect()
+    }
+
+    fn brute_nearest_fp8(x: f32) -> u8 {
+        if x.is_nan() { return 0x7f; }
+        let vals = all_fp8_values();
+        let mut best_byte = 0u8;
+        let mut best_dist = f64::MAX;
+        let mut best_val = 0.0f64;
+        for &(b, fv) in &vals {
+            let d = (x as f64 - fv as f64).abs();
+            if d < best_dist || (d == best_dist && {
+                let bm = b & 0x07;
+                let prev_m = best_byte & 0x07;
+                (bm % 2 == 0) && (prev_m % 2 != 0)
+            }) {
+                best_dist = d;
+                best_byte = b;
+                best_val = fv as f64;
+            }
+        }
+        let _ = best_val;
+        best_byte
+    }
+
+    #[test]
+    fn roundtrip_all_256_bytes() {
+        let mut fails = Vec::new();
+        for b in 0..=255u8 {
+            let v = fp8_e4m3_to_f32(b);
+            if v.is_nan() { continue; }
+            let re = fp8_e4m3_encode(v);
+            if re != b {
+                fails.push((b, v, re));
+            }
+        }
+        if !fails.is_empty() {
+            for (b, v, re) in &fails {
+                eprintln!("ROUNDTRIP FAIL: byte 0x{b:02x}({b}) -> f32={v} -> encode=0x{re:02x}({re})");
+            }
+            panic!("{} of 255 roundtrips failed", fails.len());
+        }
+    }
+
+    #[test]
+    fn midpoints_bankers_rounding() {
+        let vals = all_fp8_values();
+        let positives: Vec<(u8, f32)> = vals.iter()
+            .filter(|(_, v)| *v > 0.0)
+            .copied()
+            .collect();
+        let mut fails = Vec::new();
+        for w in positives.windows(2) {
+            let (b_lo, v_lo) = w[0];
+            let (b_hi, v_hi) = w[1];
+            let mid = (v_lo as f64 + v_hi as f64) / 2.0;
+            let mid_f32 = mid as f32;
+            if mid_f32 as f64 != mid { continue; }
+            let m_lo = b_lo & 0x07;
+            let m_hi = b_hi & 0x07;
+            let expected = if m_lo % 2 == 0 { b_lo } else { b_hi };
+            let got = fp8_e4m3_encode(mid_f32);
+            if got != expected {
+                fails.push((mid_f32, b_lo, b_hi, expected, got));
+            }
+        }
+        if !fails.is_empty() {
+            for (mid, lo, hi, exp, got) in &fails {
+                eprintln!("MIDPOINT FAIL: {mid} between 0x{lo:02x}({lo}) and 0x{hi:02x}({hi}): expected 0x{exp:02x} got 0x{got:02x}");
+            }
+            panic!("{} midpoint rounding failures", fails.len());
+        }
+    }
+
+    #[test]
+    fn sweep_all_f32_in_fp8_range() {
+        let pos_vals: Vec<(u8, f32)> = all_fp8_values().into_iter()
+            .filter(|(_, v)| *v >= 0.0)
+            .collect();
+        let mut boundaries: Vec<(f32, u8)> = Vec::new();
+        for w in pos_vals.windows(2) {
+            let (b_lo, v_lo) = w[0];
+            let (b_hi, v_hi) = w[1];
+            let mid = ((v_lo as f64 + v_hi as f64) / 2.0) as f32;
+            let m_lo = b_lo & 0x07;
+            let rte_byte = if m_lo % 2 == 0 { b_lo } else { b_hi };
+            boundaries.push((mid, rte_byte));
+        }
+
+        let expected_for = |v: f32| -> u8 {
+            if v == 0.0 { return 0; }
+            if v > 448.0 { return 0x7e; }
+            for w in pos_vals.windows(2) {
+                let (b_lo, v_lo) = w[0];
+                let (b_hi, v_hi) = w[1];
+                if v >= v_lo && v <= v_hi {
+                    if v == v_lo { return b_lo; }
+                    if v == v_hi { return b_hi; }
+                    let d_lo = (v as f64 - v_lo as f64).abs();
+                    let d_hi = (v as f64 - v_hi as f64).abs();
+                    if d_lo < d_hi { return b_lo; }
+                    if d_hi < d_lo { return b_hi; }
+                    let m_lo = b_lo & 0x07;
+                    return if m_lo % 2 == 0 { b_lo } else { b_hi };
+                }
+            }
+            if v <= pos_vals[0].1 {
+                let d = (v as f64 - pos_vals[0].1 as f64).abs();
+                if d < pos_vals[0].1 as f64 / 2.0 { return pos_vals[0].0; }
+                return 0;
+            }
+            0x7e
+        };
+
+        let mut total = 0u64;
+        let mut fails = 0u64;
+        let mut first_fails: Vec<(f32, u8, u8)> = Vec::new();
+        let max_bits = 448.0f32.to_bits();
+        for bits in 0..=max_bits {
+            let v = f32::from_bits(bits);
+            if v.is_nan() || v.is_infinite() || v < 0.0 { continue; }
+            total += 1;
+            let got = fp8_e4m3_encode(v);
+            let exp = expected_for(v);
+            if got != exp {
+                fails += 1;
+                if first_fails.len() < 20 {
+                    first_fails.push((v, exp, got));
+                }
+            }
+        }
+        if !first_fails.is_empty() {
+            eprintln!("\n=== FP8 ENCODER MISMATCHES ({fails}/{total}) ===");
+            for (v, exp, got) in &first_fails {
+                let exp_v = fp8_e4m3_to_f32(*exp);
+                let got_v = fp8_e4m3_to_f32(*got);
+                eprintln!("  {v:.10} (0x{:08x}): expected 0x{exp:02x}={exp_v} got 0x{got:02x}={got_v}",
+                    v.to_bits());
+            }
+            panic!("{fails} of {total} positive f32 values encoded wrong");
+        }
+        eprintln!("PASS: all {total} positive f32 values in [0, 448] encode correctly");
+    }
+
+    #[test]
+    fn test_specific_mismatch_values() {
+        let vals: &[f32] = &[-10.071, -80.569, 9.352, -74.814, -63.304, -25.897, -4.316, -20.142];
+        let nvidia: &[u8] = &[210, 234, 81, 233, 232, 221, 201, 218];
+        let mut fails = Vec::new();
+        for (i, &v) in vals.iter().enumerate() {
+            let rust_byte = fp8_e4m3_encode(v);
+            let brute_byte = brute_nearest_fp8(v);
+            let nv = nvidia[i];
+            eprintln!("  {v:8.3}: rust=0x{rust_byte:02x}({rust_byte:3}) brute=0x{brute_byte:02x}({brute_byte:3}) nvidia=0x{nv:02x}({nv:3}) \
+                rust_val={} brute_val={} nv_val={}",
+                fp8_e4m3_to_f32(rust_byte), fp8_e4m3_to_f32(brute_byte), fp8_e4m3_to_f32(nv));
+            if rust_byte != brute_byte {
+                fails.push((v, rust_byte, brute_byte, nv));
+            }
+        }
+        if !fails.is_empty() {
+            panic!("{} values: Rust encoder disagrees with brute-force nearest", fails.len());
+        }
+    }
 }

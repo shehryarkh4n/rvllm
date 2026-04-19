@@ -28,6 +28,10 @@ pub struct Fp8Weight {
     /// Clamp rate at quantization time; debug diagnostic.
     pub clamp_ppm: f32,
     pub dtype: DType, // Fp8E4M3 by default
+    /// Per-channel (per-row) f32 scale vector on device. When set,
+    /// cuBLASLt uses OUTER_VEC_32F mode instead of scalar scaling.
+    /// Length = shape[0] (number of output rows).
+    pub channelscale_ptr: Option<u64>,
 }
 
 /// One transformer layer's weights. Borrows into the model's HBM

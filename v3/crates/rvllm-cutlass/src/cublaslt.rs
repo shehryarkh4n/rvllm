@@ -27,7 +27,7 @@ struct AlgoKey {
     m: i32,
     n: i32,
     k: i32,
-    kind: u8, // 0 = plain, 1 = bias, 2 = residual (beta=1)
+    kind: u8,
 }
 
 pub struct CublasLt {
@@ -88,7 +88,7 @@ impl CublasLt {
         b_scale: u64,
         stream: u64,
     ) -> Result<()> {
-        self.fp8_gemm_inner(a_fp8, b_fp8, 0, 0, d_f16, m, n, k, a_scale, b_scale, stream, false, 0)
+        self.fp8_gemm_inner(a_fp8, b_fp8, 0, 0, d_f16, m, n, k, a_scale, b_scale, stream, false, 0, None)
     }
 
     /// Plain FP8 E4M3 matmul with bf16 output: D_bf16 = A * B^T.
@@ -106,7 +106,7 @@ impl CublasLt {
         b_scale: u64,
         stream: u64,
     ) -> Result<()> {
-        self.fp8_gemm_inner(a_fp8, b_fp8, 0, 0, d_bf16, m, n, k, a_scale, b_scale, stream, false, 1)
+        self.fp8_gemm_inner(a_fp8, b_fp8, 0, 0, d_bf16, m, n, k, a_scale, b_scale, stream, false, 1, None)
     }
 
     /// Plain FP8 E4M3 matmul with f32 output: D_f32 = A * B^T.
@@ -125,7 +125,25 @@ impl CublasLt {
         b_scale: u64,
         stream: u64,
     ) -> Result<()> {
-        self.fp8_gemm_inner(a_fp8, b_fp8, 0, 0, d_f32, m, n, k, a_scale, b_scale, stream, false, 2)
+        self.fp8_gemm_inner(a_fp8, b_fp8, 0, 0, d_f32, m, n, k, a_scale, b_scale, stream, false, 2, None)
+    }
+
+    /// FP8 matmul with f32 output and per-channel weight scales (OUTER_VEC_32F).
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn fp8_gemm_f32_channelscale(
+        &self,
+        a_fp8: u64,
+        b_fp8: u64,
+        d_f32: u64,
+        m: i32,
+        n: i32,
+        k: i32,
+        a_scale: u64,
+        b_channelscale: u64,
+        stream: u64,
+    ) -> Result<()> {
+        self.fp8_gemm_inner(a_fp8, b_fp8, 0, 0, d_f32, m, n, k, a_scale, 0, stream, false, 2, Some(b_channelscale))
     }
 
     /// F16 x F16 matmul with F32 output: D_f32 = A_f16 * B_f16^T.
@@ -234,7 +252,7 @@ impl CublasLt {
         stream: u64,
     ) -> Result<()> {
         self.fp8_gemm_inner(
-            a_fp8, b_fp8, bias_f16, 0, d_f16, m, n, k, a_scale, b_scale, stream, false, 0,
+            a_fp8, b_fp8, bias_f16, 0, d_f16, m, n, k, a_scale, b_scale, stream, false, 0, None,
         )
     }
 
@@ -256,7 +274,7 @@ impl CublasLt {
         stream: u64,
     ) -> Result<()> {
         self.fp8_gemm_inner(
-            a_fp8, b_fp8, 0, residual_f16, d_f16, m, n, k, a_scale, b_scale, stream, true, 0,
+            a_fp8, b_fp8, 0, residual_f16, d_f16, m, n, k, a_scale, b_scale, stream, true, 0, None,
         )
     }
 
@@ -280,6 +298,7 @@ impl CublasLt {
         stream: u64,
         beta_one: bool,
         d_out_type: u8, // 0=f16, 1=bf16, 2=f32
+        b_channelscale: Option<u64>, // per-channel weight scale (OUTER_VEC_32F)
     ) -> Result<()> {
         let mut desc: lt::cublasLtMatmulDesc_t = std::ptr::null_mut();
         let rc = lt::cublasLtMatmulDescCreate(
@@ -322,18 +341,40 @@ impl CublasLt {
             )?;
         }
 
+        // TN swap: cuBLAS A = our weight (b_fp8), cuBLAS B = our activation (a_fp8).
+        // Scale pointers must match: A_SCALE = weight scale, B_SCALE = activation scale.
+        let cublas_a_scale = if let Some(cs) = b_channelscale { cs } else { b_scale };
+        let cublas_b_scale = a_scale;
         set_attr(
             desc,
             lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
-            &a_scale as *const _ as *const _,
-            std::mem::size_of_val(&a_scale),
+            &cublas_a_scale as *const _ as *const _,
+            std::mem::size_of_val(&cublas_a_scale),
         )?;
         set_attr(
             desc,
             lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
-            &b_scale as *const _ as *const _,
-            std::mem::size_of_val(&b_scale),
+            &cublas_b_scale as *const _ as *const _,
+            std::mem::size_of_val(&cublas_b_scale),
         )?;
+
+        if b_channelscale.is_some() {
+            let scale_mode: u32 = 3; // OUTER_VEC_32F
+            let attr_a_scale_mode: u32 = 31; // CUBLASLT_MATMUL_DESC_A_SCALE_MODE
+            let attr_b_scale_mode: u32 = 32; // CUBLASLT_MATMUL_DESC_B_SCALE_MODE
+            set_attr(
+                desc,
+                unsafe { std::mem::transmute::<u32, lt::cublasLtMatmulDescAttributes_t>(attr_a_scale_mode) },
+                &scale_mode as *const _ as *const _,
+                std::mem::size_of_val(&scale_mode),
+            )?;
+            set_attr(
+                desc,
+                unsafe { std::mem::transmute::<u32, lt::cublasLtMatmulDescAttributes_t>(attr_b_scale_mode) },
+                &scale_mode as *const _ as *const _,
+                std::mem::size_of_val(&scale_mode),
+            )?;
+        }
 
         // Layouts: col-major view of our row-major buffers, TN.
         let mut layout_a: lt::cublasLtMatrixLayout_t = std::ptr::null_mut();
@@ -384,10 +425,13 @@ impl CublasLt {
             m,
             n,
             k,
-            kind: match (bias_f16 != 0, beta_one, d_out_type) {
-                (true, _, _) => 1u8,
-                (_, true, _) => 2 + d_out_type,
-                _ => 10 + d_out_type,
+            kind: match (bias_f16 != 0, beta_one, d_out_type, b_channelscale.is_some()) {
+                (true, _, _, true) => 31u8,
+                (true, _, _, false) => 1u8,
+                (_, true, _, true) => 32 + d_out_type,
+                (_, true, _, false) => 2 + d_out_type,
+                (_, false, _, true) => 40 + d_out_type,
+                (_, false, _, false) => 10 + d_out_type,
             },
         };
         let cached_algo = self

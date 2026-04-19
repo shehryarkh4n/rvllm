@@ -739,6 +739,7 @@ version = "0.3.0"
 dependencies = [
  "half",
  "memmap2",
+ "rayon",
  "rvllm-core",
  "rvllm-mem",
  "serde_json",

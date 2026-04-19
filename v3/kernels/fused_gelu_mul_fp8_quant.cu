@@ -92,7 +92,9 @@ fused_gelu_mul_fp8_quant_kernel(
     }
 
     float absmax = block_reduce_max(local_max, smem);
+    if (threadIdx.x == 0) smem[0] = absmax;
     __syncthreads();
+    absmax = smem[0];
 
     float scale = absmax / FP8_E4M3_MAX;
     scale = fmaxf(scale, 1e-12f);
