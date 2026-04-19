@@ -41,6 +41,8 @@ template<> void run_mha_fwd_<90, cutlass::float_e4m3_t, 256, 256, true, true, fa
 // Combine kernel for split-KV (reduction is fp16 O regardless of Q/K/V dtype)
 template<> void run_mha_fwd_combine_<cutlass::half_t, float, 128>(
     Flash_fwd_params &params, cudaStream_t stream, bool enable_pdl);
+template<> void run_mha_fwd_combine_<cutlass::half_t, float, 256>(
+    Flash_fwd_params &params, cudaStream_t stream, bool enable_pdl);
 
 // prepare_varlen_num_blocks from flash_prepare_scheduler.cu
 void prepare_varlen_num_blocks(Flash_fwd_params &params, cudaStream_t stream,
@@ -327,16 +329,17 @@ static int fa3_sm90_paged_decode_impl(
 
     params.rng_state = nullptr;
 
-    // Launch the kernel. FP8 and FP16 KV use different template instantiations;
-    // the combine kernel is fp16-output only, reused by both.
     if (is_fp8) {
         if (use_split) {
             if (head_dim == 128) {
                 run_mha_fwd_<90, cutlass::float_e4m3_t, 128, 128, true, true, false, true>(params, stream);
+
+                run_mha_fwd_combine_<cutlass::half_t, float, 128>(params, stream, false);
             } else {
                 run_mha_fwd_<90, cutlass::float_e4m3_t, 256, 256, true, true, false, true>(params, stream);
+
+                run_mha_fwd_combine_<cutlass::half_t, float, 256>(params, stream, false);
             }
-            run_mha_fwd_combine_<cutlass::half_t, float, 128>(params, stream, false);
         } else {
             if (head_dim == 128) {
                 run_mha_fwd_<90, cutlass::float_e4m3_t, 128, 128, false, true, false, true>(params, stream);
@@ -348,10 +351,11 @@ static int fa3_sm90_paged_decode_impl(
         if (use_split) {
             if (head_dim == 128) {
                 run_mha_fwd_<90, cutlass::half_t, 128, 128, true, true, false, true>(params, stream);
+                run_mha_fwd_combine_<cutlass::half_t, float, 128>(params, stream, false);
             } else {
                 run_mha_fwd_<90, cutlass::half_t, 256, 256, true, true, false, true>(params, stream);
+                run_mha_fwd_combine_<cutlass::half_t, float, 256>(params, stream, false);
             }
-            run_mha_fwd_combine_<cutlass::half_t, float, 128>(params, stream, false);
         } else {
             if (head_dim == 128) {
                 run_mha_fwd_<90, cutlass::half_t, 128, 128, false, true, false, true>(params, stream);
