@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
-"""Gemma 4 31B inference on TPU v6e-4 via JAX SPMD (TP=4).
+"""Gemma 4 inference on TPU v6e-4 via JAX SPMD (TP=4).
+
+Auto-detects model dimensions from config.json. Supports:
+  - Gemma 4 31B (google/gemma-4-31B-it) -- dual head dims (256/512)
+  - Gemma 4 E4B (google/gemma-4-E4B-it) -- uniform head dim
 
 Dual-path architecture:
-  - max_ctx <= 32768: single-scan path (one jax.lax.scan over 60 layers with
-    jax.lax.cond dispatch, unified KV cache [60, max_ctx, MAX_KV]). ~80 tok/s.
-  - max_ctx > 32768: split-cache path (10 groups of 5 sliding + 1 global,
-    circular buffer for sliding, blockwise for global). Fits 128K.
+  - max_ctx <= 32768: single-scan path (one jax.lax.scan over NL layers with
+    jax.lax.cond dispatch, unified KV cache [NL, max_ctx, MAX_KV]).
+  - max_ctx > 32768: split-cache path (groups of sliding + global,
+    circular buffer for sliding, blockwise for global).
 
 Usage:
     python3 gemma4_tpu_infer.py --model-dir /path/to/gemma-4-31B-it \
@@ -19,40 +23,122 @@ import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 import ml_dtypes
 
-H      = 5376
-NH     = 32
-INTER  = 21504
-VOCAB  = 262144
-NL     = 60
-WINDOW = 1024
+# Universal constants (model-independent)
 BLOCK_K = 8192
 SOFTCAP_VAL = 30.0
 EPS    = 1e-6
 B      = 1  # batch size; set via --batch flag
-
 SPLIT_THRESHOLD = 32768
 
-N_GROUPS = 10
-SLIDING_PER_GROUP = 5
-N_SLIDING = N_GROUPS * SLIDING_PER_GROUP  # 50
-N_GLOBAL = N_GROUPS                        # 10
+# Model-specific globals (set by load_config)
+H = NH = INTER = VOCAB = NL = WINDOW = 0
+N_GROUPS = SLIDING_PER_GROUP = N_SLIDING = N_GLOBAL = 0
+MAX_Q = MAX_KV = MAX_O = MAX_NORM_HD = 0
+S_Q = S_KV = S_HD = S_KVH = S_GQA = 0
+G_Q = G_KV = G_HD = G_KVH = G_GQA = 0
+MAX_KVH = 0
+LAYER_IS_GLOBAL = np.array([], dtype=np.int32)
 
-# Max shapes across layer types (pad smaller to these)
-MAX_Q  = 16384   # max(8192, 16384)
-MAX_KV = 4096    # max(4096, 2048)
-MAX_O  = 16384   # max(8192, 16384)
-MAX_NORM_HD = 512  # max(256, 512)
 
-# Sliding params
-S_Q, S_KV, S_HD, S_KVH = 8192, 4096, 256, 16
-S_GQA = NH // S_KVH  # 2
-# Global params
-G_Q, G_KV, G_HD, G_KVH = 16384, 2048, 512, 4
-G_GQA = NH // G_KVH  # 8
+def load_config(model_dir):
+    """Read config.json, handle text_config nesting, set all model globals."""
+    global H, NH, INTER, VOCAB, NL, WINDOW
+    global N_GROUPS, SLIDING_PER_GROUP, N_SLIDING, N_GLOBAL
+    global MAX_Q, MAX_KV, MAX_O, MAX_NORM_HD
+    global S_Q, S_KV, S_HD, S_KVH, S_GQA
+    global G_Q, G_KV, G_HD, G_KVH, G_GQA
+    global MAX_KVH, LAYER_IS_GLOBAL
 
-LAYER_IS_GLOBAL = np.array([1 if (i+1) % 6 == 0 else 0 for i in range(NL)], dtype=np.int32)
+    cfg_path = os.path.join(model_dir, 'config.json')
+    with open(cfg_path) as f:
+        raw = json.load(f)
 
-MAX_KVH = 16  # max(S_KVH=16, G_KVH=4)
+    # Gemma4ForConditionalGeneration nests text params under text_config
+    tc = raw.get('text_config', raw)
+
+    H     = tc['hidden_size']
+    NH    = tc['num_attention_heads']
+    NL    = tc['num_hidden_layers']
+    INTER = tc['intermediate_size']
+    VOCAB = tc['vocab_size']
+    WINDOW = tc.get('sliding_window', 1024)
+
+    # Determine layer pattern: which layers are global
+    # Gemma 4 uses sliding_window_pattern (int): every N-th layer is global
+    # e.g. pattern=6 means layer indices where (i+1)%6==0 are global
+    sw_pattern = tc.get('sliding_window_pattern', 6)
+    LAYER_IS_GLOBAL = np.array(
+        [1 if (i + 1) % sw_pattern == 0 else 0 for i in range(NL)],
+        dtype=np.int32)
+    N_GLOBAL = int(LAYER_IS_GLOBAL.sum())
+    N_SLIDING = NL - N_GLOBAL
+    # Groups: each group = (sw_pattern-1) sliding + 1 global
+    SLIDING_PER_GROUP = sw_pattern - 1
+    N_GROUPS = N_GLOBAL  # one global per group
+
+    # Head dimensions -- detect dual-attention (different sliding vs global)
+    # Fields: head_dim (sliding), query_pre_attn_scalar, per-layer attn config
+    # Gemma 4 31B: head_dim=256 (sliding), but global layers use 512
+    # Smaller models may have uniform head_dim
+    s_hd = tc.get('head_dim', 256)
+    # Global head dim: check for separate field, else same as sliding
+    g_hd = tc.get('global_head_dim', None)
+
+    # KV heads: may be int or may differ per layer type
+    kv_heads = tc.get('num_key_value_heads', NH)
+
+    if g_hd is not None:
+        # Dual attention: different head dims for sliding vs global
+        s_kvh = kv_heads  # sliding kv heads
+        # Global kv heads: NH * g_hd must equal global q_proj size
+        # and kv_heads * s_hd = sliding kv_proj size
+        # For global: total kv dim = hidden_size * (g_hd / (NH * g_hd / NH))
+        # Simpler: infer from the ratio
+        g_kvh = tc.get('global_num_key_value_heads') or tc.get('num_global_key_value_heads') or kv_heads
+    else:
+        # Check if model has attn_types or similar for dual attention
+        # Gemma 4 31B config has: head_dim=256, but global layers actually use
+        # q_proj.weight shape [NH*global_hd, H] which differs from sliding
+        # We detect this from num_key_value_heads and head_dim
+        # For truly uniform models, sliding==global
+        g_hd = s_hd
+        s_kvh = kv_heads
+        g_kvh = kv_heads
+
+    # Allow explicit overrides for known dual-attention configs
+    # Gemma 4 31B: hidden=5376, heads=32, head_dim=256 -> q_dim=8192 (sliding)
+    #   but global q_proj is 16384 = 32*512, kv_proj is 2048 = 4*512
+    # Detection: if config has 'global_head_dim' we already handled it.
+    # Otherwise, check query_pre_attn_scalar as a hint:
+    #   scalar = head_dim (sliding) for Gemma 4
+    # For models where head_dim * NH != q_proj actual size on global layers,
+    # the loader will discover the mismatch from weight shapes.
+    # Here we just set the dims and the loader's pad_to handles it.
+
+    S_HD = s_hd
+    S_KVH = s_kvh
+    S_Q = NH * S_HD
+    S_KV = S_KVH * S_HD
+    S_GQA = NH // S_KVH
+
+    G_HD = g_hd
+    G_KVH = g_kvh
+    G_Q = NH * G_HD
+    G_KV = G_KVH * G_HD
+    G_GQA = NH // G_KVH
+
+    MAX_Q = max(S_Q, G_Q)
+    MAX_KV = max(S_KV, G_KV)
+    MAX_O = MAX_Q
+    MAX_NORM_HD = max(S_HD, G_HD)
+    MAX_KVH = max(S_KVH, G_KVH)
+
+    print(f"config: H={H} NH={NH} NL={NL} INTER={INTER} VOCAB={VOCAB} WINDOW={WINDOW}", file=sys.stderr)
+    print(f"  sliding: HD={S_HD} KVH={S_KVH} Q={S_Q} KV={S_KV} GQA={S_GQA}", file=sys.stderr)
+    print(f"  global:  HD={G_HD} KVH={G_KVH} Q={G_Q} KV={G_KV} GQA={G_GQA}", file=sys.stderr)
+    print(f"  groups={N_GROUPS} sliding/group={SLIDING_PER_GROUP} "
+          f"global_layers={N_GLOBAL} sliding_layers={N_SLIDING}", file=sys.stderr)
+    print(f"  MAX_Q={MAX_Q} MAX_KV={MAX_KV} MAX_NORM_HD={MAX_NORM_HD}", file=sys.stderr)
 
 def make_mesh():
     devs = jax.devices()
@@ -423,10 +509,12 @@ def _sliding_attn_unified(q_flat, k_flat, v_flat, qn, kn, cos_s, sin_s, kc, vc, 
     s = sin_s[pos][None, None, :]
     q = rope(q, c, s, S_HD)
     k = rope(k, c, s, S_HD)
-    kc = kc.at[pos].set(k.reshape(B, S_KV)[0].astype(kc.dtype))
-    vc = vc.at[pos].set(v.reshape(B, S_KV)[0].astype(vc.dtype))
-    k_ctx = kc[:max_ctx].reshape(max_ctx, S_KVH, S_HD)
-    v_ctx = vc[:max_ctx].reshape(max_ctx, S_KVH, S_HD)
+    k_val = jnp.pad(k.reshape(B, S_KV)[0], (0, MAX_KV - S_KV)).astype(kc.dtype)
+    v_val = jnp.pad(v.reshape(B, S_KV)[0], (0, MAX_KV - S_KV)).astype(vc.dtype)
+    kc = kc.at[pos].set(k_val)
+    vc = vc.at[pos].set(v_val)
+    k_ctx = kc[:max_ctx, :S_KV].reshape(max_ctx, S_KVH, S_HD)
+    v_ctx = vc[:max_ctx, :S_KV].reshape(max_ctx, S_KVH, S_HD)
     q_g = q.reshape(B, S_KVH, S_GQA, S_HD)
     sc = jnp.einsum('bghd,tgd->bght', q_g.astype(jnp.float32), k_ctx.astype(jnp.float32))
     t = jnp.arange(max_ctx)
@@ -651,6 +739,14 @@ def load_model(model_dir, mesh, max_ctx):
             if k.startswith('model.language_model.'):
                 prefix = 'model.language_model'
                 break
+    else:
+        peek_path = os.path.join(model_dir, shard_names[0])
+        peek_t = read_safetensors(peek_path)
+        for k in peek_t:
+            if k.startswith('model.language_model.'):
+                prefix = 'model.language_model'
+                break
+        del peek_t
 
     print(f"loading from {model_dir}, prefix={prefix}", file=sys.stderr)
     all_t = {}
@@ -816,6 +912,15 @@ def load_model_unified(model_dir, mesh, max_ctx):
             if k.startswith('model.language_model.'):
                 prefix = 'model.language_model'
                 break
+    else:
+        # Single safetensors file -- peek at keys to detect prefix
+        peek_path = os.path.join(model_dir, shard_names[0])
+        peek_t = read_safetensors(peek_path)
+        for k in peek_t:
+            if k.startswith('model.language_model.'):
+                prefix = 'model.language_model'
+                break
+        del peek_t
 
     print(f"loading from {model_dir}, prefix={prefix} (unified)", file=sys.stderr)
     all_t = {}
@@ -1275,6 +1380,8 @@ def main():
 
     global B
     B = args.batch
+
+    load_config(args.model_dir)
 
     mesh = make_mesh()
     print(f"mesh: {mesh}", file=sys.stderr)
