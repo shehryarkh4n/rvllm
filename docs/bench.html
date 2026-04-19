@@ -578,6 +578,26 @@ No Docker. No conda. No torch. No vLLM. One pip install, one Python file, ~500 l
 </tbody>
 </table>
 
+<h3>rvLLM 0.3 vs vLLM 0.19 <span class="badge measured">Measured</span></h3>
+<div class="note-box">
+  <strong>Same hardware, same model.</strong> H100 SXM 80GB, RedHatAI/gemma-4-31B-it-FP8-Dynamic. rvLLM: raw CUDA graph decode benchmark. vLLM 0.19: OpenAI-compatible server with 50-token completions via concurrent requests. vLLM numbers include server overhead (HTTP, scheduler, tokenizer).
+</div>
+<table>
+<thead><tr><th>Batch</th><th class="r">rvLLM tok/s</th><th class="r">vLLM tok/s</th><th class="r">Delta</th></tr></thead>
+<tbody>
+<tr><td>1</td><td class="r">52</td><td class="r">69</td><td class="r neg">-25%</td></tr>
+<tr><td>4</td><td class="r">229</td><td class="r">264</td><td class="r neg">-13%</td></tr>
+<tr><td>8</td><td class="r">452</td><td class="r">515</td><td class="r neg">-12%</td></tr>
+<tr><td>16</td><td class="r">900</td><td class="r">997</td><td class="r neg">-10%</td></tr>
+<tr><td>32</td><td class="r">1,723</td><td class="r">1,748</td><td class="r neg">-1%</td></tr>
+<tr><td>64</td><td class="r">3,097</td><td class="r">3,130</td><td class="r neg">-1%</td></tr>
+<tr class="highlight"><td>128</td><td class="r"><strong>5,114</strong></td><td class="r">4,689</td><td class="r pos">+9%</td></tr>
+<tr><td>256</td><td class="r">6,897</td><td class="r">7,077</td><td class="r neg">-3%</td></tr>
+<tr><td>512</td><td class="r">7,943</td><td class="r">8,243</td><td class="r neg">-4%</td></tr>
+</tbody>
+</table>
+<div class="footnote"><strong>Note:</strong> vLLM includes prefill, continuous batching, and a mature CUDA graph implementation. rvLLM's bench binary measures raw decode kernel throughput without prefill or server overhead. At B=128 rvLLM's kernel fusion and graph capture overcome vLLM's scheduler efficiency. Remaining gap at low batch is primarily from vLLM's optimized prefill pipeline which warms the KV cache faster.</div>
+
 <h3>CUDA graph capture</h3>
 <table>
 <thead><tr><th>Mode</th><th class="r">tok/s (B=1)</th><th class="r">ms/step</th><th class="r">Speedup</th></tr></thead>

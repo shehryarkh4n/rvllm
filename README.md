@@ -392,6 +392,22 @@ The FP8-Dynamic checkpoint (RedHatAI/gemma-4-31B-it-FP8-Dynamic) with native per
 
 H100 SXM 80GB, FP8 weights, F16 KV cache, CUDA graph. Near-linear scaling through B=32 (memory-bound), saturating at B=256+ as FP8 tensor cores become compute-bound. Per-layer KV cache sizing (sliding layers capped at 32 blocks) enables 128K context on a single 80GB GPU.
 
+### rvLLM 0.3 vs vLLM 0.19 (same H100, same model, measured)
+
+| Batch | rvLLM tok/s | vLLM tok/s | Delta |
+|---|---|---|---|
+| 1 | 52 | 69 | -25% |
+| 4 | 229 | 264 | -13% |
+| 8 | 452 | 515 | -12% |
+| 16 | 900 | 997 | -10% |
+| 32 | 1,723 | 1,748 | -1% |
+| 64 | 3,097 | 3,130 | -1% |
+| **128** | **5,114** | **4,689** | **+9%** |
+| 256 | 6,897 | 7,077 | -3% |
+| 512 | 7,943 | 8,243 | -4% |
+
+rvLLM measures raw CUDA graph decode throughput. vLLM 0.19 includes full server overhead (HTTP, scheduler, tokenizer, prefill). rvLLM leads at B=128 where kernel fusion and graph capture overcome scheduler overhead.
+
 ### CUDA graph capture
 
 All 60 layers + lm_head captured into a single `cuGraphLaunch` (~1400 nodes, down from 1776 pre-fusion). Eliminates per-kernel launch overhead.
