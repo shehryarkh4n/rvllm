@@ -40,7 +40,8 @@ __global__ void fused_rope_partial_fp8kv_kernel(
     if (tid >= half_head) return;
 
     const float q_scale_inv = 1.0f / (*q_scale_ptr);
-    const float kv_scale_inv = 1.0f / (*kv_scale_ptr);
+    const float k_scale_inv = 1.0f / (*kv_scale_ptr);
+    const float v_scale_inv = k_scale_inv;
 
     const int pos = positions[token_idx];
 
@@ -81,21 +82,21 @@ __global__ void fused_rope_partial_fp8kv_kernel(
                 float sin_val = __half2float(sin_table[pos * half_rotary + tid]);
                 float k_lo = __half2float(k_in[k_base + tid]);
                 float k_hi = __half2float(k_in[k_base + tid + half_head]);
-                key_cache[cache_offset + tid]             = __nv_fp8_e4m3((k_lo * cos_val - k_hi * sin_val) * kv_scale_inv);
-                key_cache[cache_offset + tid + half_head] = __nv_fp8_e4m3((k_lo * sin_val + k_hi * cos_val) * kv_scale_inv);
+                key_cache[cache_offset + tid]             = __nv_fp8_e4m3((k_lo * cos_val - k_hi * sin_val) * k_scale_inv);
+                key_cache[cache_offset + tid + half_head] = __nv_fp8_e4m3((k_lo * sin_val + k_hi * cos_val) * k_scale_inv);
             } else {
                 float k_lo = __half2float(k_in[k_base + tid]);
                 float k_hi = __half2float(k_in[k_base + tid + half_head]);
-                key_cache[cache_offset + tid]             = __nv_fp8_e4m3(k_lo * kv_scale_inv);
-                key_cache[cache_offset + tid + half_head] = __nv_fp8_e4m3(k_hi * kv_scale_inv);
+                key_cache[cache_offset + tid]             = __nv_fp8_e4m3(k_lo * k_scale_inv);
+                key_cache[cache_offset + tid + half_head] = __nv_fp8_e4m3(k_hi * k_scale_inv);
             }
 
             // V: no rotation, just quantize to cache
             int v_base = (token_idx * num_kv_heads + head_idx) * head_dim;
             float v_lo = __half2float(v_in[v_base + tid]);
             float v_hi = __half2float(v_in[v_base + tid + half_head]);
-            value_cache[cache_offset + tid]             = __nv_fp8_e4m3(v_lo * kv_scale_inv);
-            value_cache[cache_offset + tid + half_head] = __nv_fp8_e4m3(v_hi * kv_scale_inv);
+            value_cache[cache_offset + tid]             = __nv_fp8_e4m3(v_lo * v_scale_inv);
+            value_cache[cache_offset + tid + half_head] = __nv_fp8_e4m3(v_hi * v_scale_inv);
         }
     }
 }

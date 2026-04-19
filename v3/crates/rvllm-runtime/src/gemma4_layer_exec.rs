@@ -148,6 +148,7 @@ pub struct Gemma4LayerKernels {
     pub f32_to_bf16: KernelFn,
     pub f32_to_f16_sat: KernelFn,
     pub scale_cols_f32: KernelFn,
+    pub compute_qkv_scales: KernelFn,
 }
 
 #[allow(clippy::too_many_arguments)]
