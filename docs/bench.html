@@ -128,7 +128,7 @@ footer{margin-top:4rem;padding-top:1.5rem;border-top:1px solid #1a1a1a;color:#88
 
 <header>
   <h1>rvLLM 0.3.0 - Featuring 31B Gemma 4</h1>
-  <div class="sub">LLM inference engine benchmarks for <strong>31B Gemma 4</strong>. TPU path: JAX+XLA on v6e-4 - <strong>13,943 tok/s</strong> (int8, B=768, TP=4 SPMD, PPL 19.24). <strong>128K context support</strong> (24.7 tok/s decode). <strong>3.6x faster than vLLM on H100 GPU</strong> (measured). GPU path: Rust+CUDA on H100 - <strong>7,612 tok/s</strong> (FP8, B=512, CUDA graph, PPL 12.54).</div>
+  <div class="sub">LLM inference engine benchmarks for <strong>31B Gemma 4</strong>. TPU path: JAX+XLA on v6e-4 - <strong>13,943 tok/s</strong> (int8, B=768, TP=4 SPMD, PPL 19.24). <strong>128K context support</strong> (24.7 tok/s decode). <strong>3.6x faster than vLLM on H100 GPU</strong> (measured). GPU path: Rust+CUDA on H100 - <strong>7,943 tok/s</strong> (FP8, B=512, CUDA graph, PPL 13.53).</div>
   <div class="nav-buttons">
     <a href="index.html">Home</a>
     <a href="https://github.com/m0at/rvllm">GitHub</a>
@@ -588,9 +588,10 @@ Batch sizes: 1, 2, 4, 8, 16, 32, 48, 64, 96, 128, 256, 512, 768. Peak: 3,848 tok
 
 <strong>GPU pipeline</strong> (v3 codebase, Rust + CUDA):<br>
 Hardware: H100 SXM 80 GB.<br>
-Model: 31B Gemma 4, FP8 E4M3 weights (per-tensor scale at load), FP8 E4M3 KV cache (calibrated scales).<br>
-Forward: 16 kernel launches per layer, 60 layers + lm_head + argmax = ~963 launches per step, captured in a single <code>cuGraphLaunch</code>.<br>
-Kernels: CUTLASS FP8 GEMMs (SM90), FlashAttention-3, custom fused ops (RMSNorm+quant, RoPE+KV, GELU*mul+quant, logit softcap).<br>
+Model: 31B Gemma 4, FP8 E4M3 weights (per-channel scale), F16 KV cache.<br>
+Forward: ~13 kernel launches per layer (post-fusion), 60 layers + lm_head + argmax = ~1400 nodes, captured in a single <code>cuGraphLaunch</code>.<br>
+Kernels: cuBLASLt FP8 GEMMs (SM90), FlashAttention-3, custom fused ops (RMSNorm+quant, RoPE+KV, GELU*mul+quant, norm+channelscale+residual+scalar, logit softcap).<br>
+Per-layer KV: sliding layers capped at 32 blocks (1024 tokens), global layers get full context. Enables 128K on single 80GB GPU.<br>
 </div>
 
 
