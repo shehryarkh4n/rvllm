@@ -14,7 +14,7 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use rvllm_core::{ModelArch as HfModelArch, ModelConfig};
+use rvllm_core::{DType, ModelArch as HfModelArch, ModelConfig};
 use rvllm_runtime::{Bringup, EnginePaths};
 use rvllm_runtime::gemma4_bring_up::{Gemma4Bringup, Gemma4EnginePaths};
 
@@ -85,22 +85,79 @@ fn run() -> Result<(), String> {
         fa3_so: env_path("RVLLM_FA3_SO")?,
         policy_json: env_path("RVLLM_POLICY")?,
     };
-    let arena_bytes: usize = 32 * 1024 * 1024 * 1024;
+    let arena_bytes: usize = if let Some(gb) = std::env::var("RVLLM_ARENA_GB").ok().and_then(|s| s.parse::<usize>().ok()) {
+        gb * 1024 * 1024 * 1024
+    } else {
+        #[cfg(feature = "cuda")]
+        {
+            let free = {
+                let mut free: usize = 0;
+                let mut total: usize = 0;
+                unsafe {
+                    cudarc::driver::sys::cuInit(0);
+                    let mut dev: cudarc::driver::sys::CUdevice = 0;
+                    cudarc::driver::sys::cuDeviceGet(&mut dev, 0);
+                    let mut ctx: cudarc::driver::sys::CUcontext = std::ptr::null_mut();
+                    cudarc::driver::sys::cuCtxCreate_v2(&mut ctx, 0, dev);
+                    cudarc::driver::sys::cuMemGetInfo_v2(&mut free as *mut _, &mut total as *mut _);
+                    cudarc::driver::sys::cuCtxDestroy_v2(ctx);
+                }
+                free
+            };
+            let reserve = 512 * 1024 * 1024; // 512MB headroom
+            let arena = if free > reserve { free - reserve } else { free };
+            eprintln!("[eval] auto-sized arena: {:.1} GB ({:.1} GB free)", arena as f64 / 1e9, free as f64 / 1e9);
+            arena
+        }
+        #[cfg(not(feature = "cuda"))]
+        { 32 * 1024 * 1024 * 1024 }
+    };
     let t0 = Instant::now();
 
     if is_gemma4_model_dir(&model_dir)? {
         let g4_paths = Gemma4EnginePaths {
-            model_dir: paths.model_dir,
+            model_dir: paths.model_dir.clone(),
             kernels_dir: paths.kernels_dir,
             cutlass_so: paths.cutlass_so,
             fa3_so: paths.fa3_so,
             policy_json: paths.policy_json,
         };
-        let _g4 = Gemma4Bringup::load(g4_paths, arena_bytes)
+        let g4 = Gemma4Bringup::load(g4_paths, arena_bytes)
             .map_err(|e| format!("gemma4 bringup: {e}"))?;
-        return Err(
-            "Gemma 4 eval still needs the Gemma4 forward/generation path; this binary no longer falls back to the generic engine".into(),
-        );
+        eprintln!("bringup: {:.2}s", t0.elapsed().as_secs_f64());
+
+        let embed_mod = g4.kernels
+            .load_ptx("embedding_gather_f16")
+            .map_err(|e| format!("load embedding_gather_f16: {e}"))?;
+        let fn_embed = embed_mod
+            .get_function("embedding_gather_f16_kernel")
+            .map_err(|e| format!("get embedding_gather_f16_kernel: {e}"))?;
+
+        let argmax_mod = g4.kernels
+            .load_ptx("argmax")
+            .map_err(|e| format!("load argmax: {e}"))?;
+        let fn_argmax = argmax_mod
+            .get_function("argmax_kernel")
+            .map_err(|e| format!("get argmax_kernel: {e}"))?;
+
+        let prompt_with_bos: Vec<u32> = std::iter::once(2u32)
+            .chain(prompt_ids.iter().copied())
+            .collect();
+        let eos_ids: Vec<u32> = vec![1, 2, 107];
+
+        let t_gen = Instant::now();
+        let output_ids = unsafe {
+            g4.run_generate(fn_embed, fn_argmax, &prompt_with_bos, max_new as usize, &eos_ids)
+        }.map_err(|e| format!("gemma4 generate: {e}"))?;
+
+        let elapsed = t_gen.elapsed();
+        let n = output_ids.len();
+        eprintln!("generated {} tokens in {:.2}s ({:.1} tok/s)", n, elapsed.as_secs_f64(), n as f64 / elapsed.as_secs_f64());
+
+        let text = tokenizer.decode(&output_ids, true)
+            .map_err(|e| format!("detokenize: {e}"))?;
+        println!("{text}");
+        return Ok(());
     }
 
     let br = Bringup::load(paths, arena_bytes).map_err(|e| format!("bringup: {e}"))?;
