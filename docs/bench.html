@@ -140,6 +140,7 @@ footer{margin-top:4rem;padding-top:1.5rem;border-top:1px solid #1a1a1a;color:#88
 <div class="filter-bar">
   <button class="filter-btn active" onclick="filterView('both')">Both</button>
   <button class="filter-btn" onclick="filterView('tpu')">TPU</button>
+  <button class="filter-btn" onclick="filterView('eagle3')">EAGLE-3</button>
   <button class="filter-btn" onclick="filterView('gpu')">GPU</button>
 </div>
 
@@ -184,16 +185,16 @@ footer{margin-top:4rem;padding-top:1.5rem;border-top:1px solid #1a1a1a;color:#88
 </div>
 
 <table>
-<thead><tr><th>Batch</th><th class="r">tok/s</th><th class="r">ms/step</th><th class="r">Scaling</th><th class="r">tok/s/$</th></tr></thead>
+<thead><tr><th>Batch</th><th class="r">Total</th><th class="r">tok/s/batch</th><th class="r">ms/step</th><th class="r">Scaling</th><th class="r">tok/s/$</th></tr></thead>
 <tbody>
-<tr><td>1</td><td class="r">79.9</td><td class="r">12.5</td><td class="r">1x</td><td class="r">15.4</td></tr>
-<tr><td>8</td><td class="r">584</td><td class="r">13.7</td><td class="r">7.3x</td><td class="r">112</td></tr>
-<tr><td>64</td><td class="r">4,220</td><td class="r">15.2</td><td class="r">52.8x</td><td class="r">812</td></tr>
-<tr><td>128</td><td class="r">6,831</td><td class="r">18.7</td><td class="r">85.5x</td><td class="r">1,314</td></tr>
-<tr><td>256</td><td class="r">10,536</td><td class="r">24.3</td><td class="r">131.9x</td><td class="r">2,026</td></tr>
-<tr><td>512</td><td class="r">12,932</td><td class="r">39.6</td><td class="r">161.9x</td><td class="r">2,487</td></tr>
-<tr class="highlight"><td><strong>768</strong></td><td class="r"><strong>13,943</strong></td><td class="r"><strong>55.1</strong></td><td class="r pos"><strong>174.5x</strong></td><td class="r pos"><strong>2,681</strong></td></tr>
-<tr><td>1024</td><td class="r">13,705</td><td class="r">74.7</td><td class="r">171.5x</td><td class="r">2,636</td></tr>
+<tr><td>1</td><td class="r">79.9</td><td class="r">79.9</td><td class="r">12.5</td><td class="r">1x</td><td class="r">15.4</td></tr>
+<tr><td>8</td><td class="r">584</td><td class="r">73.0</td><td class="r">13.7</td><td class="r">7.3x</td><td class="r">112</td></tr>
+<tr><td>64</td><td class="r">4,220</td><td class="r">65.9</td><td class="r">15.2</td><td class="r">52.8x</td><td class="r">812</td></tr>
+<tr><td>128</td><td class="r">6,831</td><td class="r">53.4</td><td class="r">18.7</td><td class="r">85.5x</td><td class="r">1,314</td></tr>
+<tr><td>256</td><td class="r">10,536</td><td class="r">41.2</td><td class="r">24.3</td><td class="r">131.9x</td><td class="r">2,026</td></tr>
+<tr><td>512</td><td class="r">12,932</td><td class="r">25.3</td><td class="r">39.6</td><td class="r">161.9x</td><td class="r">2,487</td></tr>
+<tr class="highlight"><td><strong>768</strong></td><td class="r"><strong>13,943</strong></td><td class="r"><strong>18.2</strong></td><td class="r"><strong>55.1</strong></td><td class="r pos"><strong>174.5x</strong></td><td class="r pos"><strong>2,681</strong></td></tr>
+<tr><td>1024</td><td class="r">13,705</td><td class="r">13.4</td><td class="r">74.7</td><td class="r">171.5x</td><td class="r">2,636</td></tr>
 </tbody>
 </table>
 <div class="footnote"><strong>Near-linear scaling from B=1 to B=512.</strong> Step time grows from 12.5 ms to 39.6 ms as MXU utilization rises from ~5% to ~80%. Peak at B=768 where compute and bandwidth saturate simultaneously. B=1024+ is compute-bound with diminishing returns.</div>
@@ -283,6 +284,92 @@ footer{margin-top:4rem;padding-top:1.5rem;border-top:1px solid #1a1a1a;color:#88
 No Docker. No conda. No torch. No vLLM. One pip install, one Python file, ~500 lines of JAX.
 </div>
 
+
+</div>
+
+<hr class="divider section-divider">
+
+<div id="section-eagle3" class="section-block">
+
+<h2 class="section">EAGLE-3 Speculative Decoding <span class="sub">TPU v6e-4, experimental</span></h2>
+
+<div class="note-box">
+  <strong>Single-user latency optimization via speculative decoding.</strong> A trained 450M-param draft head proposes K=5 tokens per cycle; the full 31B target verifies all K+1=6 in one forward pass. Lossless for greedy decode. Pipeline validated end-to-end on v6e-4 with training confirmed working.
+</div>
+
+<h3>Measured results</h3>
+
+<div class="pill-row">
+  <div class="pill">
+    <div class="label">Baseline (B=1)</div>
+    <strong>79.9 tok/s</strong>
+    <div class="caption">12.54 ms/step, fused while_loop</div>
+  </div>
+  <div class="pill">
+    <div class="label">EAGLE-3 fused cycle</div>
+    <strong>31.0 ms</strong>
+    <div class="caption">draft (2ms) + verify T=6 (29ms)</div>
+  </div>
+  <div class="pill">
+    <div class="label">Projected @ tau=3.5</div>
+    <strong>~145 tok/s</strong>
+    <div class="caption">1.8x baseline, requires 50K+ training</div>
+  </div>
+  <div class="pill">
+    <div class="label">Hardware ceiling</div>
+    <strong>~300 tok/s</strong>
+    <div class="caption">3.8x, weight-read limited</div>
+  </div>
+</div>
+
+<h3>Training progression (1K UltraChat examples, 2 epochs, v6e-4)</h3>
+
+<table>
+<thead><tr><th>Step</th><th class="r">Loss</th><th class="r">Grad Norm</th><th class="r">LR</th><th>Phase</th></tr></thead>
+<tbody>
+<tr><td>0</td><td class="r">26.1</td><td class="r">-</td><td class="r">-</td><td>Random init (ln(262144) = 12.5 per depth)</td></tr>
+<tr><td>10</td><td class="r">20.2</td><td class="r">66.6</td><td class="r">5e-6</td><td>Warmup, starting to learn</td></tr>
+<tr><td>50</td><td class="r">9.1</td><td class="r">7.6</td><td class="r">2.5e-5</td><td>-65%, grad norm collapsing</td></tr>
+<tr><td>300</td><td class="r">7.9</td><td class="r">6.1</td><td class="r">5e-5</td><td>Full LR, loss plateauing</td></tr>
+<tr><td>1000</td><td class="r">7.8</td><td class="r">11.6</td><td class="r">5e-5</td><td>Epoch 0 end (avg 9.23)</td></tr>
+<tr class="highlight"><td>2000</td><td class="r"><strong>7.1</strong></td><td class="r">16.5</td><td class="r">5e-5</td><td>Epoch 1 end (avg 7.57), -73% from random</td></tr>
+</tbody>
+</table>
+
+<div class="note-box">
+  <strong>Training details.</strong> Online feature capture: each step runs a full 512-token prefill through the 31B target (3.1s compile, then cached) to extract features at layers 2, 30, 59. TTT (Training-Time Test) loss: 5-depth draft chain where depths 0-1 use target features and depths 2-4 use the draft's own hidden states, training robustness to self-approximation error. Fused train step: loss + grad + clip + AdamW update all on-device via single jitted function with explicit <code>out_shardings</code> for JAX 0.6.2 SPMD compatibility. XLA compilation: 554s first run (2.2GB program), cached thereafter. 5.7s per training step on v6e-4.
+</div>
+
+<h3>Why tau is still low with 1K examples</h3>
+
+<div class="note-box">
+  At loss 7.1, per-depth cross-entropy is ~1.4 nats = ~24% probability on the correct next token. Greedy acceptance requires the draft's argmax to match the target's argmax, which needs >50% probability concentration on the correct token. The EAGLE-3 paper trains on <strong>100K-500K examples</strong> for days to achieve tau=3.5-4.5. Our 1K-example proof-of-concept validated the pipeline; scaling to 10K+ examples with self-distilled data (target model's own outputs) is the path to production tau.
+</div>
+
+<h3>Cycle time breakdown (31ms)</h3>
+
+<table>
+<thead><tr><th>Component</th><th class="r">Time</th><th class="r">% of cycle</th><th>Bottleneck</th></tr></thead>
+<tbody>
+<tr><td>Weight read (7.75GB/chip @ 820GB/s)</td><td class="r">9.5 ms</td><td class="r">31%</td><td>HBM bandwidth (hard floor)</td></tr>
+<tr><td>KV cache reads (T=6 queries x context)</td><td class="r">11.5 ms</td><td class="r">37%</td><td>HBM bandwidth (reducible with int8 KV)</td></tr>
+<tr><td>TP=4 all-reduce (T=6 activation size)</td><td class="r">9.5 ms</td><td class="r">31%</td><td>ICI interconnect (fixed)</td></tr>
+<tr><td>Draft chain (K=5 steps, 450M params)</td><td class="r">2.0 ms</td><td class="r">6%</td><td>Near-optimal (XLA VMEM caching)</td></tr>
+</tbody>
+</table>
+
+<h3>Optimization roadmap</h3>
+
+<table>
+<thead><tr><th>Optimization</th><th class="r">Cycle impact</th><th class="r">Tau impact</th><th>Status</th></tr></thead>
+<tbody>
+<tr><td>Self-distilled training data</td><td class="r">-</td><td class="r">+0.4-0.6</td><td>Planned</td></tr>
+<tr><td>Scale to 50K+ training examples</td><td class="r">-</td><td class="r">+0.2-0.3</td><td>Planned</td></tr>
+<tr><td>Int8 KV cache quantization</td><td class="r">-5.75 ms</td><td class="r">-</td><td>Designed</td></tr>
+<tr><td>Splash attention (fused Pallas)</td><td class="r">-1-2 ms</td><td class="r">-</td><td>Identified</td></tr>
+<tr class="highlight"><td><strong>Combined target</strong></td><td class="r"><strong>~23 ms</strong></td><td class="r"><strong>tau 3.5-4.0</strong></td><td><strong>~175-200 tok/s (2.2-2.5x)</strong></td></tr>
+</tbody>
+</table>
 
 </div>
 

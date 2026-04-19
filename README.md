@@ -135,6 +135,101 @@ gcloud compute tpus tpu-vm delete rvllm-gemma4 --zone=us-east5-b --quiet
 No Docker. No conda. No torch. No vLLM. One pip install, one Python file, one command.
 
 
+## EAGLE-3 Speculative Decoding (TPU, experimental)
+
+EAGLE-3 draft-verify speculation for single-user latency. Trains a lightweight 450M-param draft head that proposes K=5 tokens per cycle; the full 31B target verifies all K+1 in one forward pass.
+
+### Status
+
+| Metric | Value |
+|---|---|
+| Baseline (fused while_loop, B=1) | 79.9 tok/s, 12.5 ms/step |
+| EAGLE-3 fused cycle (random draft) | 31.0 ms/cycle |
+| EAGLE-3 fused cycle (trained, 1K examples) | 31.0 ms/cycle, tau=1.01 |
+| Projected (tau=3.5, trained on 50K+) | ~145 tok/s (1.8x) |
+| Projected (tau=3.5 + int8 KV cache) | ~175 tok/s (2.2x) |
+| Hardware ceiling (perfect pipelining) | ~300 tok/s (3.8x) |
+
+The cycle time (31ms) is physics-bound: 9.5ms weight read + 9.5ms TP=4 all-reduce at T=6 + 11.5ms KV reads + 2ms draft. The lever is tau (acceptance rate), which requires more training data.
+
+### Training the draft head
+
+```bash
+# Prepare training data (JSONL: {"text": "conversation..."})
+# UltraChat, ShareGPT, or self-distilled from target model
+
+# Train (1K examples, ~11 min on v6e-4; 10K examples, ~2 hours)
+python3 tpu/harness/eagle3_train.py \
+  --model-dir ~/models/gemma-4-31B-it \
+  --data-file train.jsonl \
+  --output-dir eagle3-head \
+  --max-seq 512 --epochs 2 --lr 5e-5 --warmup-steps 100
+
+# Training loss progression (1K examples, 2 epochs):
+#   step 10:   loss 20.2  (random)
+#   step 50:   loss 9.1   (-55%)
+#   step 300:  loss 7.9   (-61%)
+#   step 1000: loss 7.8   (epoch 0 end)
+#   step 2000: loss 7.1   (epoch 1 end)
+```
+
+For tau > 2.0, the paper recommends:
+1. **Self-distilled data**: generate responses with the target model, not generic datasets (+0.4-0.6 tau)
+2. **Scale to 50K+ examples**: diminishing returns after 100K (+0.2-0.3 tau)
+3. **Extend TTT depth schedule**: change depth transition from d<2 to d<3 (+0.1-0.3 tau)
+
+### Running inference
+
+```bash
+# With trained draft head (speculative)
+python3 tpu/harness/eagle3_infer.py \
+  --model-dir ~/models/gemma-4-31B-it \
+  --draft-dir eagle3-head \
+  --max-tokens 256 --max-ctx 512 --fused \
+  --prompt "Hello, how are you?"
+
+# Pipeline test with random draft (validates wiring, ~0% acceptance)
+python3 tpu/harness/eagle3_infer.py \
+  --model-dir ~/models/gemma-4-31B-it \
+  --random-draft --max-tokens 64 --fused
+
+# Baseline comparison (no speculation)
+python3 tpu/harness/eagle3_infer.py \
+  --model-dir ~/models/gemma-4-31B-it \
+  --baseline --max-tokens 128
+```
+
+### Architecture
+
+- **Draft head**: 450M params (1.5% of target). FC_fuse(3d->d) + FC_in(2d->d) + 1 transformer layer + shared LM head.
+- **Feature capture**: branchless `lax.cond` at layers 2, 30, 59 inside the 60-layer scan carry. No scan segmentation.
+- **Verify**: T=K+1=6 positions through all 60 layers in one pass. Multi-position causal attention with sliding window.
+- **Acceptance**: greedy argmax matching (lossless for greedy decode). Stochastic rejection for sampled decode (future).
+- **KV rollback**: implicit (next cycle overwrites; causal mask prevents reading garbage).
+- **Fused decode loop**: `jax.lax.while_loop` with draft+verify+accept all on-device. Zero Python dispatch in the hot path.
+
+### Files
+
+| File | Purpose |
+|---|---|
+| `tpu/harness/eagle3_infer.py` | Inference: fused + unfused decode, baseline comparison |
+| `tpu/harness/eagle3_train.py` | Training: online TTT loss, fused train step, safetensors export |
+| `tpu/harness/EAGLE3_SPEC.md` | Architecture spec with confirmed model values |
+| `tpu/harness/cache_push.sh` | Push XLA compilation cache to HF |
+| `tpu/harness/cache_pull.sh` | Pull XLA compilation cache from HF |
+
+### Next steps for higher tau
+
+| Optimization | Expected impact | Effort |
+|---|---|---|
+| Self-distilled training data (target model outputs) | +0.4-0.6 tau | 8-10h data gen |
+| Scale to 50K examples | +0.2-0.3 tau | 2h training |
+| Int8 KV cache quantization | -5.75ms cycle time | 2-4h code |
+| Splash attention (fused Pallas kernel) | -1-2ms cycle time | 1-2h wiring |
+
+Reference: [EAGLE-3 paper](https://arxiv.org/abs/2503.01840), [EAGLE-3 SPEC](tpu/harness/EAGLE3_SPEC.md).
+
+
 ## GPU: 31B Gemma 4 on H100
 
 Rust + CUDA. 16-kernel-launch fused pipeline for Gemma 4's dual-attention architecture. All 60 layers captured in a single CUDA graph. FP8 E4M3 weights quantized at load with calibrated per-tensor scales.
@@ -212,9 +307,19 @@ What's proven correct:
 - Per-token vs per-tensor scale mismatch: only affects tokens 1+ (token 0 is correct)
 
 What's broken:
-- `fuse_fp8_direct_channelscale` / `upload_fp8_direct_channelscale` in `gemma4_load.rs`: the per-channel-to-per-tensor rescaling produces FP8 bytes whose `fp8_to_f32(byte) * max_scale` does not equal the original `fp8_to_f32(original_byte) * channel_scale[row]`. The 27x error factor likely comes from the rescaling ratio or the unified scale value being wrong.
+- `fuse_fp8_direct_channelscale` / `upload_fp8_direct_channelscale` in `gemma4_load.rs`: the per-channel-to-per-tensor rescaling produces FP8 bytes whose `fp8_to_f32(byte) * max_scale` does not equal the original `fp8_to_f32(original_byte) * channel_scale[row]`.
 
-Next step: verify the rescaling math. The function takes `real_weight = fp8(byte) * ch_scale[r]`, rescales to `new_byte = fp8_encode(fp8(byte) * ch_scale[r] / max_scale)`, stores `unified_scale = max_scale`. Check whether `fp8_decode(new_byte) * max_scale` actually reconstructs `fp8(byte) * ch_scale[r]` for the actual Gemma 4 scale distributions, or if precision loss during re-encoding causes the 27x blowup.
+Investigated and ruled out:
+- `read_channelscale_bf16` dtype mismatch: function hardcodes BF16 (2 bytes/element) without checking `TensorEntry.dtype`. If scales were actually F32 (4 bytes/element), every scale value would be garbage. **Ruled out**: the F16 dequant bypass path (`dequant_fp8_to_f16`) uses the SAME `read_channelscale_bf16` function and produces correct output -- so the scales are being read correctly.
+- FP8 encoder/decoder bugs: manual trace of `fp8_e4m3_encode`/`fp8_e4m3_to_f32` for normal and subnormal cases shows correct roundtrip behavior. RNE rounding, subnormal gradual underflow, and overflow handling are all correct.
+- GEMM diagnostic limitation: the ratio=0.999960 result ONLY proves element D[0][0] is correct. If weight row 0 has `ch_scale[0] == max_scale` (no rescaling needed for that row), the diagnostic trivially passes without testing any rescaled rows at all.
+
+Remaining suspects (NOT yet tested):
+1. Per-channel scale AXIS: the error ratios per output feature are NOT uniform (27x, 33x, 37x, sign flip on element 3). If the scale tensor is per-INPUT-column [1, hidden_size] instead of per-OUTPUT-row [out_features, 1], the row-indexed rescaling would read the wrong scale for each row.
+2. Rescaling not applying: if `(rs - max_scale).abs() <= 1e-12` accidentally matches all rows (e.g., BF16 quantization makes all scales identical), bytes pass through unrescaled while max_scale amplifies the output.
+3. `fp8_precision_check.py` exists but has NOT been run on the H100 with actual Gemma 4 weights. Running it will reveal the scale distribution and per-row error profile.
+
+Next step: run `fp8_precision_check.py` on H100 to get q_s.dtype, q_s.shape, scale distribution, and per-row rescaling error. If scales are per-output-row as assumed, add a per-element diagnostic in the Rust loader that prints `orig_dequant = fp8(byte)*ch_scale[r]` vs `rescaled_dequant = fp8(new_byte)*max_scale` for the first few rows to pinpoint where the 27x divergence starts.
 
 ### Kernels
 

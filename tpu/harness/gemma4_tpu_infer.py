@@ -89,8 +89,6 @@ def _sliding_attn(q_flat, k_flat, v_flat, qn, kn, cos_s, sin_s, kc, vc, pos, ctx
     v_ctx = vc[:max_ctx].reshape(max_ctx, S_KVH, S_HD)
     q_g = q.reshape(B, S_KVH, S_GQA, S_HD)
     sc = jnp.einsum('bghd,tgd->bght', q_g.astype(jnp.float32), k_ctx.astype(jnp.float32))
-    # Gemma 4 uses scaling=1.0 (QK-norm handles magnitude)
-    # sc = sc / jnp.sqrt(jnp.float32(S_HD))
     t = jnp.arange(max_ctx)
     valid = (t < ctx) & (t >= jnp.maximum(0, pos - WINDOW + 1))
     sc = jnp.where(valid[None, None, None, :], sc, jnp.float32(-1e9))
@@ -115,8 +113,6 @@ def _global_attn(q_flat, k_flat, v_flat, qn, kn, cos_g, sin_g, kc, vc, pos, ctx,
     v_ctx = vc[:max_ctx, :G_KV].reshape(max_ctx, G_KVH, G_HD)
     q_g = q.reshape(B, G_KVH, G_GQA, G_HD)
     sc = jnp.einsum('bghd,tgd->bght', q_g.astype(jnp.float32), k_ctx.astype(jnp.float32))
-    # Gemma 4 uses scaling=1.0 (QK-norm handles magnitude)
-    # sc = sc / jnp.sqrt(jnp.float32(G_HD))
     valid = jnp.arange(max_ctx) < ctx
     sc = jnp.where(valid[None, None, None, :], sc, jnp.float32(-1e9))
     p = jax.nn.softmax(sc, axis=-1).astype(q.dtype)
