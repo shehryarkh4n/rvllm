@@ -103,7 +103,7 @@ async fn stream_inner(
         return Err(format!("API error {}: {}", status, body).into());
     }
 
-    let start = Instant::now();
+    let mut first_token_time: Option<Instant> = None;
     let mut token_count: u32 = 0;
     let mut last_tps_update = Instant::now();
     let mut stream = resp.bytes_stream();
@@ -126,7 +126,9 @@ async fn stream_inner(
             if let Some(data) = line.strip_prefix("data: ") {
                 let data = data.trim();
                 if data == "[DONE]" {
-                    let elapsed = start.elapsed().as_secs_f64();
+                    let elapsed = first_token_time
+                        .map(|t| t.elapsed().as_secs_f64())
+                        .unwrap_or(0.0);
                     let _ = tx.send(StreamEvent::Done {
                         tokens: token_count,
                         elapsed_secs: elapsed,
@@ -138,16 +140,21 @@ async fn stream_inner(
                     for choice in &chunk.choices {
                         if let Some(content) = &choice.delta.content {
                             if !content.is_empty() {
+                                if first_token_time.is_none() {
+                                    first_token_time = Some(Instant::now());
+                                }
                                 token_count += 1;
                                 let _ = tx.send(StreamEvent::Token(content.clone()));
 
-                                // Update tok/s at most every 100ms
+                                // Update tok/s at most every 100ms, measured from first token
                                 let now = Instant::now();
                                 if now.duration_since(last_tps_update).as_millis() >= 100 {
-                                    let elapsed = start.elapsed().as_secs_f64();
-                                    if elapsed > 0.0 {
-                                        let tps = token_count as f64 / elapsed;
-                                        let _ = tx.send(StreamEvent::TokPerSec(tps));
+                                    if let Some(ft) = first_token_time {
+                                        let elapsed = ft.elapsed().as_secs_f64();
+                                        if elapsed > 0.0 {
+                                            let tps = token_count as f64 / elapsed;
+                                            let _ = tx.send(StreamEvent::TokPerSec(tps));
+                                        }
                                     }
                                     last_tps_update = now;
                                 }
@@ -160,7 +167,9 @@ async fn stream_inner(
     }
 
     // Stream ended without [DONE]
-    let elapsed = start.elapsed().as_secs_f64();
+    let elapsed = first_token_time
+        .map(|t| t.elapsed().as_secs_f64())
+        .unwrap_or(0.0);
     let _ = tx.send(StreamEvent::Done {
         tokens: token_count,
         elapsed_secs: elapsed,
