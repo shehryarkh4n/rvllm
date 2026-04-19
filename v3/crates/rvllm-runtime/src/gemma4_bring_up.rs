@@ -399,7 +399,7 @@ impl Gemma4Bringup {
                     rms_eps: arch.rms_norm_eps,
                     layer_type: lt,
                     sliding_window: arch.sliding_window_size as u32,
-                    f16_kv: f16_only || std::env::var("RVLLM_F16_KV").map_or(false, |v| v == "1"),
+                    f16_kv: f16_only || std::env::var("RVLLM_F16_KV").map_or(true, |v| v != "0"),
                 };
 
                 let k_out = q_base + (num_seqs as u64) * (q_dim as u64) * 2;
@@ -646,7 +646,7 @@ impl Gemma4Bringup {
         )?;
 
         let f16_only = std::env::var("RVLLM_F16_ONLY").map_or(false, |v| v == "1");
-        let use_f16_kv = f16_only || std::env::var("RVLLM_F16_KV").map_or(false, |v| v == "1");
+        let use_f16_kv = f16_only || std::env::var("RVLLM_F16_KV").map_or(true, |v| v != "0");
         let kv_bytes_per_elem: u32 = if use_f16_kv { 2 } else { 1 };
         let kv_elem_per_layer = 2 * num_blocks_total * block_size * max_nkvh * max_hd;
         let kv_cache_bytes =
@@ -751,7 +751,7 @@ impl Gemma4Bringup {
                     rms_eps: arch.rms_norm_eps,
                     layer_type: lt,
                     sliding_window: arch.sliding_window_size as u32,
-                    f16_kv: f16_only || std::env::var("RVLLM_F16_KV").map_or(false, |v| v == "1"),
+                    f16_kv: f16_only || std::env::var("RVLLM_F16_KV").map_or(true, |v| v != "0"),
                 };
 
                 let k_out = q_base + (num_seqs as u64) * (q_dim as u64) * 2;
