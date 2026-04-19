@@ -420,14 +420,19 @@ All 60 layers + lm_head captured into a single `cuGraphLaunch` (~1400 nodes, dow
 
 ### Kernel fusion summary
 
-Three rounds of fusion reduced graph nodes from 1776 to ~1400 (~21% reduction):
+Four rounds of fusion + custom CUTLASS epilogue reduced graph nodes from 1776 to ~935 (47% reduction):
 
 | Fusion | Kernels eliminated | Nodes saved |
 |---|---|---|
 | f32_to_bf16 + rmsnorm + vector_add -> fused_norm_add_residual | 3 -> 1 (x2/layer) | 240 |
-| scale_cols_f32 fused into norm+add kernel | 1 -> 0 (x4/layer) | 120 |
+| scale_cols_f32 fused into norm+add kernel (O-proj, down) | 1 -> 0 (x2/layer) | 120 |
 | residual_scale_f16 fused into post-ff norm+add | 1 -> 0 (x1/layer) | 60 |
 | vnorm_f16 fused into qk_rmsnorm -> fused_qkv_rmsnorm | 2 -> 1 (x1/layer) | 60 |
+| CUTLASS channelscale epilogue (QKV, gate_up) | 3 -> 1 (x2/layer) | 240+ |
+
+The CUTLASS channelscale kernel (`cutlass_fp8_gemm_channelscale`) uses a custom SM90 EVT epilogue that applies per-token activation scale (ColBroadcast) and per-channel weight scale (RowBroadcast) directly in the GEMM epilogue while the accumulator is still F32, then casts to F16. This eliminates the `fp8_gemm_f32 + scale_cols_f32 + f32_to_f16_sat` chain for QKV and gate_up projections.
+
+**Help wanted:** The current CUTLASS kernel uses a 128x128x128 tile which is suboptimal for low-batch decode (M <= 16). A smaller tile variant (e.g. 64x64x128) would improve B=1-8 throughput. PRs welcome for additional tile shapes with autotune selection.
 
 ### Kernels
 
