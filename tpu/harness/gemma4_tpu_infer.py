@@ -414,8 +414,8 @@ def make_decode_loop(num_prompt, total):
 # SINGLE-SCAN (UNIFIED) PATH -- fast for max_ctx <= 32768
 # ============================================================
 
-def _sliding_attn_unified(q_flat, k_flat, v_flat, qn, kn, cos_s, sin_s, kc, vc, kc_s, vc_s, pos, ctx, max_ctx):
-    """Sliding attention on unified [max_ctx, MAX_KV] cache with dynamic_slice window."""
+def _sliding_attn_unified(q_flat, k_flat, v_flat, qn, kn, cos_s, sin_s, kc, vc, pos, ctx, max_ctx):
+    """Sliding attention on unified [max_ctx, MAX_KV] bf16 cache."""
     q = head_norm(q_flat[:, :S_Q].reshape(B, NH, S_HD), qn[:S_HD])
     k = head_norm(k_flat[:, :S_KV].reshape(B, S_KVH, S_HD), kn[:S_HD])
     v = head_norm_noscale(v_flat[:, :S_KV].reshape(B, S_KVH, S_HD))
@@ -423,16 +423,10 @@ def _sliding_attn_unified(q_flat, k_flat, v_flat, qn, kn, cos_s, sin_s, kc, vc, 
     s = sin_s[pos][None, None, :]
     q = rope(q, c, s, S_HD)
     k = rope(k, c, s, S_HD)
-    ki8, ks = _quant_kv(k[0], S_KVH, S_HD)
-    vi8, vs = _quant_kv(v[0], S_KVH, S_HD)
-    kc = kc.at[pos].set(ki8.reshape(S_KV))
-    vc = vc.at[pos].set(vi8.reshape(S_KV))
-    kc_s = kc_s.at[pos].set(jnp.pad(ks, (0, MAX_KVH - S_KVH)))
-    vc_s = vc_s.at[pos].set(jnp.pad(vs, (0, MAX_KVH - S_KVH)))
-    k_ctx = _dequant_kv(kc[:max_ctx, :S_KV].reshape(max_ctx, S_KVH, S_HD),
-                         kc_s[:max_ctx, :S_KVH])
-    v_ctx = _dequant_kv(vc[:max_ctx, :S_KV].reshape(max_ctx, S_KVH, S_HD),
-                         vc_s[:max_ctx, :S_KVH])
+    kc = kc.at[pos].set(k.reshape(B, S_KV)[0].astype(kc.dtype))
+    vc = vc.at[pos].set(v.reshape(B, S_KV)[0].astype(vc.dtype))
+    k_ctx = kc[:max_ctx].reshape(max_ctx, S_KVH, S_HD)
+    v_ctx = vc[:max_ctx].reshape(max_ctx, S_KVH, S_HD)
     q_g = q.reshape(B, S_KVH, S_GQA, S_HD)
     sc = jnp.einsum('bghd,tgd->bght', q_g.astype(jnp.float32), k_ctx.astype(jnp.float32))
     t = jnp.arange(max_ctx)
@@ -440,10 +434,10 @@ def _sliding_attn_unified(q_flat, k_flat, v_flat, qn, kn, cos_s, sin_s, kc, vc, 
     sc = jnp.where(valid[None, None, None, :], sc, jnp.float32(-1e9))
     p = jax.nn.softmax(sc, axis=-1).astype(q.dtype)
     out = jnp.einsum('bght,tgd->bghd', p, v_ctx).reshape(B, S_Q)
-    return out, kc, vc, kc_s, vc_s
+    return out, kc, vc
 
-def _global_attn_unified(q_flat, k_flat, v_flat, qn, kn, cos_g, sin_g, kc, vc, kc_s, vc_s, pos, ctx, max_ctx):
-    """Global attention on unified [max_ctx, MAX_KV] cache."""
+def _global_attn_unified(q_flat, k_flat, v_flat, qn, kn, cos_g, sin_g, kc, vc, pos, ctx, max_ctx):
+    """Global attention on unified [max_ctx, MAX_KV] bf16 cache."""
     k_raw = k_flat[:, :G_KV].reshape(B, G_KVH, G_HD)
     q = head_norm(q_flat[:, :G_Q].reshape(B, NH, G_HD), qn)
     k = head_norm(k_raw, kn)
@@ -452,29 +446,23 @@ def _global_attn_unified(q_flat, k_flat, v_flat, qn, kn, cos_g, sin_g, kc, vc, k
     s = sin_g[pos][None, None, :]
     q = rope(q, c, s, 128)
     k = rope(k, c, s, 128)
-    ki8, ks = _quant_kv(k[0], G_KVH, G_HD)
-    vi8, vs = _quant_kv(v[0], G_KVH, G_HD)
-    ki8_pad = jnp.pad(ki8.reshape(G_KV), (0, MAX_KV - G_KV))
-    vi8_pad = jnp.pad(vi8.reshape(G_KV), (0, MAX_KV - G_KV))
-    kc = kc.at[pos].set(ki8_pad)
-    vc = vc.at[pos].set(vi8_pad)
-    kc_s = kc_s.at[pos].set(jnp.pad(ks, (0, MAX_KVH - G_KVH)))
-    vc_s = vc_s.at[pos].set(jnp.pad(vs, (0, MAX_KVH - G_KVH)))
-    k_ctx = _dequant_kv(kc[:max_ctx, :G_KV].reshape(max_ctx, G_KVH, G_HD),
-                         kc_s[:max_ctx, :G_KVH])
-    v_ctx = _dequant_kv(vc[:max_ctx, :G_KV].reshape(max_ctx, G_KVH, G_HD),
-                         vc_s[:max_ctx, :G_KVH])
+    k_val = jnp.pad(k.reshape(B, G_KV)[0], (0, MAX_KV - G_KV)).astype(kc.dtype)
+    v_val = jnp.pad(v.reshape(B, G_KV)[0], (0, MAX_KV - G_KV)).astype(vc.dtype)
+    kc = kc.at[pos].set(k_val)
+    vc = vc.at[pos].set(v_val)
+    k_ctx = kc[:max_ctx, :G_KV].reshape(max_ctx, G_KVH, G_HD)
+    v_ctx = vc[:max_ctx, :G_KV].reshape(max_ctx, G_KVH, G_HD)
     q_g = q.reshape(B, G_KVH, G_GQA, G_HD)
     sc = jnp.einsum('bghd,tgd->bght', q_g.astype(jnp.float32), k_ctx.astype(jnp.float32))
     valid = jnp.arange(max_ctx) < ctx
     sc = jnp.where(valid[None, None, None, :], sc, jnp.float32(-1e9))
     p = jax.nn.softmax(sc, axis=-1).astype(q.dtype)
     out = jnp.einsum('bght,tgd->bghd', p, v_ctx).reshape(B, G_Q)
-    return out, kc, vc, kc_s, vc_s
+    return out, kc, vc
 
 
 def one_layer_unified(carry, xs):
-    """Single-scan body: one layer with jax.lax.cond for sliding vs global."""
+    """Single-scan body: one layer with jax.lax.cond for sliding vs global. bf16 KV cache."""
     x, pos, ctx, cos_s, sin_s, cos_g, sin_g = carry
     max_ctx = xs['kc'].shape[0]
 
@@ -488,18 +476,18 @@ def one_layer_unified(carry, xs):
     ig = xs['ig']
 
     def do_sliding(args):
-        q, k, v, qn, kn, kc, vc, kc_s, vc_s = args
-        out, kc2, vc2, kcs2, vcs2 = _sliding_attn_unified(q, k, v, qn, kn, cos_s, sin_s, kc, vc, kc_s, vc_s, pos, ctx, max_ctx)
-        return jnp.pad(out, ((0, 0), (0, MAX_Q - S_Q))), kc2, vc2, kcs2, vcs2
+        q, k, v, qn, kn, kc, vc = args
+        out, kc2, vc2 = _sliding_attn_unified(q, k, v, qn, kn, cos_s, sin_s, kc, vc, pos, ctx, max_ctx)
+        return jnp.pad(out, ((0, 0), (0, MAX_Q - S_Q))).astype(jnp.bfloat16), kc2, vc2
 
     def do_global(args):
-        q, k, v, qn, kn, kc, vc, kc_s, vc_s = args
-        out, kc2, vc2, kcs2, vcs2 = _global_attn_unified(q, k, v, qn, kn, cos_g, sin_g, kc, vc, kc_s, vc_s, pos, ctx, max_ctx)
-        return out, kc2, vc2, kcs2, vcs2
+        q, k, v, qn, kn, kc, vc = args
+        out, kc2, vc2 = _global_attn_unified(q, k, v, qn, kn, cos_g, sin_g, kc, vc, pos, ctx, max_ctx)
+        return out.astype(jnp.bfloat16), kc2, vc2
 
-    attn_out, kc, vc, kc_s, vc_s = jax.lax.cond(
+    attn_out, kc, vc = jax.lax.cond(
         ig, do_global, do_sliding,
-        (q_flat, k_flat, v_flat, xs['qn'], xs['kn'], xs['kc'], xs['vc'], xs['kc_s'], xs['vc_s']))
+        (q_flat, k_flat, v_flat, xs['qn'], xs['kn'], xs['kc'], xs['vc']))
 
     o_out = int8_matmul(attn_out, xs['ow'], xs['ow_s'])
 
@@ -516,33 +504,33 @@ def one_layer_unified(carry, xs):
     h = rms_norm(h, xs['ln4'])
     x = (residual + h) * xs['ls']
 
-    return (x, pos, ctx, cos_s, sin_s, cos_g, sin_g), {'kc': kc, 'vc': vc, 'kc_s': kc_s, 'vc_s': vc_s}
+    return (x, pos, ctx, cos_s, sin_s, cos_g, sin_g), {'kc': kc, 'vc': vc}
 
 
 def forward_unified(token_id, pos, ctx, embed, final_norm, weights, caches, cos_s, sin_s, cos_g, sin_g):
     x = embed[token_id].reshape(B, H) * jnp.sqrt(jnp.float32(H))
     init = (x, pos, ctx, cos_s, sin_s, cos_g, sin_g)
-    layer_xs = {**weights, 'kc': caches['kc'], 'vc': caches['vc'], 'kc_s': caches['kc_s'], 'vc_s': caches['vc_s']}
+    layer_xs = {**weights, 'kc': caches['kc'], 'vc': caches['vc']}
     final, scan_out = jax.lax.scan(one_layer_unified, init, layer_xs)
     x = final[0]
     x = rms_norm(x, final_norm)
     logits = x.astype(jnp.float32) @ embed.astype(jnp.float32).T
     logits = SOFTCAP_VAL * jnp.tanh(logits / SOFTCAP_VAL)
     log_probs = jax.nn.log_softmax(logits, axis=-1)
-    new_caches = {'kc': scan_out['kc'], 'vc': scan_out['vc'], 'kc_s': scan_out['kc_s'], 'vc_s': scan_out['vc_s']}
+    new_caches = {'kc': scan_out['kc'], 'vc': scan_out['vc']}
     return jnp.argmax(logits, axis=-1).astype(jnp.int32), log_probs, new_caches
 
 
 def forward_step_unified(token_id, pos, ctx, embed, final_norm, weights, caches, cos_s, sin_s, cos_g, sin_g):
     x = embed[token_id].reshape(B, H) * jnp.sqrt(jnp.float32(H))
     init = (x, pos, ctx, cos_s, sin_s, cos_g, sin_g)
-    layer_xs = {**weights, 'kc': caches['kc'], 'vc': caches['vc'], 'kc_s': caches['kc_s'], 'vc_s': caches['vc_s']}
+    layer_xs = {**weights, 'kc': caches['kc'], 'vc': caches['vc']}
     final, scan_out = jax.lax.scan(one_layer_unified, init, layer_xs)
     x = final[0]
     x = rms_norm(x, final_norm)
     logits = x.astype(jnp.float32) @ embed.astype(jnp.float32).T
     logits = SOFTCAP_VAL * jnp.tanh(logits / SOFTCAP_VAL)
-    new_caches = {'kc': scan_out['kc'], 'vc': scan_out['vc'], 'kc_s': scan_out['kc_s'], 'vc_s': scan_out['vc_s']}
+    new_caches = {'kc': scan_out['kc'], 'vc': scan_out['vc']}
     return jnp.argmax(logits, axis=-1).astype(jnp.int32), new_caches
 
 
@@ -920,14 +908,11 @@ def load_model_unified(model_dir, mesh, max_ctx):
     weights['ig'] = jax.device_put(jnp.array(np.array(stacked_ig)), NamedSharding(mesh, P(None)))
 
     kv_sh = NamedSharding(mesh, P(None, None, 'tp'))
-    kvs_sh = NamedSharding(mesh, P(None, None, None))
-    kv_mem = NL * max_ctx * MAX_KV * 1 * 2
-    print(f"  unified KV cache: {NL} x {max_ctx} x {MAX_KV} = {kv_mem/1e6:.0f}MB", file=sys.stderr)
+    kv_mem = NL * max_ctx * MAX_KV * 2 * 2
+    print(f"  unified KV cache: {NL} x {max_ctx} x {MAX_KV} bf16 = {kv_mem/1e6:.0f}MB", file=sys.stderr)
     caches = {
-        'kc': _sharded_zeros((NL, max_ctx, MAX_KV), np.int8, kv_sh),
-        'vc': _sharded_zeros((NL, max_ctx, MAX_KV), np.int8, kv_sh),
-        'kc_s': _sharded_zeros((NL, max_ctx, MAX_KVH), ml_dtypes.bfloat16, kvs_sh),
-        'vc_s': _sharded_zeros((NL, max_ctx, MAX_KVH), ml_dtypes.bfloat16, kvs_sh),
+        'kc': _sharded_zeros((NL, max_ctx, MAX_KV), ml_dtypes.bfloat16, kv_sh),
+        'vc': _sharded_zeros((NL, max_ctx, MAX_KV), ml_dtypes.bfloat16, kv_sh),
     }
 
     del all_t, stacked_i8, stacked_sc, stacked_bf
@@ -1205,12 +1190,9 @@ def run_fused_unified(args, mesh, embed, final_norm, weights, caches, cos_s, sin
 
     print("\nre-running (cached compile)...", file=sys.stderr, flush=True)
     kv_sh = NamedSharding(mesh, P(None, None, 'tp'))
-    kvs_sh = NamedSharding(mesh, P(None, None, None))
     caches2 = {
-        'kc': _sharded_zeros((NL, args.max_ctx, MAX_KV), np.int8, kv_sh),
-        'vc': _sharded_zeros((NL, args.max_ctx, MAX_KV), np.int8, kv_sh),
-        'kc_s': _sharded_zeros((NL, args.max_ctx, MAX_KVH), ml_dtypes.bfloat16, kvs_sh),
-        'vc_s': _sharded_zeros((NL, args.max_ctx, MAX_KVH), ml_dtypes.bfloat16, kvs_sh),
+        'kc': _sharded_zeros((NL, args.max_ctx, MAX_KV), ml_dtypes.bfloat16, kv_sh),
+        'vc': _sharded_zeros((NL, args.max_ctx, MAX_KV), ml_dtypes.bfloat16, kv_sh),
     }
     t0 = time.time()
     gen2 = fused_jit(prompt_arr, embed, final_norm, weights, caches2, cos_s, sin_s, cos_g, sin_g)
