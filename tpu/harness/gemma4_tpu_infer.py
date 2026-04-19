@@ -214,7 +214,7 @@ def rope(x, cos, sin, rot_dim):
     ], axis=-1)
     return jnp.concatenate([rotated, xp], axis=-1)
 
-def precompute_rope(theta, rot_dim, max_pos):
+def precompute_rope(theta, rot_dim, max_pos, head_dim=None):
     half = rot_dim // 2
     freqs = 1.0 / (theta ** (np.arange(0, rot_dim, 2, dtype=np.float32) / rot_dim))
     angles = np.outer(np.arange(max_pos, dtype=np.float32), freqs)
@@ -268,9 +268,8 @@ def moe_ffn(x_residual, x_normed, router_w, router_scale, per_expert_scale, expe
     weights = (topk_vals / topk_vals.sum(axis=-1, keepdims=True)).astype(x_normed.dtype)  # [B, TOP_K]
 
     # Per-expert scaling applied to weights
-    for e in range(TOP_K_EXPERTS):
-        idx_e = topk_idx[:, e]
-        weights = weights.at[:, e].set(weights[:, e] * per_expert_scale[idx_e[0]])
+    selected_scales = per_expert_scale[topk_idx[0]]  # [TOP_K]
+    weights = weights * selected_scales[None, :]
 
     # Experts run on the pre_feedforward_layernorm_2'd input
     out = jnp.zeros_like(x_normed)  # [B, H]
@@ -1702,7 +1701,7 @@ def main():
         embed, final_norm, weights, caches = load_model_unified(args.model_dir, mesh, max_ctx)
 
         cos_s, sin_s = precompute_rope(10000.0, S_HD, max_ctx)
-        cos_g, sin_g = precompute_rope(1000000.0, 128, max_ctx)
+        cos_g, sin_g = precompute_rope(1000000.0, 128, max_ctx, head_dim=G_HD)
         cos_s = jax.device_put(jnp.array(cos_s), NamedSharding(mesh, P(None, None)))
         sin_s = jax.device_put(jnp.array(sin_s), NamedSharding(mesh, P(None, None)))
         cos_g = jax.device_put(jnp.array(cos_g), NamedSharding(mesh, P(None, None)))
@@ -1723,7 +1722,7 @@ def main():
         embed, final_norm, sliding_weights, global_weights, sliding_caches, global_caches = load_model(args.model_dir, mesh, max_ctx)
 
         cos_s, sin_s = precompute_rope(10000.0, S_HD, max_ctx)
-        cos_g, sin_g = precompute_rope(1000000.0, 128, max_ctx)
+        cos_g, sin_g = precompute_rope(1000000.0, 128, max_ctx, head_dim=G_HD)
         cos_s = jax.device_put(jnp.array(cos_s), NamedSharding(mesh, P(None, None)))
         sin_s = jax.device_put(jnp.array(sin_s), NamedSharding(mesh, P(None, None)))
         cos_g = jax.device_put(jnp.array(cos_g), NamedSharding(mesh, P(None, None)))
