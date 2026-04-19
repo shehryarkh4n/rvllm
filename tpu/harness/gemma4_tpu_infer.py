@@ -219,7 +219,9 @@ def moe_ffn(x, router_w, router_scale, per_expert_scale, expert_gate_up, expert_
     Returns:
         [B, H] MoE output (bf16)
     """
-    logits = (x @ router_w.T) * router_scale          # [B, NUM_EXPERTS]
+    # router_scale is [H] -- RMSNorm scale for input before routing
+    x_normed = rms_norm(x, router_scale)               # [B, H]
+    logits = x_normed @ router_w.T                     # [B, NUM_EXPERTS]
     logits = logits * per_expert_scale                 # per-expert scaling
     topk_vals, topk_idx = jax.lax.top_k(logits, TOP_K_EXPERTS)  # [B, TOP_K]
     weights = jax.nn.softmax(topk_vals.astype(jnp.float32), axis=-1).astype(x.dtype)  # [B, TOP_K]
@@ -1192,20 +1194,22 @@ def load_model_unified(model_dir, mesh, max_ctx):
     weights['ig'] = jax.device_put(jnp.array(np.array(stacked_ig)), NamedSharding(mesh, P(None)))
 
     if ENABLE_MOE:
-        # MoE weights: replicated on all chips (NOT TP-sharded -- gathered sparsely)
-        rep = NamedSharding(mesh, P(None, None))
-        rep3 = NamedSharding(mesh, P(None, None, None))
-        rep4 = NamedSharding(mesh, P(None, None, None, None))
+        # MoE weights: shard large expert tensors on hidden dim (last axis)
+        moe_shardings = {
+            'router_w': P(None, None, None),       # [NL, NUM_EXPERTS, H] -> replicated
+            'router_s': P(None, None),              # [NL, 1] -> replicated
+            'router_ps': P(None, None),             # [NL, NUM_EXPERTS] -> replicated
+            'expert_gu': P(None, None, None, 'tp'), # [NL, NUM_EXPERTS, 2*MOE_INTER, H] -> shard H
+            'expert_dw': P(None, None, 'tp', None), # [NL, NUM_EXPERTS, H, MOE_INTER] -> shard H
+        }
         for k in moe_keys:
-            arr = np.stack(stacked_moe[k])
-            ndim = arr.ndim
-            if ndim == 2:
-                weights[k] = jax.device_put(jnp.array(arr, dtype=jnp.bfloat16), rep)
-            elif ndim == 3:
-                weights[k] = jax.device_put(jnp.array(arr, dtype=jnp.bfloat16), rep3)
-            elif ndim == 4:
-                weights[k] = jax.device_put(jnp.array(arr, dtype=jnp.bfloat16), rep4)
-            print(f"    moe.{k}: {arr.shape} bf16", file=sys.stderr)
+            arr = np.stack(stacked_moe[k]).astype(ml_dtypes.bfloat16)
+            sh = moe_shardings.get(k, P(*([None] * arr.ndim)))
+            nsh = NamedSharding(mesh, sh)
+            weights[k] = jax.make_array_from_callback(
+                arr.shape, nsh,
+                lambda idx, a=arr: a[tuple(slice(s.start, s.stop) if s.start is not None else slice(None) for s in idx)])
+            print(f"    moe.{k}: {arr.shape} bf16 shard={sh}", file=sys.stderr)
 
     kv_sh = NamedSharding(mesh, P(None, None, 'tp'))
     kv_mem = NL * max_ctx * MAX_KV * 2 * 2
