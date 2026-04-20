@@ -50,6 +50,13 @@ K_EQ_V = False          # True => global layers use V = norm(K) instead of real 
 NUM_KV_SHARED_LAYERS = 0  # layers at the end that share KV from earlier layers
 KV_SHARED_MAP = {}      # layer_idx -> source_layer_idx for KV sharing
 
+# Per-layer input injection (set by load_config when hidden_size_per_layer_input > 0)
+ENABLE_PLI = False
+PLI_DIM = 0
+PLI_EMBED_SCALE = 1.0
+PLI_PROJ_SCALE = 1.0
+PLI_INPUT_SCALE = 1.0
+
 
 def load_config(model_dir):
     """Read config.json, handle text_config nesting, set all model globals."""
@@ -61,6 +68,7 @@ def load_config(model_dir):
     global MAX_KVH, LAYER_IS_GLOBAL
     global ENABLE_MOE, NUM_EXPERTS, TOP_K_EXPERTS, MOE_INTER
     global K_EQ_V, NUM_KV_SHARED_LAYERS, KV_SHARED_MAP
+    global ENABLE_PLI, PLI_DIM, PLI_EMBED_SCALE, PLI_PROJ_SCALE, PLI_INPUT_SCALE
 
     cfg_path = os.path.join(model_dir, 'config.json')
     with open(cfg_path) as f:
@@ -184,9 +192,18 @@ def load_config(model_dir):
     print(f"  MAX_Q={MAX_Q} MAX_KV={MAX_KV} MAX_NORM_HD={MAX_NORM_HD}", file=sys.stderr)
     if ENABLE_MOE:
         print(f"  MoE: experts={NUM_EXPERTS} top_k={TOP_K_EXPERTS} moe_inter={MOE_INTER}", file=sys.stderr)
+    PLI_DIM = int(tc.get('hidden_size_per_layer_input', 0))
+    ENABLE_PLI = PLI_DIM > 0
+    if ENABLE_PLI:
+        PLI_EMBED_SCALE = float(PLI_DIM ** 0.5)
+        PLI_PROJ_SCALE = float(H ** -0.5)
+        PLI_INPUT_SCALE = float(2 ** -0.5)
+
     print(f"  K_EQ_V={K_EQ_V} NUM_KV_SHARED_LAYERS={NUM_KV_SHARED_LAYERS}", file=sys.stderr)
     if KV_SHARED_MAP:
         print(f"  KV_SHARED_MAP={KV_SHARED_MAP}", file=sys.stderr)
+    if ENABLE_PLI:
+        print(f"  PLI: dim={PLI_DIM} embed_scale={PLI_EMBED_SCALE} proj_scale={PLI_PROJ_SCALE:.6f} input_scale={PLI_INPUT_SCALE:.4f}", file=sys.stderr)
 
 def make_mesh():
     devs = jax.devices()
@@ -655,7 +672,7 @@ def make_decode_loop(num_prompt, total):
 # SINGLE-SCAN (UNIFIED) PATH -- fast for max_ctx <= 32768
 # ============================================================
 
-def _sliding_attn_unified(q_flat, k_flat, v_flat, qn, kn, cos_s, sin_s, kc, vc, pos, ctx, max_ctx):
+def _sliding_attn_unified(q_flat, k_flat, v_flat, qn, kn, cos_s, sin_s, kc, vc, pos, ctx, max_ctx, write_kv):
     """Sliding attention on unified [max_ctx, MAX_KV] bf16 cache."""
     q = head_norm(q_flat[:, :S_Q].reshape(B, NH, S_HD), qn[:S_HD])
     k = head_norm(k_flat[:, :S_KV].reshape(B, S_KVH, S_HD), kn[:S_HD])
@@ -666,6 +683,8 @@ def _sliding_attn_unified(q_flat, k_flat, v_flat, qn, kn, cos_s, sin_s, kc, vc, 
     k = rope(k, c, s, S_HD)
     k_val = jnp.pad(k.reshape(B, S_KV)[0], (0, MAX_KV - S_KV)).astype(kc.dtype)
     v_val = jnp.pad(v.reshape(B, S_KV)[0], (0, MAX_KV - S_KV)).astype(vc.dtype)
+    k_val = jnp.where(write_kv, k_val, kc[pos])
+    v_val = jnp.where(write_kv, v_val, vc[pos])
     kc = kc.at[pos].set(k_val)
     vc = vc.at[pos].set(v_val)
     k_ctx = kc[:max_ctx, :S_KV].reshape(max_ctx, S_KVH, S_HD)
@@ -679,7 +698,7 @@ def _sliding_attn_unified(q_flat, k_flat, v_flat, qn, kn, cos_s, sin_s, kc, vc, 
     out = jnp.einsum('bght,tgd->bghd', p, v_ctx).reshape(B, S_Q)
     return out, kc, vc
 
-def _global_attn_unified(q_flat, k_flat, v_flat, qn, kn, cos_g, sin_g, kc, vc, pos, ctx, max_ctx):
+def _global_attn_unified(q_flat, k_flat, v_flat, qn, kn, cos_g, sin_g, kc, vc, pos, ctx, max_ctx, write_kv):
     """Global attention on unified [max_ctx, MAX_KV] bf16 cache."""
     k_raw = k_flat[:, :G_KV].reshape(B, G_KVH, G_HD)
     q = head_norm(q_flat[:, :G_Q].reshape(B, NH, G_HD), qn)
@@ -695,6 +714,8 @@ def _global_attn_unified(q_flat, k_flat, v_flat, qn, kn, cos_g, sin_g, kc, vc, p
     k = rope(k, c, s, 128)
     k_val = jnp.pad(k.reshape(B, G_KV)[0], (0, MAX_KV - G_KV)).astype(kc.dtype)
     v_val = jnp.pad(v.reshape(B, G_KV)[0], (0, MAX_KV - G_KV)).astype(vc.dtype)
+    k_val = jnp.where(write_kv, k_val, kc[pos])
+    v_val = jnp.where(write_kv, v_val, vc[pos])
     kc = kc.at[pos].set(k_val)
     vc = vc.at[pos].set(v_val)
     k_ctx = kc[:max_ctx, :G_KV].reshape(max_ctx, G_KVH, G_HD)
@@ -728,20 +749,21 @@ def one_layer_unified(carry, xs):
 
     ig = xs['ig']
     is_shared = (kv_src != layer_idx)
+    write_kv = ~is_shared
 
     def do_sliding(args):
-        q, k, v, qn, kn, kc, vc = args
-        out, kc2, vc2 = _sliding_attn_unified(q, k, v, qn, kn, cos_s, sin_s, kc, vc, pos, ctx, max_ctx)
+        q, k, v, qn, kn, kc, vc, wkv = args
+        out, kc2, vc2 = _sliding_attn_unified(q, k, v, qn, kn, cos_s, sin_s, kc, vc, pos, ctx, max_ctx, wkv)
         return jnp.pad(out, ((0, 0), (0, MAX_Q - S_Q))).astype(jnp.bfloat16), kc2, vc2
 
     def do_global(args):
-        q, k, v, qn, kn, kc, vc = args
-        out, kc2, vc2 = _global_attn_unified(q, k, v, qn, kn, cos_g, sin_g, kc, vc, pos, ctx, max_ctx)
+        q, k, v, qn, kn, kc, vc, wkv = args
+        out, kc2, vc2 = _global_attn_unified(q, k, v, qn, kn, cos_g, sin_g, kc, vc, pos, ctx, max_ctx, wkv)
         return out.astype(jnp.bfloat16), kc2, vc2
 
     attn_out, kc_new, vc_new = jax.lax.cond(
         ig, do_global, do_sliding,
-        (q_flat, k_flat, v_flat, xs['qn'], xs['kn'], kc_layer, vc_layer))
+        (q_flat, k_flat, v_flat, xs['qn'], xs['kn'], kc_layer, vc_layer, write_kv))
 
     # Write updated cache back: shared layers don't write (source already has the cache)
     # For non-shared layers, write to own slot; for shared, keep cache unchanged
@@ -774,7 +796,6 @@ def one_layer_unified(carry, xs):
         combined = h1 + h2
         combined = rms_norm(combined, xs['ln4'])   # post_feedforward_layernorm (final)
         x = residual + combined
-        x = x * xs['ls']
     else:
         residual = x
         h = rms_norm(x, xs['ln3'])
@@ -783,15 +804,37 @@ def one_layer_unified(carry, xs):
         h = jax.nn.gelu(gate, approximate=True) * up
         h = int8_matmul(h, xs['dw'], xs['dw_s'])
         h = rms_norm(h, xs['ln4'])
-        x = (residual + h) * xs['ls']
+        x = residual + h
+
+    if ENABLE_PLI:
+        residual = x
+        g = jax.nn.gelu(x @ xs['pli_gw'].T, approximate=True)
+        g = g * xs['pli']
+        g = g @ xs['pli_pw'].T
+        g = rms_norm(g, xs['pli_norm'])
+        x = residual + g
+
+    x = x * xs['ls']
 
     return (x, pos, ctx, cos_s, sin_s, cos_g, sin_g, all_kc, all_vc, layer_idx + 1), None
 
 
-def forward_unified(token_id, pos, ctx, embed, final_norm, weights, caches, cos_s, sin_s, cos_g, sin_g):
+def forward_unified(token_id, pos, ctx, embed, final_norm, weights, caches, cos_s, sin_s, cos_g, sin_g,
+                    pli_embed=None, pli_model_proj=None, pli_proj_norm=None):
     x = embed[token_id].reshape(B, H) * jnp.sqrt(jnp.float32(H))
-    all_kc = caches['kc']  # [NL, max_ctx, MAX_KV]
-    all_vc = caches['vc']  # [NL, max_ctx, MAX_KV]
+
+    if ENABLE_PLI:
+        pli_emb = pli_embed[token_id[0]] * PLI_EMBED_SCALE
+        pli_emb = pli_emb.reshape(NL, PLI_DIM)
+        proj = (x[0:1] @ pli_model_proj.T) * PLI_PROJ_SCALE
+        proj = proj.reshape(NL, PLI_DIM)
+        proj32 = proj.astype(jnp.float32)
+        proj = (proj * jax.lax.rsqrt(jnp.mean(proj32 * proj32, axis=-1, keepdims=True) + EPS).astype(proj.dtype)) * pli_proj_norm
+        pli = (proj + pli_emb) * PLI_INPUT_SCALE
+        weights = {**weights, 'pli': pli}
+
+    all_kc = caches['kc']
+    all_vc = caches['vc']
     init = (x, pos, ctx, cos_s, sin_s, cos_g, sin_g, all_kc, all_vc, jnp.int32(0))
     final, _ = jax.lax.scan(one_layer_unified, init, weights)
     x = final[0]
@@ -805,8 +848,20 @@ def forward_unified(token_id, pos, ctx, embed, final_norm, weights, caches, cos_
     return jnp.argmax(logits, axis=-1).astype(jnp.int32), log_probs, new_caches
 
 
-def forward_step_unified(token_id, pos, ctx, embed, final_norm, weights, caches, cos_s, sin_s, cos_g, sin_g):
+def forward_step_unified(token_id, pos, ctx, embed, final_norm, weights, caches, cos_s, sin_s, cos_g, sin_g,
+                         pli_embed=None, pli_model_proj=None, pli_proj_norm=None):
     x = embed[token_id].reshape(B, H) * jnp.sqrt(jnp.float32(H))
+
+    if ENABLE_PLI:
+        pli_emb = pli_embed[token_id[0]] * PLI_EMBED_SCALE
+        pli_emb = pli_emb.reshape(NL, PLI_DIM)
+        proj = (x[0:1] @ pli_model_proj.T) * PLI_PROJ_SCALE
+        proj = proj.reshape(NL, PLI_DIM)
+        proj32 = proj.astype(jnp.float32)
+        proj = (proj * jax.lax.rsqrt(jnp.mean(proj32 * proj32, axis=-1, keepdims=True) + EPS).astype(proj.dtype)) * pli_proj_norm
+        pli = (proj + pli_emb) * PLI_INPUT_SCALE
+        weights = {**weights, 'pli': pli}
+
     all_kc = caches['kc']
     all_vc = caches['vc']
     init = (x, pos, ctx, cos_s, sin_s, cos_g, sin_g, all_kc, all_vc, jnp.int32(0))
@@ -1199,6 +1254,8 @@ def load_model_unified(model_dir, mesh, max_ctx):
     bf16_keys = ['qn','kn','ln1','ln2','ln3','ln4','ls']
     if ENABLE_MOE:
         bf16_keys += ['ln3_moe', 'ln4_moe', 'ln4_combine']
+    if ENABLE_PLI:
+        bf16_keys += ['pli_gw', 'pli_pw', 'pli_norm']
     stacked_i8 = {k: [] for k in matmul_keys}
     stacked_sc = {k+'_s': [] for k in matmul_keys}
     stacked_bf = {k: [] for k in bf16_keys}
@@ -1256,12 +1313,16 @@ def load_model_unified(model_dir, mesh, max_ctx):
             stacked_bf['ln4_moe'].append(to_np_bf16(get(f'{lp}.post_feedforward_layernorm_1.weight')))
             stacked_bf['ln4_combine'].append(to_np_bf16(get(f'{lp}.post_feedforward_layernorm_2.weight')))
             stacked_moe['router_w'].append(to_np_bf16(get(f'{lp}.router.proj.weight')))
-            # router.scale is [H] (or scalar for older checkpoints) -- keep shape for stacking
             rs = to_np_bf16(get(f'{lp}.router.scale'))
             stacked_moe['router_s'].append(rs.reshape(1) if rs.ndim == 0 else rs)
             stacked_moe['router_ps'].append(to_np_bf16(get(f'{lp}.router.per_expert_scale')))
             stacked_moe['expert_gu'].append(to_np_bf16(get(f'{lp}.experts.gate_up_proj')))
             stacked_moe['expert_dw'].append(to_np_bf16(get(f'{lp}.experts.down_proj')))
+
+        if ENABLE_PLI:
+            stacked_bf['pli_gw'].append(to_np_bf16(get(f'{lp}.per_layer_input_gate.weight')))
+            stacked_bf['pli_pw'].append(to_np_bf16(get(f'{lp}.per_layer_projection.weight')))
+            stacked_bf['pli_norm'].append(to_np_bf16(get(f'{lp}.post_per_layer_input_norm.weight')))
 
         if i % 15 == 0:
             print(f"    layer {i}", file=sys.stderr)
@@ -1325,11 +1386,20 @@ def load_model_unified(model_dir, mesh, max_ctx):
         'vc': _sharded_zeros((NL, max_ctx, MAX_KV), ml_dtypes.bfloat16, kv_sh),
     }
 
+    pli_weights = None
+    if ENABLE_PLI:
+        pli_embed = put(get(f'{prefix}.embed_tokens_per_layer.weight'), P(None, None))
+        pli_model_proj = put(get(f'{prefix}.per_layer_model_projection.weight'), P(None, None))
+        pli_proj_norm = put(get(f'{prefix}.per_layer_projection_norm.weight'), P(None))
+        pli_weights = {'embed': pli_embed, 'model_proj': pli_model_proj, 'proj_norm': pli_proj_norm}
+        pli_mem = VOCAB * NL * PLI_DIM * 2
+        print(f"  PLI embed: {VOCAB}x{NL*PLI_DIM} bf16 = {pli_mem/1e6:.0f}MB", file=sys.stderr)
+
     del all_t, stacked_i8, stacked_sc, stacked_bf
     if ENABLE_MOE:
         del stacked_moe
     print("  done loading (unified)", file=sys.stderr)
-    return embed, final_norm, weights, caches
+    return embed, final_norm, weights, caches, pli_weights
 
 
 # -- main --
@@ -1519,7 +1589,7 @@ def run_generate(args, mesh, embed, final_norm, sliding_weights, global_weights,
     print(f"total time:       {total:.1f}s", file=sys.stderr)
     print(f"generated:        {generated[:20]}", file=sys.stderr)
 
-def run_perplexity_unified(args, mesh, embed, final_norm, weights, caches, cos_s, sin_s, cos_g, sin_g):
+def run_perplexity_unified(args, mesh, embed, final_norm, weights, caches, cos_s, sin_s, cos_g, sin_g, pli_weights=None):
     tokenizer = load_tokenizer(args.model_dir)
     if tokenizer is None:
         print("ERROR: no tokenizer.json found", file=sys.stderr)
@@ -1536,6 +1606,9 @@ def run_perplexity_unified(args, mesh, embed, final_norm, weights, caches, cos_s
     token_ids = [2] + token_ids[:max_tokens]
     print(f"perplexity eval: {len(token_ids)} tokens (unified)", file=sys.stderr)
 
+    pli_e = pli_weights['embed'] if pli_weights else None
+    pli_p = pli_weights['model_proj'] if pli_weights else None
+    pli_n = pli_weights['proj_norm'] if pli_weights else None
     fwd_jit = jax.jit(forward_unified, donate_argnums=(6,))
     total_nll = 0.0
     n_tokens = 0
@@ -1547,7 +1620,8 @@ def run_perplexity_unified(args, mesh, embed, final_norm, weights, caches, cos_s
         ctx = jnp.int32(step + 1)
 
         next_tok, log_probs, caches = fwd_jit(
-            tok_arr, pos, ctx, embed, final_norm, weights, caches, cos_s, sin_s, cos_g, sin_g)
+            tok_arr, pos, ctx, embed, final_norm, weights, caches, cos_s, sin_s, cos_g, sin_g,
+            pli_e, pli_p, pli_n)
 
         target = token_ids[step + 1]
         nll = -float(log_probs[0, target])
@@ -1570,7 +1644,7 @@ def run_perplexity_unified(args, mesh, embed, final_norm, weights, caches, cos_s
     print(f"perplexity: {ppl:.2f}", file=sys.stderr)
     print(f"time:       {elapsed:.1f}s ({n_tokens/elapsed:.1f} tok/s)", file=sys.stderr)
 
-def run_fused_unified(args, mesh, embed, final_norm, weights, caches, cos_s, sin_s, cos_g, sin_g):
+def run_fused_unified(args, mesh, embed, final_norm, weights, caches, cos_s, sin_s, cos_g, sin_g, pli_weights=None):
     prompt_ids = [int(x.strip()) for x in args.prompt.split(',')]
     num_prompt = len(prompt_ids)
     num_decode = args.max_tokens
@@ -1615,10 +1689,13 @@ def run_fused_unified(args, mesh, embed, final_norm, weights, caches, cos_s, sin
     print(f"tok/s:        {total*B/pure_time:.1f} (B={B})", file=sys.stderr)
     print(f"ms/step:      {pure_time/total*1000:.2f}", file=sys.stderr)
 
-def run_generate_unified(args, mesh, embed, final_norm, weights, caches, cos_s, sin_s, cos_g, sin_g):
+def run_generate_unified(args, mesh, embed, final_norm, weights, caches, cos_s, sin_s, cos_g, sin_g, pli_weights=None):
     prompt_ids = [int(x.strip()) for x in args.prompt.split(',')]
     print(f"prompt: {len(prompt_ids)} tokens {prompt_ids[:10]} (unified)", file=sys.stderr)
 
+    pli_e = pli_weights['embed'] if pli_weights else None
+    pli_p = pli_weights['model_proj'] if pli_weights else None
+    pli_n = pli_weights['proj_norm'] if pli_weights else None
     fwd_jit = jax.jit(forward_unified, donate_argnums=(6,))
     generated = []
     last_sampled = None
@@ -1637,7 +1714,8 @@ def run_generate_unified(args, mesh, embed, final_norm, weights, caches, cos_s, 
 
         t0 = time.time()
         next_tok, _log_probs, caches = fwd_jit(
-            tok_arr, pos, ctx, embed, final_norm, weights, caches, cos_s, sin_s, cos_g, sin_g)
+            tok_arr, pos, ctx, embed, final_norm, weights, caches, cos_s, sin_s, cos_g, sin_g,
+            pli_e, pli_p, pli_n)
         next_tok.block_until_ready()
         dt = time.time() - t0
 
@@ -1698,7 +1776,7 @@ def main():
     if max_ctx <= SPLIT_THRESHOLD:
         # -- single-scan (unified) path: fast for short contexts --
         print(f"using single-scan architecture (fast path, max_ctx={max_ctx})", file=sys.stderr)
-        embed, final_norm, weights, caches = load_model_unified(args.model_dir, mesh, max_ctx)
+        embed, final_norm, weights, caches, pli_weights = load_model_unified(args.model_dir, mesh, max_ctx)
 
         cos_s, sin_s = precompute_rope(10000.0, S_HD, max_ctx)
         cos_g, sin_g = precompute_rope(1000000.0, 128, max_ctx, head_dim=G_HD)
@@ -1708,11 +1786,11 @@ def main():
         sin_g = jax.device_put(jnp.array(sin_g), NamedSharding(mesh, P(None, None)))
 
         if args.perplexity:
-            run_perplexity_unified(args, mesh, embed, final_norm, weights, caches, cos_s, sin_s, cos_g, sin_g)
+            run_perplexity_unified(args, mesh, embed, final_norm, weights, caches, cos_s, sin_s, cos_g, sin_g, pli_weights)
         elif args.fused:
-            run_fused_unified(args, mesh, embed, final_norm, weights, caches, cos_s, sin_s, cos_g, sin_g)
+            run_fused_unified(args, mesh, embed, final_norm, weights, caches, cos_s, sin_s, cos_g, sin_g, pli_weights)
         else:
-            run_generate_unified(args, mesh, embed, final_norm, weights, caches, cos_s, sin_s, cos_g, sin_g)
+            run_generate_unified(args, mesh, embed, final_norm, weights, caches, cos_s, sin_s, cos_g, sin_g, pli_weights)
     else:
         # -- split-cache path: fits 128K --
         print(f"using split-cache architecture (128K path, max_ctx={max_ctx})", file=sys.stderr)

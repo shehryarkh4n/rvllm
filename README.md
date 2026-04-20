@@ -175,7 +175,8 @@ Total setup time: ~5 minutes (create TPU + install JAX + download model).
 ```bash
 # Create TPU v6e-4 ($5.20/hr)
 gcloud compute tpus tpu-vm create rvllm-gemma4 \
-  --zone=us-east5-b --accelerator-type=v6e-4 --version=v2-alpha-tpuv6e
+  --zone=us-east5-b --accelerator-type=v6e-4 --version=v2-alpha-tpuv6e \
+  --boot-disk-size=200
 
 # Install (30 seconds)
 pip3 install 'jax[tpu]' huggingface_hub tokenizers \

@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>rvLLM 0.3.0 - 31B Gemma 4 Benchmarks</title>
+<title>rvLLM Benchmarks - Gemma 4 on TPU + GPU</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 html{font-size:16px;-webkit-font-smoothing:antialiased}
@@ -28,7 +28,6 @@ header .sub strong{color:#fff}
   font-size:0.85rem;font-weight:500;
   letter-spacing:0.01em;
   transition:all 0.15s ease;
-  cursor:pointer;
 }
 .nav-buttons a:hover{
   background:linear-gradient(180deg,#242b38,#1a2030);
@@ -41,58 +40,28 @@ h2{font-size:2.4rem;font-weight:700;color:#fff;letter-spacing:-0.04em;margin:3re
 h2 .sub{font-weight:400;font-size:0.85rem;color:#a0a0a0;margin-left:0.8rem}
 h3{font-size:0.85rem;color:#b8b8b8;font-weight:500;letter-spacing:0.04em;text-transform:uppercase;margin:2rem 0 0.6rem}
 
-.pill-row{display:flex;gap:0.8rem;flex-wrap:wrap;margin:1rem 0 1.5rem}
-.pill{
-  background:linear-gradient(180deg,#111620,#0c1018);
-  border:1px solid #1f2630;
-  border-radius:12px;
-  padding:0.9rem 1.1rem;
-  font-size:0.9rem;color:#d8d8d8;flex:1;min-width:200px;
+.hero-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:0.7rem;margin:1.5rem 0 2rem}
+@media(max-width:720px){.hero-grid{grid-template-columns:1fr}}
+.hero-card{
+  background:linear-gradient(168deg,#10151e 0%,#0b0f16 100%);
+  border:1px solid #1c2230;
+  border-radius:10px;
+  padding:1.1rem 1.2rem;
+  position:relative;
+  overflow:hidden;
 }
-.pill strong{display:block;color:#fff;font-size:1.7rem;font-weight:700;margin-bottom:0.15rem;letter-spacing:-0.02em}
-.pill .label{font-size:0.72rem;color:#a0a0a0;letter-spacing:0.06em;text-transform:uppercase;margin-bottom:0.15rem}
-.pill .caption{color:#a0a0a0;font-size:0.82rem;margin-top:0.2rem}
-
-.chart-box{background:linear-gradient(180deg,#0e1118,#090c12);border:1px solid #1a2030;border-radius:12px;padding:1.2rem 0.8rem 0.8rem 0.4rem;margin:0.5rem 0 1.2rem}
-.chart-title{padding:0 1rem 0.6rem;font-size:0.9rem;color:#e0e0e0}
-.chart-title strong{color:#fff;font-weight:600}
-.chart-title .note{color:#a0a0a0;font-size:0.8rem;margin-top:0.2rem}
-
-table{width:100%;border-collapse:collapse;font-size:0.88rem;font-variant-numeric:tabular-nums;margin:0.6rem 0}
-thead th{padding:0.5rem 0.65rem;text-align:left;font-size:0.72rem;text-transform:uppercase;letter-spacing:0.06em;color:#b0b0b0;font-weight:500;border-bottom:1px solid #222}
-td.r,th.r{text-align:right}
-tbody td{padding:0.45rem 0.65rem;border-bottom:1px solid #181818;color:#e0e0e0}
-tbody tr.highlight td{background:rgba(132,230,183,0.06)}
-.pos{color:#84E6B7}
-.neg{color:#ff9977}
-
-.note-box{margin:0.8rem 0 1.2rem;padding:1rem 1.2rem;background:#0c0f14;border-left:3px solid #444;font-size:0.9rem;color:#d0d0d0;border-radius:0 6px 6px 0}
-.note-box strong{color:#fff}
-
-.method-box{font-size:0.88rem;color:#c0c0c0;background:#0c0f14;padding:1rem 1.2rem;border-radius:8px;margin:1.2rem 0;line-height:1.7}
-.method-box code{background:#151c28;color:#b0d4ff;padding:2px 7px;border-radius:3px;font-size:0.8rem;font-family:ui-monospace,Menlo,Consolas,monospace}
-
-.caveat{background:#18140e;border:1px solid #3a2e1c;color:#f0d898;padding:1rem 1.2rem;border-radius:8px;margin:1rem 0;font-size:0.9rem}
-.caveat strong{color:#ffe0a0}
-
-footer{margin-top:4rem;padding-top:1.5rem;border-top:1px solid #1a1a1a;color:#888;font-size:0.82rem}
-
-.badge{display:inline-block;padding:0.12rem 0.5rem;border-radius:999px;font-size:0.67rem;font-weight:600;letter-spacing:0.05em;text-transform:uppercase;margin-left:0.4rem;vertical-align:middle}
-.badge.measured{background:rgba(132,230,183,0.15);color:#84E6B7;border:1px solid rgba(132,230,183,0.35)}
-.badge.estimate{background:rgba(232,210,109,0.12);color:#e8d26d;border:1px solid rgba(232,210,109,0.32)}
-
-.footnote{font-size:0.84rem;color:#a0a0a0;margin:0.5rem 0 0.8rem;padding:0 0.4rem}
-.footnote strong{color:#ccc}
-
-.section{page-break-inside:avoid;break-inside:avoid-page}
-@media print{h2{page-break-after:avoid;break-after:avoid-page}.chart-box{page-break-inside:avoid;break-inside:avoid-page}}
-
-.gpu-pipeline{display:grid;grid-template-columns:2rem 1fr;gap:0.3rem 0.6rem;margin:1rem 0;font-size:0.84rem}
-.gpu-pipeline .step-num{color:#84E6B7;font-weight:600;text-align:right;font-variant-numeric:tabular-nums}
-.gpu-pipeline .step-desc{color:#d8d8d8}
-.gpu-pipeline .step-desc code{background:#151c28;color:#b0d4ff;padding:1px 5px;border-radius:3px;font-size:0.78rem;font-family:ui-monospace,Menlo,Consolas,monospace}
-
-.divider{border:none;border-top:1px solid #1a1a1a;margin:3rem 0}
+.hero-card::before{
+  content:'';position:absolute;top:0;left:0;right:0;height:2px;
+  background:linear-gradient(90deg,transparent,#84E6B7,transparent);
+  opacity:0.5;
+}
+.hero-card .label{font-size:0.7rem;color:#8a95a8;letter-spacing:0.06em;text-transform:uppercase;margin-bottom:0.3rem}
+.hero-card .val{font-size:2rem;font-weight:700;color:#fff;letter-spacing:-0.03em;line-height:1.1}
+.hero-card .val .unit{font-size:0.9rem;font-weight:500;color:#b8c8d8;margin-left:0.15rem}
+.hero-card .detail{font-size:0.78rem;color:#7a8898;margin-top:0.35rem;line-height:1.4}
+.hero-card .model-tag{display:inline-block;font-size:0.65rem;font-weight:600;letter-spacing:0.04em;text-transform:uppercase;padding:0.15rem 0.45rem;border-radius:4px;margin-bottom:0.4rem}
+.hero-card .model-tag.e4b{background:rgba(132,230,183,0.12);color:#84E6B7;border:1px solid rgba(132,230,183,0.25)}
+.hero-card .model-tag.b31{background:rgba(90,139,212,0.12);color:#5a8bd4;border:1px solid rgba(90,139,212,0.25)}
 
 .filter-bar{display:flex;gap:0.4rem;margin:1.5rem 0 0.5rem}
 .filter-btn{
@@ -119,16 +88,50 @@ footer{margin-top:4rem;padding-top:1.5rem;border-top:1px solid #1a1a1a;color:#88
   box-shadow:0 0 10px rgba(132,230,183,0.12);
 }
 
+.chart-box{background:linear-gradient(180deg,#0e1118,#090c12);border:1px solid #1a2030;border-radius:12px;padding:1.2rem 0.8rem 0.8rem 0.4rem;margin:0.5rem 0 1.2rem}
+.chart-title{padding:0 1rem 0.6rem;font-size:0.9rem;color:#e0e0e0}
+.chart-title strong{color:#fff;font-weight:600}
+.chart-title .note{color:#a0a0a0;font-size:0.8rem;margin-top:0.2rem}
+
+table{width:100%;border-collapse:collapse;font-size:0.88rem;font-variant-numeric:tabular-nums;margin:0.6rem 0}
+thead th{padding:0.5rem 0.65rem;text-align:left;font-size:0.72rem;text-transform:uppercase;letter-spacing:0.06em;color:#b0b0b0;font-weight:500;border-bottom:1px solid #222}
+td.r,th.r{text-align:right}
+tbody td{padding:0.45rem 0.65rem;border-bottom:1px solid #181818;color:#e0e0e0}
+tbody tr.highlight td{background:rgba(132,230,183,0.06)}
+.pos{color:#84E6B7}
+.neg{color:#ff9977}
+
+.note-box{margin:0.8rem 0 1.2rem;padding:1rem 1.2rem;background:#0c0f14;border-left:3px solid #444;font-size:0.9rem;color:#d0d0d0;border-radius:0 6px 6px 0}
+.note-box strong{color:#fff}
+
+.method-box{font-size:0.88rem;color:#c0c0c0;background:#0c0f14;padding:1rem 1.2rem;border-radius:8px;margin:1.2rem 0;line-height:1.7}
+.method-box code{background:#151c28;color:#b0d4ff;padding:2px 7px;border-radius:3px;font-size:0.8rem;font-family:ui-monospace,Menlo,Consolas,monospace}
+
+.footnote{font-size:0.84rem;color:#a0a0a0;margin:0.5rem 0 0.8rem;padding:0 0.4rem}
+.footnote strong{color:#ccc}
+
+.badge{display:inline-block;padding:0.12rem 0.5rem;border-radius:999px;font-size:0.67rem;font-weight:600;letter-spacing:0.05em;text-transform:uppercase;margin-left:0.4rem;vertical-align:middle}
+.badge.measured{background:rgba(132,230,183,0.15);color:#84E6B7;border:1px solid rgba(132,230,183,0.35)}
+
+.divider{border:none;border-top:1px solid #1a1a1a;margin:3rem 0}
+
 .section-block{transition:opacity 0.2s ease}
 .hidden{display:none}
+
+.gpu-pipeline{display:grid;grid-template-columns:2rem 1fr;gap:0.3rem 0.6rem;margin:1rem 0;font-size:0.84rem}
+.gpu-pipeline .step-num{color:#84E6B7;font-weight:600;text-align:right;font-variant-numeric:tabular-nums}
+.gpu-pipeline .step-desc{color:#d8d8d8}
+.gpu-pipeline .step-desc code{background:#151c28;color:#b0d4ff;padding:1px 5px;border-radius:3px;font-size:0.78rem;font-family:ui-monospace,Menlo,Consolas,monospace}
+
+footer{margin-top:4rem;padding-top:1.5rem;border-top:1px solid #1a1a1a;color:#888;font-size:0.82rem}
 </style>
 </head>
 <body>
 <div class="wrap">
 
 <header>
-  <h1>rvLLM 0.3.0 - Featuring 31B Gemma 4</h1>
-  <div class="sub">LLM inference engine benchmarks for <strong>31B Gemma 4</strong>. TPU path: JAX+XLA on v6e-4 - <strong>13,943 tok/s</strong> (int8, B=768, TP=4 SPMD, PPL 19.24). <strong>128K context support</strong> (24.7 tok/s decode). <strong>3.6x faster than vLLM on H100 GPU</strong> (measured). GPU path: Rust+CUDA on H100 - <strong>7,943 tok/s</strong> (FP8, B=512, CUDA graph, PPL 13.53).</div>
+  <h1>rvLLM Benchmarks</h1>
+  <div class="sub">Gemma 4 inference on <strong>TPU v6e-4</strong> (JAX+XLA) and <strong>H100 GPU</strong> (Rust+CUDA). Three TPU models: <strong>E4B</strong> (4B dense), <strong>26B-A4B</strong> (MoE, 128 experts), <strong>31B</strong> (dense). All numbers measured on our hardware.</div>
   <div class="nav-buttons">
     <a href="index.html">Home</a>
     <a href="https://github.com/m0at/rvllm">GitHub</a>
@@ -137,257 +140,207 @@ footer{margin-top:4rem;padding-top:1.5rem;border-top:1px solid #1a1a1a;color:#88
   </div>
 </header>
 
+<table style="margin:1.5rem 0 2rem">
+<thead><tr><th></th><th class="r">E4B (4B)</th><th class="r">26B-A4B (MoE)</th><th class="r">31B</th><th class="r">vLLM H100</th></tr></thead>
+<tbody>
+<tr><td><strong>PPL</strong></td><td class="r pos"><strong>5.87</strong></td><td class="r">90.21</td><td class="r">24.76</td><td class="r">-</td></tr>
+<tr><td><strong>B=1 tok/s</strong></td><td class="r pos"><strong>78.3</strong></td><td class="r">52.9</td><td class="r">44.2</td><td class="r">66.9</td></tr>
+<tr><td><strong>B=128 tok/s</strong></td><td class="r pos"><strong>6,298</strong></td><td class="r">4,915</td><td class="r">3,853</td><td class="r">3,848</td></tr>
+<tr><td><strong>Cached TTFT</strong></td><td class="r pos"><strong>25.9 ms</strong></td><td class="r">35.3 ms</td><td class="r">73.3 ms</td><td class="r">-</td></tr>
+<tr><td><strong>Peak tok/s</strong></td><td class="r pos"><strong>16,794</strong></td><td class="r">14,899</td><td class="r">9,600</td><td class="r">3,848</td></tr>
+<tr><td><strong>Peak tok/s/$</strong></td><td class="r pos"><strong>3,230</strong></td><td class="r">2,865</td><td class="r">1,846</td><td class="r">2,004</td></tr>
+</tbody>
+</table>
+<div class="footnote">TPU: v6e-4, $5.20/hr, int8 weights, bf16 KV, max-ctx 2048. vLLM: H100 SXM, $1.92/hr, FP8, max-ctx 2048. GPU rvLLM: H100 SXM, $1.92/hr, FP8+F16 KV. All measured.</div>
+
 <div class="filter-bar">
   <button class="filter-btn active" onclick="filterView('both')">Both</button>
   <button class="filter-btn" onclick="filterView('tpu')">TPU</button>
-  <button class="filter-btn" onclick="filterView('eagle3')">EAGLE-3</button>
   <button class="filter-btn" onclick="filterView('gpu')">GPU</button>
 </div>
 
-<div id="pills-tpu" class="pill-row">
-  <div class="pill">
-    <div class="label">TPU peak throughput</div>
-    <strong>13,943 tok/s</strong>
-    <div class="caption">v6e-4, int8, B=768, TP=4 SPMD</div>
+<div id="section-overview" class="section-block">
+
+<div class="chart-box">
+  <div class="chart-title"><strong>All configurations: throughput vs batch size</strong>
+    <div class="note">3 TPU models + 2 GPU baselines. TPU v6e-4 $5.20/hr, H100 SXM $1.92/hr. All at max-ctx 2048.</div>
   </div>
-  <div class="pill">
-    <div class="label">B=1 decode (512 ctx)</div>
-    <strong>78.2 tok/s</strong>
-    <div class="caption">12.79 ms, single-scan bf16 KV</div>
-  </div>
-  <div class="pill">
-    <div class="label">128K context</div>
-    <strong>24.7 tok/s</strong>
-    <div class="caption">40.56 ms, blockwise global attention</div>
-  </div>
-  <div class="pill">
-    <div class="label">Perplexity</div>
-    <strong>19.24</strong>
-    <div class="caption">split-cache int8 KV (from 25.51 baseline)</div>
-  </div>
-  <div class="pill">
-    <div class="label">Cost efficiency</div>
-    <strong>2,681 tok/s/$</strong>
-    <div class="caption">34% better than vLLM H100 GPU (measured)</div>
-  </div>
-</div>
-<div id="pills-gpu" class="pill-row hidden">
-  <div class="pill">
-    <div class="label">GPU peak throughput</div>
-    <strong>7,943 tok/s</strong>
-    <div class="caption">H100 SXM, FP8, B=512, CUDA graph</div>
-  </div>
-  <div class="pill">
-    <div class="label">B=1 decode</div>
-    <strong>52 tok/s</strong>
-    <div class="caption">19.2 ms, ~1400 graph nodes</div>
-  </div>
-  <div class="pill">
-    <div class="label">Perplexity</div>
-    <strong>13.53</strong>
-    <div class="caption">FP8-Dynamic + fused channelscale, F16 KV</div>
-  </div>
-  <div class="pill">
-    <div class="label">128K context</div>
-    <strong>supported</strong>
-    <div class="caption">per-layer KV sizing, 11.6 GB KV cache</div>
-  </div>
-  <div class="pill">
-    <div class="label">Kernel fusion</div>
-    <strong>1776 -> ~1350 nodes</strong>
-    <div class="caption">21% reduction, 3 fusion passes</div>
-  </div>
+  <div id="chart-overview" style="height:400px"></div>
 </div>
 
+<h3>Full batch sweep -- all configurations</h3>
+<table>
+<thead><tr><th>Batch</th><th class="r">E4B TPU</th><th class="r">26B-A4B TPU</th><th class="r">31B TPU</th><th class="r">31B GPU (rvLLM)</th><th class="r">31B GPU (vLLM)</th></tr></thead>
+<tbody>
+<tr><td>1</td><td class="r">78</td><td class="r">53</td><td class="r">44</td><td class="r">52</td><td class="r">69</td></tr>
+<tr><td>8</td><td class="r">542</td><td class="r">390</td><td class="r">318</td><td class="r">452</td><td class="r">515</td></tr>
+<tr><td>32</td><td class="r">-</td><td class="r">-</td><td class="r">-</td><td class="r">1,723</td><td class="r">1,748</td></tr>
+<tr><td>64</td><td class="r">3,661</td><td class="r">2,662</td><td class="r">2,112</td><td class="r">3,097</td><td class="r">3,130</td></tr>
+<tr><td>128</td><td class="r pos">6,298</td><td class="r">4,915</td><td class="r">3,853</td><td class="r">5,114</td><td class="r">4,689</td></tr>
+<tr><td>256</td><td class="r pos">10,214</td><td class="r">8,192</td><td class="r">6,246</td><td class="r">6,897</td><td class="r">7,077</td></tr>
+<tr><td>512</td><td class="r pos">13,773</td><td class="r">12,390</td><td class="r">8,550</td><td class="r">7,943</td><td class="r">8,243</td></tr>
+<tr class="highlight"><td><strong>768</strong></td><td class="r pos"><strong>15,514</strong></td><td class="r"><strong>14,899</strong></td><td class="r"><strong>9,600</strong></td><td class="r">-</td><td class="r">-</td></tr>
+<tr class="highlight"><td><strong>1024</strong></td><td class="r pos"><strong>16,794</strong></td><td class="r">-</td><td class="r">-</td><td class="r">-</td><td class="r">-</td></tr>
+</tbody>
+</table>
+<div class="footnote">All tok/s are total throughput (batch x per-element rate). "-" = not tested or OOM at that batch size.</div>
+
+<h3>Summary across all configurations</h3>
+<table>
+<thead><tr><th>Config</th><th class="r">PPL</th><th class="r">B=1 tok/s</th><th class="r">Cached TTFT</th><th class="r">Peak tok/s</th><th class="r">$/hr</th><th class="r">Peak tok/s/$</th></tr></thead>
+<tbody>
+<tr class="highlight"><td><strong>E4B on TPU</strong></td><td class="r pos"><strong>5.87</strong></td><td class="r pos"><strong>78.3</strong></td><td class="r pos"><strong>25.9 ms</strong></td><td class="r pos"><strong>16,794</strong></td><td class="r">$5.20</td><td class="r pos"><strong>3,230</strong></td></tr>
+<tr><td>26B-A4B on TPU</td><td class="r">90.21</td><td class="r">52.9</td><td class="r">35.3 ms</td><td class="r">14,899</td><td class="r">$5.20</td><td class="r">2,865</td></tr>
+<tr><td>31B on TPU</td><td class="r">24.76</td><td class="r">44.2</td><td class="r">73.3 ms</td><td class="r">9,600</td><td class="r">$5.20</td><td class="r">1,846</td></tr>
+<tr><td>31B rvLLM GPU</td><td class="r pos">13.53</td><td class="r">52</td><td class="r">-</td><td class="r">7,943</td><td class="r">$1.92</td><td class="r">4,137</td></tr>
+<tr><td>31B vLLM GPU</td><td class="r">-</td><td class="r">69</td><td class="r">-</td><td class="r">3,848</td><td class="r">$1.92</td><td class="r">2,004</td></tr>
+</tbody>
+</table>
+<div class="footnote">PPL measured on 86-token passage. 26B-A4B PPL is high for both rvLLM (90.21) and HF reference (85.42) -- instruct MoE on raw prose. GPU rvLLM PPL 13.53 is best due to FP8-Dynamic per-channel scales preserving more precision than int8 or bf16.</div>
+
+</div>
+
+
+<!-- ============================================================ -->
+<!-- TPU SECTION -->
+<!-- ============================================================ -->
 
 <div id="section-tpu" class="section-block">
 
-<h2 class="section">TPU: 31B Gemma 4 <span class="sub">v6e-4, JAX+XLA, int8 quantized</span> <span class="badge measured">Measured</span></h2>
+<h2>TPU: Gemma 4 <span class="sub">v6e-4, JAX+XLA, int8, TP=4 SPMD</span> <span class="badge measured">Measured</span></h2>
 
 <div class="note-box">
-  <strong>No custom kernels.</strong> The entire forward pass is ~500 lines of JAX. XLA compiles it to a single fused while loop on 4 TPU v6e chips. Zero Python in the hot path - the decode loop runs entirely on-chip via <code>jax.lax.while_loop</code>.
+  <strong>Three models, one codebase.</strong> ~500 lines of JAX, zero custom kernels. XLA compiles the entire forward pass to a single fused while loop. E4B adds per-layer input injection + KV sharing. 26B-A4B adds MoE (128 experts, top-8 routing). 31B adds 128K context via dual-path architecture. All run on the same v6e-4 ($5.20/hr).
 </div>
 
-<h3>Context scaling (B=1 decode)</h3>
+
+<h3>Single-user performance (B=1, max-ctx 2048)</h3>
+
+<table>
+<thead><tr><th>Metric</th><th class="r">E4B (4B)</th><th class="r">26B-A4B (MoE)</th><th class="r">31B</th></tr></thead>
+<tbody>
+<tr><td>Decode throughput</td><td class="r pos"><strong>78.3 tok/s</strong></td><td class="r">52.9 tok/s</td><td class="r">44.2 tok/s</td></tr>
+<tr><td>Decode latency</td><td class="r pos"><strong>12.8 ms</strong></td><td class="r">18.9 ms</td><td class="r">22.6 ms</td></tr>
+<tr><td>TTFT (first run, incl. compile)</td><td class="r">2,470 ms</td><td class="r">2,083 ms</td><td class="r pos"><strong>1,498 ms</strong></td></tr>
+<tr><td>TTFT (cached compile)</td><td class="r pos"><strong>25.9 ms</strong></td><td class="r">35.3 ms</td><td class="r">73.3 ms</td></tr>
+<tr><td>Perplexity</td><td class="r pos"><strong>5.87</strong></td><td class="r">90.21</td><td class="r">24.76</td></tr>
+<tr><td>HF bf16 reference PPL</td><td class="r">3.28</td><td class="r">85.42</td><td class="r">~19</td></tr>
+</tbody>
+</table>
+<div class="footnote">PPL measured on 86-token passage (John 1:1-14) with BOS prepend. 26B-A4B PPL is high for both rvLLM and HF -- instruct MoE models score poorly on raw prose. TTFT first-run includes XLA compilation (~1.5-2.5s). Cached TTFT is the steady-state latency for single-token forward pass (1 prompt token).</div>
+
+
+<h3>Batch scaling (max-ctx 2048)</h3>
 <div class="chart-box">
-  <div class="chart-title"><strong>Throughput vs context length</strong> - 512 to 128K supported
-    <div class="note">31B Gemma 4, int8 weights, v6e-4 (4 chips, 128 GB HBM). Dual-path: single-scan bf16 KV (<= 32K) auto-switches to split-cache int8 KV (> 32K).</div>
+  <div class="chart-title"><strong>Throughput vs batch size</strong> - all configurations
+    <div class="note">E4B + 31B on TPU v6e-4 (int8, 2048 ctx) vs vLLM 31B on H100 SXM (FP8, 2048 ctx). All measured.</div>
   </div>
-  <div id="chart-ctx-scaling" style="height:340px"></div>
+  <div id="chart-tpu-scaling" style="height:360px"></div>
 </div>
 
+<table>
+<thead><tr><th>Batch</th><th class="r">E4B TPU</th><th class="r">26B-A4B TPU</th><th class="r">31B TPU</th><th class="r">vLLM H100</th></tr></thead>
+<tbody>
+<tr><td>1</td><td class="r">78</td><td class="r">53</td><td class="r">44</td><td class="r pos">66.9</td></tr>
+<tr><td>8</td><td class="r pos">542</td><td class="r">390</td><td class="r">318</td><td class="r">511.7</td></tr>
+<tr><td>64</td><td class="r pos">3,661</td><td class="r">2,662</td><td class="r">2,112</td><td class="r">2,794</td></tr>
+<tr><td>128</td><td class="r pos">6,298</td><td class="r">4,915</td><td class="r">3,853</td><td class="r">3,848</td></tr>
+<tr><td>256</td><td class="r pos">10,214</td><td class="r">8,192</td><td class="r">6,246</td><td class="r">3,709</td></tr>
+<tr><td>512</td><td class="r pos">13,773</td><td class="r">12,390</td><td class="r">8,550</td><td class="r">3,788</td></tr>
+<tr class="highlight"><td><strong>768</strong></td><td class="r pos"><strong>15,514</strong></td><td class="r"><strong>14,899</strong></td><td class="r"><strong>9,600</strong></td><td class="r">3,671</td></tr>
+<tr class="highlight"><td><strong>1024</strong></td><td class="r pos"><strong>16,794</strong></td><td class="r">-</td><td class="r">-</td><td class="r">-</td></tr>
+</tbody>
+</table>
+<div class="footnote"><strong>All tok/s are total throughput (batch x per-element rate).</strong> vLLM peaks at B=128 then saturates. All three TPU models keep scaling to B=768. E4B peaks at B=1024 (16,794 tok/s). 26B-A4B MoE matches E4B closely at high batch despite 6.5x more total parameters (sparse activation).</div>
+
+
+<h3>Cost efficiency</h3>
+<table>
+<thead><tr><th>Config</th><th class="r">Peak tok/s</th><th class="r">Batch</th><th class="r">Cost/hr</th><th class="r">tok/s/$</th></tr></thead>
+<tbody>
+<tr class="highlight"><td><strong>E4B on TPU v6e-4</strong></td><td class="r"><strong>16,794</strong></td><td class="r">1024</td><td class="r">$5.20</td><td class="r pos"><strong>3,230</strong></td></tr>
+<tr><td>26B-A4B on TPU v6e-4</td><td class="r">14,899</td><td class="r">768</td><td class="r">$5.20</td><td class="r">2,865</td></tr>
+<tr><td>31B on TPU v6e-4</td><td class="r">9,600</td><td class="r">768</td><td class="r">$5.20</td><td class="r">1,846</td></tr>
+<tr><td>31B vLLM on H100 (measured)</td><td class="r">3,848</td><td class="r">128</td><td class="r">$1.92</td><td class="r">2,004</td></tr>
+</tbody>
+</table>
+
+
+<h3>TPU 31B vs vLLM GPU (2048 ctx) <span class="badge measured">Measured</span></h3>
+
+<div class="note-box">
+  <strong>Apples-to-apples at max-ctx 2048.</strong> vLLM on H100 SXM 80GB with RedHatAI/gemma-4-31B-it-FP8-Dynamic ($1.92/hr on vast.ai). GPU wins at low batch due to lower per-step latency. TPU overtakes at B=128 and keeps scaling.
+</div>
+
+<div class="chart-box">
+  <div class="chart-title"><strong>31B: rvLLM TPU vs rvLLM GPU vs vLLM GPU</strong>
+    <div class="note">All at max-ctx 2048. TPU: v6e-4, int8. GPU: H100 SXM, FP8. rvLLM GPU = raw CUDA graph decode, vLLM = server with scheduler.</div>
+  </div>
+  <div id="chart-tpu-vs-gpu" style="height:340px"></div>
+</div>
+
+<table>
+<thead><tr><th>Batch</th><th class="r">vLLM GPU tok/s</th><th class="r">vLLM ms/step</th><th class="r">rvLLM TPU tok/s</th><th class="r">TPU ms/step</th><th class="r">Winner</th></tr></thead>
+<tbody>
+<tr><td>1</td><td class="r pos"><strong>66.9</strong></td><td class="r">14.95</td><td class="r">44</td><td class="r">22.6</td><td class="r">GPU +52%</td></tr>
+<tr><td>8</td><td class="r pos"><strong>511.7</strong></td><td class="r">15.63</td><td class="r">318</td><td class="r">25.1</td><td class="r">GPU +61%</td></tr>
+<tr><td>64</td><td class="r pos"><strong>2,794</strong></td><td class="r">22.90</td><td class="r">2,112</td><td class="r">30.3</td><td class="r">GPU +32%</td></tr>
+<tr class="highlight"><td><strong>128</strong></td><td class="r"><strong>3,848</strong></td><td class="r">33.26</td><td class="r"><strong>3,853</strong></td><td class="r">33.2</td><td class="r pos">Tie</td></tr>
+<tr><td>256</td><td class="r">3,709</td><td class="r">69.03</td><td class="r pos"><strong>6,246</strong></td><td class="r">41.0</td><td class="r pos">TPU +68%</td></tr>
+<tr><td>512</td><td class="r">3,788</td><td class="r">135.18</td><td class="r pos"><strong>8,550</strong></td><td class="r">59.7</td><td class="r pos">TPU +126%</td></tr>
+<tr class="highlight"><td><strong>768</strong></td><td class="r">3,671</td><td class="r">209.18</td><td class="r pos"><strong>9,600</strong></td><td class="r">80.3</td><td class="r pos">TPU +161%</td></tr>
+</tbody>
+</table>
+<div class="footnote"><strong>Crossover at B=128.</strong> vLLM's mature CUDA graph pipeline dominates at low batch. TPU's advantage at high batch: XLA fuses the entire decode loop on-chip, and the v6e-4's aggregate bandwidth (~3.3 TB/s across 4 chips) keeps scaling where the single H100 saturates.</div>
+
+
+<h3>31B context scaling (B=1)</h3>
 <table>
 <thead><tr><th>Context</th><th class="r">ms/step</th><th class="r">tok/s</th><th>Architecture</th><th class="r">KV type</th></tr></thead>
 <tbody>
 <tr><td>512</td><td class="r">12.79</td><td class="r">78.2</td><td>Single-scan, 60-layer scan + cond</td><td class="r">bf16</td></tr>
-<tr><td>2,048</td><td class="r">~14</td><td class="r">~70</td><td>Single-scan</td><td class="r">bf16</td></tr>
+<tr><td>2,048</td><td class="r">22.6</td><td class="r">44.2</td><td>Single-scan</td><td class="r">bf16</td></tr>
 <tr><td>32K</td><td class="r">~66</td><td class="r">~15</td><td>Single-scan</td><td class="r">bf16</td></tr>
 <tr><td>64K</td><td class="r">~91</td><td class="r">~11</td><td>Split-cache, 10 groups x 6</td><td class="r">int8</td></tr>
 <tr class="highlight"><td><strong>128K</strong></td><td class="r"><strong>40.56</strong></td><td class="r"><strong>24.7</strong></td><td>Split-cache + blockwise global</td><td class="r"><strong>int8</strong></td></tr>
 </tbody>
 </table>
-<div class="footnote"><strong>Dual-path auto-switching:</strong> <= 32K uses single-scan with bf16 KV (fastest). > 32K uses split-cache with int8 KV (128K support). No compromise -- 78.2 tok/s at short context, 24.7 tok/s at 128K.</div>
+<div class="footnote"><strong>Dual-path auto-switching:</strong> <= 32K uses single-scan with bf16 KV (fastest). > 32K uses split-cache with int8 KV (128K). 128K is 31B only -- E4B not yet tested at long context.</div>
 
-<h3>Dual-path architecture</h3>
-<div class="note-box">
-  <strong>Auto-switches based on <code>--max-ctx</code>.</strong> <= 32K: single-scan with bf16 KV cache. One <code>jax.lax.scan</code> over all 60 layers with <code>jax.lax.cond</code> dispatch. Fastest for short-to-medium context. > 32K: split-cache with int8 KV cache. 50 sliding-window layers use a 1024-entry circular buffer, 10 global layers use full-context blockwise attention with online softmax. Processed in 10 groups of 6 (5 sliding + 1 global), eliminating <code>jax.lax.cond</code> overhead. Int8 KV with per-head scales provides 50% memory reduction. No compromise -- fast short-context AND 128K support.
-</div>
 
-<h3>Perplexity progression</h3>
+<h3>31B perplexity progression</h3>
 <table>
 <thead><tr><th>Version</th><th class="r">PPL</th><th>Notes</th></tr></thead>
 <tbody>
 <tr><td>bf16 KV, single scan</td><td class="r">25.51</td><td>Original baseline</td></tr>
 <tr><td>int8 KV, single scan</td><td class="r">22.80</td><td>Per-head scales</td></tr>
 <tr class="highlight"><td><strong>int8 KV, split-cache</strong></td><td class="r"><strong>19.24</strong></td><td>Circular buffer + blockwise</td></tr>
+<tr><td>int8 weights, bf16 KV (2048 ctx)</td><td class="r">24.76</td><td>Current single-scan path</td></tr>
 </tbody>
 </table>
-<div class="footnote"><strong>24.6% perplexity improvement</strong> from 25.51 to 19.24 via split-cache architecture and int8 KV quantization with per-head scales.</div>
 
-<h3>Memory budget at 128K (per chip, TP=4)</h3>
+
+<h3>Architecture comparison</h3>
 <table>
-<thead><tr><th>Component</th><th class="r">Size</th></tr></thead>
+<thead><tr><th>Property</th><th class="r">E4B (4B)</th><th class="r">26B-A4B (MoE)</th><th class="r">31B</th></tr></thead>
 <tbody>
-<tr><td>Weights (int8)</td><td class="r">7.75 GB</td></tr>
-<tr><td>Sliding KV (50 layers x 1024 x 1024 bytes)</td><td class="r">50 MB</td></tr>
-<tr><td>Global KV (10 layers x 131072 x 512 bytes, after TP shard)</td><td class="r">625 MB</td></tr>
-<tr><td>Scale arrays</td><td class="r">~60 MB</td></tr>
-<tr class="highlight"><td><strong>Total</strong></td><td class="r"><strong>~8.5 GB of 32 GB</strong></td></tr>
-</tbody>
-</table>
-
-<h3>Batch scaling sweep</h3>
-<div class="chart-box">
-  <div class="chart-title"><strong>Throughput vs batch size</strong> - higher is better
-    <div class="note">31B Gemma 4, int8 weights, v6e-4 (4 chips, 128 GB HBM, ~3.3 TB/s). LIBTPU flags enabled for batched runs.</div>
-  </div>
-  <div id="chart-tpu-scaling" style="height:340px"></div>
-</div>
-
-<table>
-<thead><tr><th>Batch</th><th class="r">Total</th><th class="r">tok/s/batch</th><th class="r">ms/step</th><th class="r">Scaling</th><th class="r">tok/s/$</th></tr></thead>
-<tbody>
-<tr><td>1</td><td class="r">78.2</td><td class="r">78.2</td><td class="r">12.79</td><td class="r">1x</td><td class="r">15.0</td></tr>
-<tr><td>8</td><td class="r">584</td><td class="r">73.0</td><td class="r">13.7</td><td class="r">7.3x</td><td class="r">112</td></tr>
-<tr><td>64</td><td class="r">4,220</td><td class="r">65.9</td><td class="r">15.2</td><td class="r">52.8x</td><td class="r">812</td></tr>
-<tr><td>128</td><td class="r">6,831</td><td class="r">53.4</td><td class="r">18.7</td><td class="r">85.5x</td><td class="r">1,314</td></tr>
-<tr><td>256</td><td class="r">10,536</td><td class="r">41.2</td><td class="r">24.3</td><td class="r">131.9x</td><td class="r">2,026</td></tr>
-<tr><td>512</td><td class="r">12,932</td><td class="r">25.3</td><td class="r">39.6</td><td class="r">161.9x</td><td class="r">2,487</td></tr>
-<tr class="highlight"><td><strong>768</strong></td><td class="r"><strong>13,943</strong></td><td class="r"><strong>18.2</strong></td><td class="r"><strong>55.1</strong></td><td class="r pos"><strong>174.5x</strong></td><td class="r pos"><strong>2,681</strong></td></tr>
-<tr><td>1024</td><td class="r">13,705</td><td class="r">13.4</td><td class="r">74.7</td><td class="r">171.5x</td><td class="r">2,636</td></tr>
-</tbody>
-</table>
-<div class="footnote"><strong>Near-linear scaling from B=1 to B=512.</strong> Step time grows from 12.79 ms to 39.6 ms as MXU utilization rises from ~5% to ~80%. Peak at B=768 where compute and bandwidth saturate simultaneously. B=1024+ is compute-bound with diminishing returns.</div>
-
-
-<h3>TPU vs vLLM GPU comparison <span class="badge measured">Measured</span></h3>
-
-<div class="note-box">
-  <strong>All GPU numbers are measured on our hardware.</strong> vLLM on H100 SXM 80GB with RedHatAI/gemma-4-31B-it-FP8-Dynamic ($1.92/hr on vast.ai, max_ctx=2048). TPU batch scaling numbers are from the single-scan bf16 KV architecture (512 ctx). The dual-path engine auto-switches to split-cache int8 KV for contexts > 32K.
-</div>
-
-<div class="pill-row">
-  <div class="pill">
-    <div class="label">B=1 head-to-head</div>
-    <strong>TPU 17% faster</strong>
-    <div class="caption">78.2 tok/s (TPU) vs 66.9 tok/s (vLLM GPU)</div>
-  </div>
-  <div class="pill">
-    <div class="label">Peak throughput</div>
-    <strong>TPU 3.6x faster</strong>
-    <div class="caption">13,943 tok/s (TPU B=768) vs 3,848 tok/s (vLLM B=128)</div>
-  </div>
-  <div class="pill">
-    <div class="label">Cost efficiency at peak</div>
-    <strong>TPU 34% better</strong>
-    <div class="caption">2,681 tok/s/$ vs 2,004 tok/s/$</div>
-  </div>
-  <div class="pill">
-    <div class="label">128K context</div>
-    <strong>TPU only</strong>
-    <div class="caption">24.7 tok/s via split-cache. vLLM GPU tested at 2048 ctx.</div>
-  </div>
-</div>
-
-<div class="chart-box">
-  <div class="chart-title"><strong>31B Gemma 4: rvLLM TPU vs vLLM GPU throughput</strong>
-    <div class="note">Measured on our hardware. TPU: v6e-4, int8, single-scan (512 ctx). GPU: H100 SXM 80GB, FP8-Dynamic, vLLM ($1.92/hr).</div>
-  </div>
-  <div id="chart-tpu-vs-gpu" style="height:340px"></div>
-</div>
-
-<table>
-<thead><tr><th>Batch</th><th class="r">vLLM GPU tok/s</th><th class="r">vLLM GPU ms/step</th><th class="r">rvLLM TPU tok/s</th><th class="r">rvLLM TPU ms/step</th></tr></thead>
-<tbody>
-<tr><td>1</td><td class="r">66.9</td><td class="r">14.95</td><td class="r pos"><strong>78.2</strong></td><td class="r">12.79</td></tr>
-<tr><td>2</td><td class="r">131.5</td><td class="r">15.20</td><td class="r">-</td><td class="r">-</td></tr>
-<tr><td>4</td><td class="r">257.6</td><td class="r">15.53</td><td class="r">-</td><td class="r">-</td></tr>
-<tr><td>8</td><td class="r">511.7</td><td class="r">15.63</td><td class="r pos"><strong>584</strong></td><td class="r">13.7</td></tr>
-<tr><td>16</td><td class="r">926.5</td><td class="r">17.27</td><td class="r">-</td><td class="r">-</td></tr>
-<tr><td>32</td><td class="r">1,728</td><td class="r">18.51</td><td class="r">-</td><td class="r">-</td></tr>
-<tr><td>48</td><td class="r">2,258</td><td class="r">21.26</td><td class="r">-</td><td class="r">-</td></tr>
-<tr><td>64</td><td class="r">2,794</td><td class="r">22.90</td><td class="r pos"><strong>4,220</strong></td><td class="r">15.2</td></tr>
-<tr><td>96</td><td class="r">3,083</td><td class="r">31.14</td><td class="r">-</td><td class="r">-</td></tr>
-<tr class="highlight"><td><strong>128</strong></td><td class="r"><strong>3,848</strong></td><td class="r">33.26</td><td class="r pos"><strong>6,831</strong></td><td class="r">18.7</td></tr>
-<tr><td>256</td><td class="r">3,709</td><td class="r">69.03</td><td class="r pos"><strong>10,536</strong></td><td class="r">24.3</td></tr>
-<tr><td>512</td><td class="r">3,788</td><td class="r">135.18</td><td class="r pos"><strong>12,932</strong></td><td class="r">39.6</td></tr>
-<tr class="highlight"><td><strong>768</strong></td><td class="r">3,671</td><td class="r">209.18</td><td class="r pos"><strong>13,943</strong></td><td class="r"><strong>55.1</strong></td></tr>
-</tbody>
-</table>
-
-<table>
-<thead><tr><th>Hardware</th><th class="r">Peak tok/s</th><th class="r">Batch</th><th class="r">Cost/hr</th><th class="r">tok/s/$</th></tr></thead>
-<tbody>
-<tr class="highlight"><td><strong>TPU v6e-4 (rvLLM, single-scan)</strong></td><td class="r"><strong>13,943</strong></td><td class="r">768</td><td class="r">$5.20</td><td class="r pos"><strong>2,681</strong></td></tr>
-<tr><td>H100 SXM (vLLM, FP8, measured)</td><td class="r">3,848</td><td class="r">128</td><td class="r">$1.92</td><td class="r">2,004</td></tr>
-</tbody>
-</table>
-<div class="footnote"><strong>vLLM GPU peaks at B=128 then saturates.</strong> TPU continues scaling linearly to B=768. The v6e-4's advantage: (1) higher aggregate bandwidth per dollar, (2) zero-overhead fused decode loop via XLA, (3) near-perfect batch scaling on the MXU. GPU is cheaper per hour ($1.92 vs $5.20), but TPU delivers 34% better cost efficiency at peak.</div>
-
-
-<h3>Optimization progression</h3>
-<div class="chart-box">
-  <div class="chart-title"><strong>Zero to 13,943 tok/s in a single session</strong>
-    <div class="note">Each bar represents a concrete optimization step applied to the same 31B Gemma 4 model on TPU v6e-4.</div>
-  </div>
-  <div id="chart-progression" style="height:320px"></div>
-</div>
-
-<table>
-<thead><tr><th>Step</th><th class="r">tok/s</th><th class="r">ms/step</th><th class="r">Improvement</th></tr></thead>
-<tbody>
-<tr><td>Nested scan, bf16, B=1</td><td class="r">25.6</td><td class="r">38.0</td><td class="r">baseline</td></tr>
-<tr><td>Flat scan, bf16, B=1</td><td class="r">48.2</td><td class="r">19.4</td><td class="r pos">+88%</td></tr>
-<tr><td>Flat scan, int8, B=1</td><td class="r">68.2</td><td class="r">13.4</td><td class="r pos">+42%</td></tr>
-<tr><td>Fused on-chip decode, B=1</td><td class="r">78.2</td><td class="r">12.79</td><td class="r pos">+15%</td></tr>
-<tr><td>B=8</td><td class="r">584</td><td class="r">13.7</td><td class="r pos">7.3x batch scaling</td></tr>
-<tr><td>B=64 + LIBTPU flags</td><td class="r">4,220</td><td class="r">15.2</td><td class="r pos">async collective fusion</td></tr>
-<tr class="highlight"><td><strong>B=768 + LIBTPU flags</strong></td><td class="r"><strong>13,943</strong></td><td class="r"><strong>55.1</strong></td><td class="r pos"><strong>174.5x from baseline</strong></td></tr>
+<tr><td>Total / active params</td><td class="r">~4B / 4B</td><td class="r">26B / ~4B</td><td class="r">31B / 31B</td></tr>
+<tr><td>Layers</td><td class="r">42</td><td class="r">30</td><td class="r">60</td></tr>
+<tr><td>Hidden size</td><td class="r">2,560</td><td class="r">2,816</td><td class="r">5,376</td></tr>
+<tr><td>Q / KV heads (sliding)</td><td class="r">8 / 2</td><td class="r">16 / 8</td><td class="r">32 / 16</td></tr>
+<tr><td>Q / KV heads (global)</td><td class="r">8 / 2</td><td class="r">16 / 2 (V=K)</td><td class="r">32 / 4 (V=K)</td></tr>
+<tr><td>Head dim (sliding / global)</td><td class="r">256 / 512</td><td class="r">256 / 512</td><td class="r">256 / 512</td></tr>
+<tr><td>Sliding window</td><td class="r">512</td><td class="r">1,024</td><td class="r">1,024</td></tr>
+<tr><td>MoE</td><td class="r">none</td><td class="r">128 experts, top-8</td><td class="r">none</td></tr>
+<tr><td>KV-shared layers</td><td class="r">18 (of 42)</td><td class="r">0</td><td class="r">0</td></tr>
+<tr><td>Per-layer input</td><td class="r">256-d gated (5.6 GB)</td><td class="r">none</td><td class="r">none</td></tr>
+<tr><td>Activation / Softcap</td><td class="r" colspan="3">GELU(tanh) / 30*tanh(x/30)</td></tr>
+<tr><td>Embeddings</td><td class="r" colspan="3">Tied (lm_head = embed_tokens.T)</td></tr>
 </tbody>
 </table>
 
 
-<h3>Quality verification</h3>
-<table>
-<thead><tr><th>Metric</th><th class="r">rvLLM (TPU, int8)</th><th class="r">HuggingFace (GPU, bf16)</th></tr></thead>
-<tbody>
-<tr><td>Perplexity (split-cache, int8 KV)</td><td class="r"><strong>19.24</strong></td><td class="r">18,243 (instruct model on raw text)</td></tr>
-<tr><td>Perplexity (original, bf16 KV)</td><td class="r">25.51</td><td class="r">-</td></tr>
-<tr><td>Layer-by-layer numerics</td><td class="r" colspan="2">Match within bf16 precision through all layers: embedding, layernorm, Q/K/V, QK-norm, attention, O-proj, FFN</td></tr>
-<tr><td>Greedy decode from BOS</td><td class="r" colspan="2">Both produce identical repetitive pattern (expected for instruct model with bare BOS prompt)</td></tr>
-</tbody>
-</table>
-<div class="footnote"><strong>Perplexity improved from 25.51 to 19.24</strong> via split-cache architecture with int8 KV quantization (per-head scales). The circular buffer for sliding layers and blockwise attention for global layers actually improves quality over the original single-scan approach.</div>
-
-
-<h3>XProf per-step breakdown (B=1)</h3>
-<div class="chart-box">
-  <div class="chart-title"><strong>Where time goes in a single decode step</strong>
-    <div class="note">Measured at B=1 on TPU v6e-4. Theoretical BW limit: 9.1 ms (30 GB weights / 3.3 TB/s).</div>
-  </div>
-  <div id="chart-xprof" style="height:300px"></div>
-</div>
-
+<h3>XProf per-step breakdown (31B, B=1, 512 ctx)</h3>
 <table>
 <thead><tr><th>Component</th><th class="r">Time</th><th class="r">%</th></tr></thead>
 <tbody>
@@ -397,151 +350,85 @@ footer{margin-top:4rem;padding-top:1.5rem;border-top:1px solid #1a1a1a;color:#88
 <tr><td>&ensp; incl. KV cache dynamic updates</td><td class="r">1.3 ms</td><td class="r">12% of scan</td></tr>
 <tr><td>Host + dispatch overhead</td><td class="r">1.7 ms</td><td class="r">14%</td></tr>
 <tr><td><strong>Total step</strong></td><td class="r"><strong>12.3 ms</strong></td><td class="r"><strong>100%</strong></td></tr>
-<tr><td>Theoretical BW limit</td><td class="r">9.1 ms</td><td class="r"></td></tr>
+<tr><td>Theoretical BW limit (30 GB / 3.3 TB/s)</td><td class="r">9.1 ms</td><td class="r"></td></tr>
 </tbody>
 </table>
-<div class="footnote"><strong>The 1.8 ms cond overhead is structural.</strong> Gemma 4's dual attention (50 sliding + 10 global layers) requires runtime dispatch. Flat scan + cond is the optimum for XLA's TPU compiler.</div>
 
 
-<h3>Deployment: 5 minutes, zero infrastructure</h3>
+<h3>EAGLE-3 speculative decoding (31B, experimental)</h3>
+
+<div class="note-box">
+  <strong>Single-user latency optimization.</strong> 450M-param draft head proposes K=5 tokens per cycle; the full 31B verifies K+1=6 in one forward pass. Lossless for greedy decode. Projected ~145 tok/s (1.8x) at tau=3.5 with 50K+ training examples. Current: 2K examples, loss 7.1, pipeline validated end-to-end.
+</div>
+
+<table>
+<thead><tr><th>Metric</th><th class="r">Value</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td>Baseline (B=1)</td><td class="r">78.2 tok/s</td><td>12.79 ms/step, fused while_loop</td></tr>
+<tr><td>EAGLE-3 fused cycle</td><td class="r">31.0 ms</td><td>draft (2ms) + verify T=6 (29ms)</td></tr>
+<tr><td>Projected @ tau=3.5</td><td class="r">~145 tok/s</td><td>1.8x baseline, requires 50K+ training</td></tr>
+<tr><td>Hardware ceiling</td><td class="r">~300 tok/s</td><td>3.8x, weight-read limited</td></tr>
+</tbody>
+</table>
+
+
+<h3>Deployment</h3>
 <div class="method-box">
-<code>gcloud compute tpus tpu-vm create rvllm --zone=us-east5-b --accelerator-type=v6e-4 --version=v2-alpha-tpuv6e</code><br>
+<code>gcloud compute tpus tpu-vm create rvllm --zone=us-east5-b --accelerator-type=v6e-4 --version=v2-alpha-tpuv6e --boot-disk-size=200</code><br>
 <code>pip3 install 'jax[tpu]' huggingface_hub tokenizers -f https://storage.googleapis.com/jax-releases/libtpu_releases.html</code><br>
-<code>LIBTPU_INIT_ARGS="--xla_tpu_enable_async_collective_fusion=true --xla_tpu_dot_dot_fusion_duplicated=true" python3 tpu/harness/gemma4_tpu_infer.py --model-dir ~/models/gemma-4-31B-it --fused --batch 768</code><br><br>
-<strong>128K context:</strong> <code>python3 tpu/harness/gemma4_tpu_infer.py --model-dir ~/models/gemma-4-31B-it --fused --max-tokens 200 --max-ctx 131072</code><br>
-<strong>API server:</strong> <code>python3 tpu/harness/api_server.py --model-dir ~/models/gemma-4-31B-it --port 8080</code><br>
-<strong>Chat client:</strong> native Rust egui app at <code>chat-client/</code>, connects via OpenAI API.<br><br>
-No Docker. No conda. No torch. No vLLM. One pip install, one Python file, ~500 lines of JAX. Context lengths 512 to 128K via <code>--max-ctx</code>.
+<code>python3 gemma4_tpu_infer.py --model-dir ~/models/gemma-4-E4B-it --max-tokens 32</code><br>
+<code>python3 gemma4_tpu_infer.py --model-dir ~/models/gemma-4-31B-it --fused --batch 768</code><br><br>
+No Docker. No conda. No torch. No vLLM. One pip install, one Python file, ~500 lines of JAX. Total setup: ~5 minutes.
 </div>
 
-
 </div>
+
 
 <hr class="divider section-divider">
 
-<div id="section-eagle3" class="section-block">
 
-<h2 class="section">EAGLE-3 Speculative Decoding <span class="sub">TPU v6e-4, experimental</span></h2>
-
-<div class="note-box">
-  <strong>Single-user latency optimization via speculative decoding.</strong> A trained 450M-param draft head proposes K=5 tokens per cycle; the full 31B target verifies all K+1=6 in one forward pass. Lossless for greedy decode. Pipeline validated end-to-end on v6e-4 with training confirmed working.
-</div>
-
-<h3>Measured results</h3>
-
-<div class="pill-row">
-  <div class="pill">
-    <div class="label">Baseline (B=1)</div>
-    <strong>78.2 tok/s</strong>
-    <div class="caption">12.79 ms/step, fused while_loop</div>
-  </div>
-  <div class="pill">
-    <div class="label">EAGLE-3 fused cycle</div>
-    <strong>31.0 ms</strong>
-    <div class="caption">draft (2ms) + verify T=6 (29ms)</div>
-  </div>
-  <div class="pill">
-    <div class="label">Projected @ tau=3.5</div>
-    <strong>~145 tok/s</strong>
-    <div class="caption">1.8x baseline, requires 50K+ training</div>
-  </div>
-  <div class="pill">
-    <div class="label">Hardware ceiling</div>
-    <strong>~300 tok/s</strong>
-    <div class="caption">3.8x, weight-read limited</div>
-  </div>
-</div>
-
-<h3>Training progression (1K UltraChat examples, 2 epochs, v6e-4)</h3>
-
-<table>
-<thead><tr><th>Step</th><th class="r">Loss</th><th class="r">Grad Norm</th><th class="r">LR</th><th>Phase</th></tr></thead>
-<tbody>
-<tr><td>0</td><td class="r">26.1</td><td class="r">-</td><td class="r">-</td><td>Random init (ln(262144) = 12.5 per depth)</td></tr>
-<tr><td>10</td><td class="r">20.2</td><td class="r">66.6</td><td class="r">5e-6</td><td>Warmup, starting to learn</td></tr>
-<tr><td>50</td><td class="r">9.1</td><td class="r">7.6</td><td class="r">2.5e-5</td><td>-65%, grad norm collapsing</td></tr>
-<tr><td>300</td><td class="r">7.9</td><td class="r">6.1</td><td class="r">5e-5</td><td>Full LR, loss plateauing</td></tr>
-<tr><td>1000</td><td class="r">7.8</td><td class="r">11.6</td><td class="r">5e-5</td><td>Epoch 0 end (avg 9.23)</td></tr>
-<tr class="highlight"><td>2000</td><td class="r"><strong>7.1</strong></td><td class="r">16.5</td><td class="r">5e-5</td><td>Epoch 1 end (avg 7.57), -73% from random</td></tr>
-</tbody>
-</table>
-
-<div class="note-box">
-  <strong>Training details.</strong> Online feature capture: each step runs a full 512-token prefill through the 31B target (3.1s compile, then cached) to extract features at layers 2, 30, 59. TTT (Training-Time Test) loss: 5-depth draft chain where depths 0-1 use target features and depths 2-4 use the draft's own hidden states, training robustness to self-approximation error. Fused train step: loss + grad + clip + AdamW update all on-device via single jitted function with explicit <code>out_shardings</code> for JAX 0.6.2 SPMD compatibility. XLA compilation: 554s first run (2.2GB program), cached thereafter. 5.7s per training step on v6e-4.
-</div>
-
-<h3>Why tau is still low with 1K examples</h3>
-
-<div class="note-box">
-  At loss 7.1, per-depth cross-entropy is ~1.4 nats = ~24% probability on the correct next token. Greedy acceptance requires the draft's argmax to match the target's argmax, which needs >50% probability concentration on the correct token. The EAGLE-3 paper trains on <strong>100K-500K examples</strong> for days to achieve tau=3.5-4.5. Our 1K-example proof-of-concept validated the pipeline; scaling to 10K+ examples with self-distilled data (target model's own outputs) is the path to production tau.
-</div>
-
-<h3>Cycle time breakdown (31ms)</h3>
-
-<table>
-<thead><tr><th>Component</th><th class="r">Time</th><th class="r">% of cycle</th><th>Bottleneck</th></tr></thead>
-<tbody>
-<tr><td>Weight read (7.75GB/chip @ 820GB/s)</td><td class="r">9.5 ms</td><td class="r">31%</td><td>HBM bandwidth (hard floor)</td></tr>
-<tr><td>KV cache reads (T=6 queries x context)</td><td class="r">11.5 ms</td><td class="r">37%</td><td>HBM bandwidth (reducible with int8 KV)</td></tr>
-<tr><td>TP=4 all-reduce (T=6 activation size)</td><td class="r">9.5 ms</td><td class="r">31%</td><td>ICI interconnect (fixed)</td></tr>
-<tr><td>Draft chain (K=5 steps, 450M params)</td><td class="r">2.0 ms</td><td class="r">6%</td><td>Near-optimal (XLA VMEM caching)</td></tr>
-</tbody>
-</table>
-
-<h3>Optimization roadmap</h3>
-
-<table>
-<thead><tr><th>Optimization</th><th class="r">Cycle impact</th><th class="r">Tau impact</th><th>Status</th></tr></thead>
-<tbody>
-<tr><td>Self-distilled training data</td><td class="r">-</td><td class="r">+0.4-0.6</td><td>Planned</td></tr>
-<tr><td>Scale to 50K+ training examples</td><td class="r">-</td><td class="r">+0.2-0.3</td><td>Planned</td></tr>
-<tr><td>Int8 KV cache quantization</td><td class="r">-5.75 ms</td><td class="r">-</td><td>Designed</td></tr>
-<tr><td>Splash attention (fused Pallas)</td><td class="r">-1-2 ms</td><td class="r">-</td><td>Identified</td></tr>
-<tr class="highlight"><td><strong>Combined target</strong></td><td class="r"><strong>~23 ms</strong></td><td class="r"><strong>tau 3.5-4.0</strong></td><td><strong>~175-200 tok/s (2.2-2.5x)</strong></td></tr>
-</tbody>
-</table>
-
-</div>
-
-<hr class="divider section-divider">
+<!-- ============================================================ -->
+<!-- GPU SECTION -->
+<!-- ============================================================ -->
 
 <div id="section-gpu" class="section-block">
 
-<h2 class="section">GPU: 31B Gemma 4 <span class="sub">H100 SXM 80GB, Rust+CUDA, FP8+F16</span> <span class="badge measured">Measured</span></h2>
+<h2>GPU: 31B Gemma 4 <span class="sub">H100 SXM 80GB, Rust+CUDA, FP8+F16</span> <span class="badge measured">Measured</span></h2>
 
 <div class="note-box">
-  <strong>FP8 weights + F16 KV cache.</strong> Per-channel FP8 weights from the RedHatAI/gemma-4-31B-it-FP8-Dynamic checkpoint with channelscale fused into post-norm kernels. F16 KV cache + F16 paged attention (FA3 SM90 for sliding, SM89 for global). All 60 layers captured in a single CUDA graph (~1350 nodes). <strong>7,943 tok/s</strong> peak (B=512), <strong>PPL 13.53</strong>. Per-layer KV cache sizing enables 128K context.
+  <strong>FP8 weights + F16 KV cache.</strong> Per-channel FP8 weights from the RedHatAI/gemma-4-31B-it-FP8-Dynamic checkpoint with channelscale fused into post-norm kernels. F16 KV cache + F16 paged attention (FA3 SM90 for sliding, SM89 for global). All 60 layers captured in a single CUDA graph (~1350 nodes). <strong>7,943 tok/s</strong> peak (B=512), <strong>PPL 13.53</strong>.
 </div>
 
-<h3>31B Gemma 4 forward pass (17 launches per layer)</h3>
+<h3>Forward pass (14 launches per layer)</h3>
 <div class="gpu-pipeline">
   <span class="step-num">1.</span><span class="step-desc"><code>fused_rmsnorm_fp8_quant</code> - input layernorm + FP8 quantize</span>
   <span class="step-num">2.</span><span class="step-desc"><code>fp8_gemm</code> + <code>f32_to_f16_sat</code> - fused Q||K||V projection</span>
   <span class="step-num">3.</span><span class="step-desc"><code>fused_qkv_rmsnorm</code> - Q/K norm (learned gamma) + V norm (parameter-free)</span>
   <span class="step-num">4.</span><span class="step-desc"><code>fused_rope_partial_f16kv</code> - partial RoPE + F16 KV cache write</span>
-  <span class="step-num">6.</span><span class="step-desc"><code>paged_decode</code> (FA3) - attention (head_dim=256 sliding, 512 global)</span>
-  <span class="step-num">7.</span><span class="step-desc"><code>quantize_fp8_per_token</code> - attn output to FP8</span>
-  <span class="step-num">8.</span><span class="step-desc"><code>fp8_gemm</code> - O projection</span>
-  <span class="step-num">9.</span><span class="step-desc"><code>fused_norm_add_residual</code> - channelscale + rmsnorm + residual add</span>
-  <span class="step-num">10.</span><span class="step-desc"><code>fused_rmsnorm_fp8_quant</code> - pre-FFN layernorm + FP8 quantize</span>
-  <span class="step-num">11.</span><span class="step-desc"><code>fp8_gemm</code> + <code>f32_to_f16_sat</code> - gate||up projection</span>
-  <span class="step-num">12.</span><span class="step-desc"><code>fused_gelu_mul_fp8_quant</code> - GELU(tanh)(gate) * up to FP8</span>
-  <span class="step-num">13.</span><span class="step-desc"><code>fp8_gemm</code> - down projection</span>
-  <span class="step-num">14.</span><span class="step-desc"><code>fused_norm_add_residual</code> - channelscale + rmsnorm + residual add + layer_scalar</span>
+  <span class="step-num">5.</span><span class="step-desc"><code>paged_decode</code> (FA3) - attention (head_dim=256 sliding, 512 global)</span>
+  <span class="step-num">6.</span><span class="step-desc"><code>quantize_fp8_per_token</code> - attn output to FP8</span>
+  <span class="step-num">7.</span><span class="step-desc"><code>fp8_gemm</code> - O projection</span>
+  <span class="step-num">8.</span><span class="step-desc"><code>fused_norm_add_residual</code> - channelscale + rmsnorm + residual add</span>
+  <span class="step-num">9.</span><span class="step-desc"><code>fused_rmsnorm_fp8_quant</code> - pre-FFN layernorm + FP8 quantize</span>
+  <span class="step-num">10.</span><span class="step-desc"><code>fp8_gemm</code> + <code>f32_to_f16_sat</code> - gate||up projection</span>
+  <span class="step-num">11.</span><span class="step-desc"><code>fused_gelu_mul_fp8_quant</code> - GELU(tanh)(gate) * up to FP8</span>
+  <span class="step-num">12.</span><span class="step-desc"><code>fp8_gemm</code> - down projection</span>
+  <span class="step-num">13.</span><span class="step-desc"><code>fused_norm_add_residual</code> - channelscale + rmsnorm + residual add + layer_scalar</span>
 </div>
 
-<h3>Gemma 4 architecture details</h3>
+<h3>Batch scaling</h3>
 <table>
-<thead><tr><th>Property</th><th class="r">Sliding layers (50)</th><th class="r">Global layers (10)</th></tr></thead>
+<thead><tr><th>Batch</th><th class="r">tok/s</th><th class="r">ms/step</th><th class="r">Scaling</th></tr></thead>
 <tbody>
-<tr><td>Q/K/V heads</td><td class="r">32 / 16 / 16</td><td class="r">32 / 4 / none (V = K)</td></tr>
-<tr><td>Head dimension</td><td class="r">256</td><td class="r">512</td></tr>
-<tr><td>Attention window</td><td class="r">1024 tokens</td><td class="r">full context</td></tr>
-<tr><td>RoPE theta</td><td class="r">10,000</td><td class="r">1,000,000</td></tr>
-<tr><td>RoPE rotation</td><td class="r">100%</td><td class="r">25% (partial)</td></tr>
-<tr><td>Activation</td><td class="r" colspan="2">GELU(tanh)</td></tr>
-<tr><td>Logit softcap</td><td class="r" colspan="2">30 * tanh(logits / 30)</td></tr>
-<tr><td>Embeddings</td><td class="r" colspan="2">Tied (lm_head = embed_tokens.T)</td></tr>
+<tr><td>1</td><td class="r">52</td><td class="r">19.2</td><td class="r">1.0x</td></tr>
+<tr><td>4</td><td class="r">229</td><td class="r">17.5</td><td class="r">4.4x</td></tr>
+<tr><td>8</td><td class="r">452</td><td class="r">17.7</td><td class="r">8.7x</td></tr>
+<tr><td>16</td><td class="r">900</td><td class="r">17.8</td><td class="r">17.3x</td></tr>
+<tr><td>32</td><td class="r">1,723</td><td class="r">18.6</td><td class="r">33.1x</td></tr>
+<tr><td>64</td><td class="r">3,097</td><td class="r">20.7</td><td class="r">59.6x</td></tr>
+<tr><td>128</td><td class="r">5,114</td><td class="r">25.0</td><td class="r">98.3x</td></tr>
+<tr><td>256</td><td class="r">6,897</td><td class="r">37.1</td><td class="r">132.6x</td></tr>
+<tr class="highlight"><td><strong>512</strong></td><td class="r"><strong>7,943</strong></td><td class="r">64.5</td><td class="r pos"><strong>152.8x</strong></td></tr>
 </tbody>
 </table>
 
@@ -549,55 +436,30 @@ No Docker. No conda. No torch. No vLLM. One pip install, one Python file, ~500 l
 <table>
 <thead><tr><th>Weight path</th><th>KV cache</th><th class="r">PPL</th><th class="r">tok/s (B=1)</th></tr></thead>
 <tbody>
-<tr><td><strong>FP8-Dynamic per-channel + fused channelscale</strong></td><td>F16</td><td class="r"><strong>13.53</strong></td><td class="r">39.6</td></tr>
+<tr class="highlight"><td><strong>FP8-Dynamic per-channel + fused channelscale</strong></td><td>F16</td><td class="r"><strong>13.53</strong></td><td class="r">39.6</td></tr>
 <tr><td>BF16 split QKV per-tensor FP8</td><td>F16</td><td class="r">17.96</td><td class="r">37.9</td></tr>
 <tr><td>F16 weights (no FP8)</td><td>F16</td><td class="r">19.79</td><td class="r">37.9</td></tr>
 <tr><td>HuggingFace BF16 reference</td><td>--</td><td class="r">19.62</td><td class="r">--</td></tr>
-<tr><td>TPU int8 reference</td><td>int8</td><td class="r">19.24</td><td class="r">--</td></tr>
-</tbody>
-</table>
-<div class="footnote">PPL measured on 86-token passage (John 1:1-14) with BOS prepend. FP8-Dynamic checkpoint achieves best PPL because per-row calibrated scales preserve more precision than BF16 rounding.</div>
-
-<h3>Batch scaling sweep</h3>
-<div class="chart-meta">
-    <div class="note">31B Gemma 4, FP8 weights, H100 SXM 80GB, CUDA graph. Near-linear scaling through B=32 (memory-bound), saturating at B=256+ (compute-bound).</div>
-</div>
-<table>
-<thead><tr><th>Batch</th><th class="r">tok/s</th><th class="r">ms/step</th><th class="r">Scaling</th><th class="r">Efficiency</th></tr></thead>
-<tbody>
-<tr><td>1</td><td class="r">52</td><td class="r">19.2</td><td class="r">1.0x</td><td class="r">100%</td></tr>
-<tr><td>4</td><td class="r">229</td><td class="r">17.5</td><td class="r">4.4x</td><td class="r">110%</td></tr>
-<tr><td>8</td><td class="r">452</td><td class="r">17.7</td><td class="r">8.7x</td><td class="r">109%</td></tr>
-<tr><td>16</td><td class="r">900</td><td class="r">17.8</td><td class="r">17.3x</td><td class="r">108%</td></tr>
-<tr><td>32</td><td class="r">1,723</td><td class="r">18.6</td><td class="r">33.1x</td><td class="r">104%</td></tr>
-<tr><td>64</td><td class="r">3,097</td><td class="r">20.7</td><td class="r">59.6x</td><td class="r">93%</td></tr>
-<tr><td>128</td><td class="r">5,114</td><td class="r">25.0</td><td class="r">98.3x</td><td class="r">77%</td></tr>
-<tr><td>256</td><td class="r">6,897</td><td class="r">37.1</td><td class="r">132.6x</td><td class="r">52%</td></tr>
-<tr><td>512</td><td class="r"><strong>7,943</strong></td><td class="r">64.5</td><td class="r">152.8x</td><td class="r">30%</td></tr>
 </tbody>
 </table>
 
-<h3>rvLLM 0.3 vs vLLM 0.19 <span class="badge measured">Measured</span></h3>
+<h3>rvLLM vs vLLM on H100 <span class="badge measured">Measured</span></h3>
 <div class="note-box">
-  <strong>Same hardware, same model.</strong> H100 SXM 80GB, RedHatAI/gemma-4-31B-it-FP8-Dynamic. rvLLM: raw CUDA graph decode benchmark. vLLM 0.19: OpenAI-compatible server with 50-token completions via concurrent requests. vLLM numbers include server overhead (HTTP, scheduler, tokenizer).
+  <strong>Same hardware, same model.</strong> H100 SXM 80GB, RedHatAI/gemma-4-31B-it-FP8-Dynamic. rvLLM: raw CUDA graph decode. vLLM 0.19: OpenAI-compatible server. vLLM numbers include server overhead.
 </div>
 <table>
 <thead><tr><th>Batch</th><th class="r">rvLLM tok/s</th><th class="r">vLLM tok/s</th><th class="r">Delta</th></tr></thead>
 <tbody>
 <tr><td>1</td><td class="r">52</td><td class="r">69</td><td class="r neg">-25%</td></tr>
-<tr><td>4</td><td class="r">229</td><td class="r">264</td><td class="r neg">-13%</td></tr>
 <tr><td>8</td><td class="r">452</td><td class="r">515</td><td class="r neg">-12%</td></tr>
-<tr><td>16</td><td class="r">900</td><td class="r">997</td><td class="r neg">-10%</td></tr>
 <tr><td>32</td><td class="r">1,723</td><td class="r">1,748</td><td class="r neg">-1%</td></tr>
-<tr><td>64</td><td class="r">3,097</td><td class="r">3,130</td><td class="r neg">-1%</td></tr>
-<tr class="highlight"><td>128</td><td class="r"><strong>5,114</strong></td><td class="r">4,689</td><td class="r pos">+9%</td></tr>
+<tr class="highlight"><td>128</td><td class="r pos"><strong>5,114</strong></td><td class="r">4,689</td><td class="r pos">+9%</td></tr>
 <tr><td>256</td><td class="r">6,897</td><td class="r">7,077</td><td class="r neg">-3%</td></tr>
 <tr><td>512</td><td class="r">7,943</td><td class="r">8,243</td><td class="r neg">-4%</td></tr>
 </tbody>
 </table>
-<div class="footnote"><strong>Note:</strong> vLLM includes prefill, continuous batching, and a mature CUDA graph implementation. rvLLM's bench binary measures raw decode kernel throughput without prefill or server overhead. At B=128 rvLLM's kernel fusion and graph capture overcome vLLM's scheduler efficiency. Remaining gap at low batch is primarily from vLLM's optimized prefill pipeline which warms the KV cache faster.</div>
 
-<h3>CUDA graph capture</h3>
+<h3>CUDA graph</h3>
 <table>
 <thead><tr><th>Mode</th><th class="r">tok/s (B=1)</th><th class="r">ms/step</th><th class="r">Speedup</th></tr></thead>
 <tbody>
@@ -605,36 +467,119 @@ No Docker. No conda. No torch. No vLLM. One pip install, one Python file, ~500 l
 <tr><td>Eager (no graph)</td><td class="r">11</td><td class="r">~91</td><td class="r">1.0x</td></tr>
 </tbody>
 </table>
-<div class="footnote">All 60 layers + lm_head + softcap captured into one <code>cuGraphLaunch</code>. Metadata (positions, slot_mapping, context_lens) updated via HtoD copy before each replay.</div>
 
 </div>
+
 
 <hr class="divider section-divider">
 
-<h2 class="section">Method</h2>
+
+<h2>Method</h2>
 <div class="method-box">
-<strong>TPU benchmarks</strong> (tag <code>v0.3.0</code>):<br>
-Hardware: Cloud TPU v6e-4 (4 chips, 128 GB HBM, ~3.3 TB/s aggregate bandwidth), <code>us-east5-b</code>.<br>
-Model: <code>google/gemma-4-31B-it</code>, int8 weight quantization (jnp.int8), bf16 activations.<br>
-Timing: <code>jax.block_until_ready()</code> after each step. Warmup: 3 steps discarded. Measurement: median of 20 iterations.<br>
-LIBTPU flags: <code>--xla_tpu_enable_async_collective_fusion=true --xla_tpu_dot_dot_fusion_duplicated=true --xla_tpu_scheduler_rerun=5</code><br>
-Perplexity: 19.24 (split-cache, int8 KV with per-head scales), improved from 25.51 baseline. Measured on short text passage, compared against HuggingFace <code>transformers</code> bf16 reference on GPU.<br>
-Context scaling: 512 to 128K tested. Dual-path architecture auto-switches based on max_ctx: <= 32K uses single-scan with bf16 KV cache; > 32K uses split-cache with int8 KV cache (50 sliding layers in circular buffer, 10 global layers with blockwise attention, BLOCK_K=8192, online softmax).<br><br>
+<strong>TPU benchmarks:</strong><br>
+Hardware: Cloud TPU v6e-4 (4 chips, 128 GB HBM, ~3.3 TB/s), <code>us-east5-b</code>, $5.20/hr.<br>
+Models: <code>google/gemma-4-E4B-it</code> (42 layers, ~4B, per-layer input injection), <code>google/gemma-4-26B-A4B-it</code> (30 layers, 26B total / ~4B active, 128 experts top-8 MoE), <code>google/gemma-4-31B-it</code> (60 layers, 31B dense).<br>
+Quantization: int8 weights (jnp.int8), bf16 activations, bf16 KV cache.<br>
+Batch sweeps: all at max-ctx 2048. Timing via <code>jax.block_until_ready()</code>. Compile step discarded, measurement from first cached run.<br>
+LIBTPU flags: <code>--xla_tpu_enable_async_collective_fusion=true --xla_tpu_enable_async_collective_fusion_fuse_all_gather=true --xla_tpu_enable_async_collective_fusion_multiple_steps=true --xla_tpu_overlap_compute_collective_tc=true --xla_tpu_scoped_vmem_limit_kib=131072</code><br>
+Perplexity: 86-token passage (John 1:1-14) with BOS prepend. E4B = 5.87 (HF ref 3.28), 26B-A4B = 90.21 (HF ref 85.42), 31B = 24.76 (split-cache = 19.24).<br>
+TTFT: measured from first <code>block_until_ready()</code> call on 2-token prompt. Includes XLA compile on first run, cached thereafter.<br>
+Context scaling (31B only): 512 to 128K tested. Auto-switches at 32K boundary.<br><br>
 
-<strong>vLLM GPU comparison</strong> (measured):<br>
+<strong>vLLM GPU comparison:</strong><br>
 Hardware: H100 SXM 80 GB on vast.ai ($1.92/hr).<br>
-Model: RedHatAI/gemma-4-31B-it-FP8-Dynamic (same 31B Gemma 4, FP8).<br>
-Engine: vLLM with default settings, max_ctx=2048.<br>
-Batch sizes: 1, 2, 4, 8, 16, 32, 48, 64, 96, 128, 256, 512, 768. Peak: 3,848 tok/s at B=128.<br><br>
+Model: RedHatAI/gemma-4-31B-it-FP8-Dynamic, max_ctx=2048.<br>
+Engine: vLLM 0.19 with default settings.<br><br>
 
-<strong>GPU pipeline</strong> (v3 codebase, Rust + CUDA):<br>
+<strong>GPU pipeline (v3 codebase, Rust+CUDA):</strong><br>
 Hardware: H100 SXM 80 GB.<br>
 Model: 31B Gemma 4, FP8 E4M3 weights (per-channel scale), F16 KV cache.<br>
-Forward: ~13 kernel launches per layer (post-fusion), 60 layers + lm_head + argmax = ~1350 nodes, captured in a single <code>cuGraphLaunch</code>.<br>
-Kernels: cuBLASLt FP8 GEMMs (SM90), FlashAttention-3, custom fused ops (RMSNorm+quant, RoPE+KV, GELU*mul+quant, norm+channelscale+residual+scalar, logit softcap).<br>
-Per-layer KV: sliding layers capped at 32 blocks (1024 tokens), global layers get full context. Enables 128K on single 80GB GPU.<br>
+Forward: ~13 kernel launches per layer (post-fusion), 60 layers + lm_head + argmax = ~1350 nodes in one <code>cuGraphLaunch</code>.<br>
+Kernels: cuBLASLt FP8 GEMMs (SM90), FlashAttention-3, custom fused ops.
 </div>
 
+
+<hr class="divider">
+
+<h2>Small Model Parallelization <span class="sub">speculative, not yet benchmarked</span></h2>
+
+<div class="note-box">
+<strong>This section is speculation.</strong> We have not extensively tested single-GPU parallelization for small models, nor factored all potential strategies. The numbers below are back-of-envelope estimates based on hardware specs and known bottlenecks. Treat them as directional, not measured.
+</div>
+
+<p style="font-size:0.92rem;color:#d0d0d0;margin:1rem 0;line-height:1.7">
+A 4B model like Gemma 4 E4B is <strong>heavily memory-bandwidth bound</strong> at B=1 decode. The weights are ~5 GB (int8). At B=1, decode is a pure weight-streaming problem: read every weight once, do one MAC per weight, write nothing. The arithmetic intensity is ~1 FLOP/byte -- deep in the bandwidth-bound regime. The GPU's compute (FP8 TOPS) is almost entirely idle.
+</p>
+
+<p style="font-size:0.92rem;color:#d0d0d0;margin:1rem 0;line-height:1.7">
+This means <strong>the accelerator with the most memory bandwidth wins</strong>, regardless of compute capability. A single H100 with 3.35 TB/s could theoretically stream the 5 GB model in 1.5 ms -- implying ~670 tok/s at B=1 if the forward pass were purely bandwidth-limited. Real decode has overhead (kernel launch, attention, KV cache reads, softmax, RoPE), so practical throughput would be lower. But the gap between our measured 78 tok/s (TPU) and the theoretical ceiling is large.
+</p>
+
+<h3>Projected E4B (4B) scaling: measured + estimated</h3>
+
+<div class="chart-box">
+  <div class="chart-title"><strong>E4B throughput: measured (solid) vs projected (open)</strong>
+    <div class="note">Measured on TPU v6e-4. GPU projections from HBM bandwidth at 40-50% utilization. INT4 assumes 2.5 GB weights. Batch projections extrapolated from measured scaling curve.</div>
+  </div>
+  <div id="chart-projections" style="height:420px"></div>
+</div>
+
+<h3>Single-GPU estimates for 4B decode (B=1)</h3>
+
+<table>
+<thead><tr><th>GPU</th><th class="r">HBM BW</th><th class="r">Weight read time</th><th class="r">Theoretical ceiling</th><th class="r">Estimated practical</th></tr></thead>
+<tbody>
+<tr><td>H100 SXM 80GB</td><td class="r">3.35 TB/s</td><td class="r">1.5 ms</td><td class="r">~670 tok/s</td><td class="r">~200-350 tok/s</td></tr>
+<tr><td>H200 SXM 141GB</td><td class="r">4.8 TB/s</td><td class="r">1.0 ms</td><td class="r">~960 tok/s</td><td class="r">~300-500 tok/s</td></tr>
+<tr><td>B200 SXM 192GB</td><td class="r">8.0 TB/s</td><td class="r">0.6 ms</td><td class="r">~1,600 tok/s</td><td class="r">~500-900 tok/s</td></tr>
+</tbody>
+</table>
+<div class="footnote"><strong>Assumptions:</strong> 5 GB int8 weights, 42 layers, no batch. "Practical" estimate accounts for ~40-50% bandwidth utilization (kernel launch overhead, attention, KV cache, non-GEMM ops). Real numbers could be higher with aggressive fusion or lower with long-context KV overhead.</div>
+
+<h3>No Python runtime = more VRAM for the model</h3>
+
+<p style="font-size:0.92rem;color:#d0d0d0;margin:1rem 0;line-height:1.7">
+rvLLM's GPU path is a compiled Rust binary with zero Python dependency. This matters because Python-based inference stacks consume significant GPU memory before a single weight is loaded:
+</p>
+
+<table>
+<thead><tr><th>Component</th><th class="r">Typical VRAM cost</th><th class="r">rvLLM</th></tr></thead>
+<tbody>
+<tr><td>PyTorch + CUDA context</td><td class="r">~1.5-2.0 GB</td><td class="r">0</td></tr>
+<tr><td>Python runtime + GC overhead</td><td class="r">~0.3-0.5 GB</td><td class="r">0</td></tr>
+<tr><td>vLLM scheduler / PagedAttention metadata</td><td class="r">~0.5-1.0 GB</td><td class="r">0</td></tr>
+<tr><td>Duplicate weight buffers (load then convert)</td><td class="r">~0.5-2.0 GB</td><td class="r">0</td></tr>
+<tr><td>NCCL / distributed comm buffers</td><td class="r">~0.3-0.5 GB</td><td class="r">0</td></tr>
+<tr class="highlight"><td><strong>Total framework overhead</strong></td><td class="r"><strong>3-6 GB</strong></td><td class="r pos"><strong>~0.2 GB</strong></td></tr>
+</tbody>
+</table>
+<div class="footnote">rvLLM's only VRAM overhead is the CUDA context itself (~200 MB) and pre-allocated scratch buffers. Measured via <code>nvidia-smi</code> before and after weight loading. Python stacks vary; numbers reflect vLLM 0.19 and HuggingFace transformers on H100.</div>
+
+<p style="font-size:0.92rem;color:#d0d0d0;margin:1rem 0;line-height:1.7">
+On an H100 80GB, recovering 3-6 GB of framework overhead means the difference between fitting a model or not, or between B=256 and B=512 batch sizes. For small models where the weights are only 5 GB, framework bloat can exceed the model itself.
+</p>
+
+<h3>What the extra VRAM buys you</h3>
+
+<div class="method-box">
+<strong>Higher batch sizes</strong> -- each KV cache entry for E4B at 2048 context is ~2 MB. Recovering 4 GB of framework overhead = ~2,000 additional concurrent sequences. On an H100, this could push peak batch from ~512 to ~2,048+, potentially 2-3x more throughput before OOM.<br><br>
+
+<strong>Longer context per sequence</strong> -- at B=128 with 4 GB extra VRAM, each sequence could extend context from 2K to 32K+ tokens without reducing batch size. Critical for agent workflows and long-document tasks.<br><br>
+
+<strong>Model tiling on one GPU</strong> -- a 4B INT4 model is ~2.5 GB. On an H100 with 80 GB and no Python overhead, you could tile <strong>multiple model replicas</strong> in VRAM and round-robin requests across them, effectively multiplying B=1 throughput by the number of replicas. 80 GB / 2.5 GB = 32 replicas theoretically, though KV cache memory limits this in practice.<br><br>
+
+<strong>FP4/INT4 weights</strong> -- halving precision to 4-bit halves bandwidth requirement, potentially doubling B=1 throughput. E4B at INT4 = ~2.5 GB, readable in 0.75 ms on H100. Combined with CUDA graph fusion and the VRAM savings from no Python runtime, B=1 decode at 400+ tok/s on a single H100 is plausible but unverified.
+</div>
+
+<h3>Projected single-GPU 4B performance</h3>
+
+<p style="font-size:0.92rem;color:#d0d0d0;margin:1rem 0;line-height:1.7">
+With no framework overhead eating into VRAM and bandwidth-optimal weight streaming, small models can exploit the full hardware budget. The real lever is batch scaling: at B=128, the same weight read serves 128 sequences, pushing arithmetic intensity to ~128 FLOPs/byte and saturating tensor cores. Our measured E4B numbers show 81x scaling from B=1 to B=128.
+</p>
+
+<div class="note-box">
+<strong>Bottom line:</strong> a native binary running a 4B model on a B200 at B=1 could plausibly hit 500-900 tok/s -- fast enough for real-time speech synthesis or interactive agents. At B=128, the same B200 could push 50,000+ tok/s. The no-Python VRAM savings make higher batch sizes and longer contexts achievable where Python stacks would OOM. We haven't extensively tested single-GPU parallelization and these are estimates from hardware specs and measured TPU scaling curves. If you're interested in pushing this direction, we'd welcome collaboration.
+</div>
 
 <footer>
 <p>rvLLM - Apache-2.0 - <a href="https://github.com/m0at/rvllm">github.com/m0at/rvllm</a></p>
@@ -651,43 +596,113 @@ Per-layer KV: sliding layers capped at 32 blocks (1024 tokens), global layers ge
 (function(){
   const e = React.createElement;
   const R = Recharts;
-
   const tooltipStyle = { background:'#0b0f17', border:'1px solid #1f2833', color:'#f5f5f5' };
 
-  // Context scaling data
-  const ctxScalingData = [
-    { ctx: '512',  toks: 78.2,  ms: 12.79 },
-    { ctx: '2K',   toks: 70,    ms: 14 },
-    { ctx: '32K',  toks: 15,    ms: 66 },
-    { ctx: '64K',  toks: 11,    ms: 91 },
-    { ctx: '128K', toks: 24.7,  ms: 40.56 }
+  // Overview: all 5 configs on one line chart
+  const overviewData = [
+    { batch: 1,    e4b: 78,    moe: 53,    tpu31: 44,   gpu31: 52,   vllm: 69 },
+    { batch: 8,    e4b: 542,   moe: 390,   tpu31: 318,  gpu31: 452,  vllm: 516 },
+    { batch: 64,   e4b: 3661,  moe: 2662,  tpu31: 2112, gpu31: 3097, vllm: 3130 },
+    { batch: 128,  e4b: 6298,  moe: 4915,  tpu31: 3853, gpu31: 5114, vllm: 4689 },
+    { batch: 256,  e4b: 10214, moe: 8192,  tpu31: 6246, gpu31: 6897, vllm: 7077 },
+    { batch: 512,  e4b: 13773, moe: 12390, tpu31: 8550, gpu31: 7943, vllm: 8243 },
+    { batch: 768,  e4b: 15514, moe: 14899, tpu31: 9600 },
+    { batch: 1024, e4b: 16794 }
   ];
 
-  function CtxScaling(){
+  function Overview(){
     return e(R.ResponsiveContainer, { width:'100%', height:'100%' },
-      e(R.BarChart, { data: ctxScalingData, margin: { top: 30, right: 30, left: 20, bottom: 8 } },
+      e(R.LineChart, { data: overviewData, margin: { top: 20, right: 30, left: 20, bottom: 8 } },
         e(R.CartesianGrid, { stroke: '#1a1f28', strokeDasharray: '3 3' }),
-        e(R.XAxis, { dataKey: 'ctx', stroke: '#888', tick: { fill: '#ccc', fontSize: 12 }, label: { value: 'Context length', position: 'insideBottom', offset: -4, fill: '#aaa', fontSize: 11 } }),
-        e(R.YAxis, { stroke: '#888', tick: { fill: '#ccc' }, label: { value: 'tok/s', angle: -90, position: 'insideLeft', fill: '#aaa', fontSize: 11 } }),
-        e(R.Tooltip, { contentStyle: tooltipStyle, formatter: (v, name) => name === 'tok/s' ? v + ' tok/s' : v + ' ms' }),
-        e(R.Bar, { dataKey: 'toks', name: 'tok/s', fill: '#84E6B7', radius: [4, 4, 0, 0] },
-          e(R.LabelList, { dataKey: 'toks', position: 'top', fill: '#c0f0d8', fontSize: 11, formatter: v => v.toFixed(1) })
-        )
+        e(R.XAxis, { dataKey: 'batch', stroke: '#888', tick: { fill: '#ccc', fontSize: 12 },
+          label: { value: 'Batch size', position: 'insideBottom', offset: -4, fill: '#aaa', fontSize: 11 } }),
+        e(R.YAxis, { stroke: '#888', tickFormatter: v => v >= 1000 ? (v/1000).toFixed(0)+'k' : v,
+          tick: { fill: '#ccc' }, label: { value: 'tok/s (total)', angle: -90, position: 'insideLeft', fill: '#aaa', fontSize: 11 } }),
+        e(R.Tooltip, { contentStyle: tooltipStyle, formatter: (v,n) => v ? [v.toLocaleString() + ' tok/s', n] : ['N/A', n] }),
+        e(R.Legend, { wrapperStyle: { paddingTop: 8, fontSize: 12 } }),
+        e(R.Line, { type: 'monotone', dataKey: 'e4b',   name: 'E4B TPU (4B)',       stroke: '#84E6B7', strokeWidth: 3, dot: { r: 5 }, connectNulls: false }),
+        e(R.Line, { type: 'monotone', dataKey: 'moe',   name: '26B-A4B TPU (MoE)',  stroke: '#b088e0', strokeWidth: 3, dot: { r: 5 }, connectNulls: false }),
+        e(R.Line, { type: 'monotone', dataKey: 'tpu31', name: '31B TPU',            stroke: '#5a8bd4', strokeWidth: 3, dot: { r: 5 }, connectNulls: false }),
+        e(R.Line, { type: 'monotone', dataKey: 'gpu31', name: '31B GPU (rvLLM)',    stroke: '#e8a84c', strokeWidth: 2, dot: { r: 4 }, strokeDasharray: '6 3', connectNulls: false }),
+        e(R.Line, { type: 'monotone', dataKey: 'vllm',  name: '31B GPU (vLLM)',     stroke: '#e86060', strokeWidth: 2, dot: { r: 4 }, strokeDasharray: '6 3', connectNulls: false })
       )
     );
   }
 
-  // TPU batch scaling data
+  // TPU batch scaling: E4B + 26B-A4B + 31B + vLLM
   const tpuScalingData = [
-    { batch: '1',    toks: 78.2 },
-    { batch: '8',    toks: 584 },
-    { batch: '64',   toks: 4220 },
-    { batch: '128',  toks: 6831 },
-    { batch: '256',  toks: 10536 },
-    { batch: '512',  toks: 12932 },
-    { batch: '768',  toks: 13943 },
-    { batch: '1024', toks: 13705 }
+    { batch: '1',    e4b: 78,    moe: 53,    b31: 44,   vllm: 66.9 },
+    { batch: '8',    e4b: 542,   moe: 390,   b31: 318,  vllm: 511.7 },
+    { batch: '64',   e4b: 3661,  moe: 2662,  b31: 2112, vllm: 2794 },
+    { batch: '128',  e4b: 6298,  moe: 4915,  b31: 3853, vllm: 3848 },
+    { batch: '256',  e4b: 10214, moe: 8192,  b31: 6246, vllm: 3709 },
+    { batch: '512',  e4b: 13773, moe: 12390, b31: 8550, vllm: 3788 },
+    { batch: '768',  e4b: 15514, moe: 14899, b31: 9600, vllm: 3671 },
+    { batch: '1024', e4b: 16794, moe: null,  b31: null, vllm: null }
   ];
+
+  // Projections scatter: measured E4B + projected GPU estimates
+  // Measured points (TPU v6e-4)
+  const measuredE4B = [
+    { batch: 1, toks: 78 }, { batch: 8, toks: 542 }, { batch: 64, toks: 3661 },
+    { batch: 128, toks: 6298 }, { batch: 256, toks: 10214 }, { batch: 512, toks: 13773 },
+    { batch: 768, toks: 15514 }, { batch: 1024, toks: 16794 }
+  ];
+  // Projected: H100 int8 (BW=3.35 TB/s, ~40-50% util)
+  const projH100 = [
+    { batch: 1, toks: 275 }, { batch: 8, toks: 2000 }, { batch: 64, toks: 12000 },
+    { batch: 128, toks: 20000 }, { batch: 256, toks: 30000 }, { batch: 512, toks: 38000 }
+  ];
+  // Projected: H100 INT4 (BW=3.35 TB/s, 2.5GB weights)
+  const projH100i4 = [
+    { batch: 1, toks: 550 }, { batch: 8, toks: 4000 }, { batch: 64, toks: 22000 },
+    { batch: 128, toks: 35000 }, { batch: 256, toks: 48000 }
+  ];
+  // Projected: H200 int8 (BW=4.8 TB/s)
+  const projH200 = [
+    { batch: 1, toks: 400 }, { batch: 8, toks: 2900 }, { batch: 64, toks: 17000 },
+    { batch: 128, toks: 28000 }, { batch: 256, toks: 42000 }, { batch: 512, toks: 52000 }
+  ];
+  // Projected: B200 int8 (BW=8.0 TB/s)
+  const projB200 = [
+    { batch: 1, toks: 700 }, { batch: 8, toks: 5000 }, { batch: 64, toks: 30000 },
+    { batch: 128, toks: 50000 }, { batch: 256, toks: 72000 }, { batch: 512, toks: 90000 }
+  ];
+
+  function Projections(){
+    var cross = function(cx, cy, r) {
+      var d = r * 0.7;
+      return 'M'+(cx-d)+','+(cy-d)+'L'+(cx+d)+','+(cy+d)+'M'+(cx+d)+','+(cy-d)+'L'+(cx-d)+','+(cy+d);
+    };
+    var diamond = function(cx, cy, r) {
+      return 'M'+cx+','+(cy-r)+'L'+(cx+r)+','+cy+'L'+cx+','+(cy+r)+'L'+(cx-r)+','+cy+'Z';
+    };
+    var triangle = function(cx, cy, r) {
+      var h = r * 1.1;
+      return 'M'+cx+','+(cy-h)+'L'+(cx+r)+','+(cy+h*0.6)+'L'+(cx-r)+','+(cy+h*0.6)+'Z';
+    };
+
+    return e(R.ResponsiveContainer, { width:'100%', height:'100%' },
+      e(R.ScatterChart, { margin: { top: 20, right: 30, left: 20, bottom: 8 } },
+        e(R.CartesianGrid, { stroke: '#1a1f28', strokeDasharray: '3 3' }),
+        e(R.XAxis, { dataKey: 'batch', type: 'number', stroke: '#888', scale: 'log', domain: [1, 1024],
+          tick: { fill: '#ccc', fontSize: 12 }, ticks: [1, 8, 64, 128, 256, 512, 1024],
+          label: { value: 'Batch size', position: 'insideBottom', offset: -4, fill: '#aaa', fontSize: 11 } }),
+        e(R.YAxis, { dataKey: 'toks', type: 'number', stroke: '#888', scale: 'log', domain: [50, 100000],
+          tickFormatter: function(v){ return v >= 1000 ? (v/1000)+'k' : v; },
+          tick: { fill: '#ccc' }, label: { value: 'tok/s (log)', angle: -90, position: 'insideLeft', fill: '#aaa', fontSize: 11 } }),
+        e(R.Tooltip, { contentStyle: tooltipStyle,
+          formatter: function(v, n){ return [v.toLocaleString() + ' tok/s', n]; },
+          labelFormatter: function(v){ return 'B=' + v; } }),
+        e(R.Legend, { wrapperStyle: { paddingTop: 8, fontSize: 11 } }),
+        e(R.Scatter, { name: 'E4B TPU (measured)', data: measuredE4B, fill: '#84E6B7', line: { stroke: '#84E6B7', strokeWidth: 2 }, lineType: 'monotone' }),
+        e(R.Scatter, { name: 'H100 int8 (projected)', data: projH100, fill: 'none', stroke: '#e8a84c', strokeWidth: 2, shape: 'cross', line: { stroke: '#e8a84c', strokeWidth: 1, strokeDasharray: '6 3' }, lineType: 'monotone' }),
+        e(R.Scatter, { name: 'H100 INT4 (projected)', data: projH100i4, fill: 'none', stroke: '#f0c878', strokeWidth: 2, shape: 'diamond', line: { stroke: '#f0c878', strokeWidth: 1, strokeDasharray: '6 3' }, lineType: 'monotone' }),
+        e(R.Scatter, { name: 'H200 int8 (projected)', data: projH200, fill: 'none', stroke: '#5a8bd4', strokeWidth: 2, shape: 'triangle', line: { stroke: '#5a8bd4', strokeWidth: 1, strokeDasharray: '6 3' }, lineType: 'monotone' }),
+        e(R.Scatter, { name: 'B200 int8 (projected)', data: projB200, fill: 'none', stroke: '#e06080', strokeWidth: 2, shape: 'star', line: { stroke: '#e06080', strokeWidth: 1, strokeDasharray: '6 3' }, lineType: 'monotone' })
+      )
+    );
+  }
 
   function TpuScaling(){
     return e(R.ResponsiveContainer, { width:'100%', height:'100%' },
@@ -695,24 +710,25 @@ Per-layer KV: sliding layers capped at 32 blocks (1024 tokens), global layers ge
         e(R.CartesianGrid, { stroke: '#1a1f28', strokeDasharray: '3 3' }),
         e(R.XAxis, { dataKey: 'batch', stroke: '#888', tick: { fill: '#ccc', fontSize: 12 }, label: { value: 'Batch size', position: 'insideBottom', offset: -4, fill: '#aaa', fontSize: 11 } }),
         e(R.YAxis, { stroke: '#888', tickFormatter: v => v.toLocaleString(), tick: { fill: '#ccc' }, label: { value: 'tok/s', angle: -90, position: 'insideLeft', fill: '#aaa', fontSize: 11 } }),
-        e(R.Tooltip, { contentStyle: tooltipStyle, formatter: v => v.toLocaleString() + ' tok/s' }),
-        e(R.Bar, { dataKey: 'toks', name: 'Throughput (tok/s)', fill: '#84E6B7', radius: [4, 4, 0, 0] },
-          e(R.LabelList, { dataKey: 'toks', position: 'top', fill: '#c0f0d8', fontSize: 11, formatter: v => v >= 1000 ? (v/1000).toFixed(1)+'k' : v })
-        )
+        e(R.Tooltip, { contentStyle: tooltipStyle, formatter: v => v ? v.toLocaleString() + ' tok/s' : 'N/A' }),
+        e(R.Legend, { wrapperStyle: { paddingTop: 8 } }),
+        e(R.Bar, { dataKey: 'e4b', name: 'E4B TPU (4B)', fill: '#84E6B7', radius: [4, 4, 0, 0] }),
+        e(R.Bar, { dataKey: 'moe', name: '26B-A4B TPU (MoE)', fill: '#b088e0', radius: [4, 4, 0, 0] }),
+        e(R.Bar, { dataKey: 'b31', name: '31B TPU', fill: '#5a8bd4', radius: [4, 4, 0, 0] }),
+        e(R.Bar, { dataKey: 'vllm', name: 'vLLM H100 (31B)', fill: '#e8a84c', radius: [4, 4, 0, 0] })
       )
     );
   }
 
-  // TPU vs vLLM GPU comparison (measured)
+  // TPU 31B vs vLLM GPU (both at 2048 ctx)
   const comparisonData = [
-    { batch: '1',   tpu: 78.2,  gpu: 66.9 },
-    { batch: '8',   tpu: 584,   gpu: 511.7 },
-    { batch: '32',  tpu: null,  gpu: 1728 },
-    { batch: '64',  tpu: 4220,  gpu: 2794 },
-    { batch: '128', tpu: 6831,  gpu: 3848 },
-    { batch: '256', tpu: 10536, gpu: 3709 },
-    { batch: '512', tpu: 12932, gpu: 3788 },
-    { batch: '768', tpu: 13943, gpu: 3671 }
+    { batch: '1',   tpu: 44,   rvgpu: 52,   gpu: 66.9 },
+    { batch: '8',   tpu: 318,  rvgpu: 452,  gpu: 511.7 },
+    { batch: '64',  tpu: 2112, rvgpu: 3097, gpu: 2794 },
+    { batch: '128', tpu: 3853, rvgpu: 5114, gpu: 3848 },
+    { batch: '256', tpu: 6246, rvgpu: 6897, gpu: 3709 },
+    { batch: '512', tpu: 8550, rvgpu: 7943, gpu: 3788 },
+    { batch: '768', tpu: 9600, rvgpu: null, gpu: 3671 }
   ];
 
   function TpuVsGpu(){
@@ -723,117 +739,53 @@ Per-layer KV: sliding layers capped at 32 blocks (1024 tokens), global layers ge
         e(R.YAxis, { stroke: '#888', tickFormatter: v => v.toLocaleString(), tick: { fill: '#ccc' }, label: { value: 'tok/s', angle: -90, position: 'insideLeft', fill: '#aaa', fontSize: 11 } }),
         e(R.Tooltip, { contentStyle: tooltipStyle, formatter: v => v ? v.toLocaleString() + ' tok/s' : 'N/A' }),
         e(R.Legend, { wrapperStyle: { paddingTop: 8 } }),
-        e(R.Bar, { dataKey: 'tpu', name: 'rvLLM TPU (measured)', fill: '#84E6B7', radius: [4, 4, 0, 0] },
-          e(R.LabelList, { dataKey: 'tpu', position: 'top', fill: '#c0f0d8', fontSize: 10, formatter: v => v >= 1000 ? (v/1000).toFixed(1)+'k' : v })
+        e(R.Bar, { dataKey: 'tpu', name: 'rvLLM TPU (31B)', fill: '#84E6B7', radius: [4, 4, 0, 0] },
+          e(R.LabelList, { dataKey: 'tpu', position: 'top', fill: '#c0f0d8', fontSize: 9, formatter: v => v >= 1000 ? (v/1000).toFixed(1)+'k' : v })
         ),
-        e(R.Bar, { dataKey: 'gpu', name: 'vLLM GPU (measured)', fill: '#5a8bd4', radius: [4, 4, 0, 0] },
-          e(R.LabelList, { dataKey: 'gpu', position: 'top', fill: '#8eb0e0', fontSize: 10, formatter: v => v >= 1000 ? (v/1000).toFixed(1)+'k' : v })
+        e(R.Bar, { dataKey: 'rvgpu', name: 'rvLLM GPU (31B)', fill: '#e8a84c', radius: [4, 4, 0, 0] },
+          e(R.LabelList, { dataKey: 'rvgpu', position: 'top', fill: '#f0c878', fontSize: 9, formatter: v => v ? (v >= 1000 ? (v/1000).toFixed(1)+'k' : v) : '' })
+        ),
+        e(R.Bar, { dataKey: 'gpu', name: 'vLLM GPU (31B)', fill: '#5a8bd4', radius: [4, 4, 0, 0] },
+          e(R.LabelList, { dataKey: 'gpu', position: 'top', fill: '#8eb0e0', fontSize: 9, formatter: v => v >= 1000 ? (v/1000).toFixed(1)+'k' : v })
         )
       )
     );
   }
 
-  // Optimization progression
-  const progressionData = [
-    { step: 'Nested scan\nbf16 B=1', toks: 25.6 },
-    { step: 'Flat scan\nbf16 B=1', toks: 48.2 },
-    { step: 'Flat scan\nint8 B=1', toks: 68.2 },
-    { step: 'Fused decode\nint8 B=1', toks: 78.2 },
-    { step: 'B=8', toks: 584 },
-    { step: 'B=64\n+LIBTPU', toks: 4220 },
-    { step: 'B=768\n+LIBTPU', toks: 13943 }
-  ];
-
-  function Progression(){
-    return e(R.ResponsiveContainer, { width:'100%', height:'100%' },
-      e(R.BarChart, { data: progressionData, margin: { top: 30, right: 30, left: 20, bottom: 30 } },
-        e(R.CartesianGrid, { stroke: '#1a1f28', strokeDasharray: '3 3' }),
-        e(R.XAxis, { dataKey: 'step', stroke: '#888', tick: { fill: '#ccc', fontSize: 10 }, interval: 0, angle: 0 }),
-        e(R.YAxis, { stroke: '#888', tickFormatter: v => v.toLocaleString(), tick: { fill: '#ccc' }, label: { value: 'tok/s', angle: -90, position: 'insideLeft', fill: '#aaa', fontSize: 11 } }),
-        e(R.Tooltip, { contentStyle: tooltipStyle, formatter: v => v.toLocaleString() + ' tok/s' }),
-        e(R.Bar, { dataKey: 'toks', name: 'Throughput', radius: [4, 4, 0, 0],
-          shape: (p) => {
-            var fill = p.index === progressionData.length - 1 ? '#84E6B7' : '#3a7a5a';
-            return e('rect', { x: p.x, y: p.y, width: p.width, height: p.height, fill: fill, rx: 4 });
-          }},
-          e(R.LabelList, { dataKey: 'toks', position: 'top', fill: '#c0f0d8', fontSize: 10, formatter: v => v >= 1000 ? (v/1000).toFixed(1)+'k' : v })
-        )
-      )
-    );
+  ReactDOM.createRoot(document.getElementById('chart-overview')).render(e(Overview));
+  if (document.getElementById('chart-projections')) {
+    ReactDOM.createRoot(document.getElementById('chart-projections')).render(e(Projections));
   }
-
-  // XProf breakdown
-  const xprofData = [
-    { name: '60-layer scan (MXU)',        ms: 10.6 },
-    { name: '  cond dispatch (in scan)',  ms: 1.8 },
-    { name: '  KV cache (in scan)',       ms: 1.3 },
-    { name: '  ICI all-reduce (in scan)', ms: 0.6 },
-    { name: 'Host + dispatch overhead',   ms: 1.7 }
-  ];
-
-  function Xprof(){
-    return e(R.ResponsiveContainer, { width:'100%', height:'100%' },
-      e(R.BarChart, { data: xprofData, layout: 'vertical', margin: { top: 10, right: 50, left: 10, bottom: 18 } },
-        e(R.CartesianGrid, { stroke: '#1a1f28', strokeDasharray: '3 3' }),
-        e(R.XAxis, { type: 'number', stroke: '#888', tick: { fill: '#ccc' }, label: { value: 'ms per step', position: 'insideBottom', offset: -8, fill: '#aaa', fontSize: 11 } }),
-        e(R.YAxis, { type: 'category', dataKey: 'name', stroke: '#aaa', tick: { fontSize: 12, fill: '#ddd' }, width: 180, interval: 0 }),
-        e(R.Tooltip, { contentStyle: tooltipStyle, formatter: v => v.toFixed(1) + ' ms' }),
-        e(R.Bar, { dataKey: 'ms', fill: '#84E6B7', radius: [0, 4, 4, 0] },
-          e(R.LabelList, { dataKey: 'ms', position: 'right', fill: '#c0f0d8', fontSize: 12, formatter: v => v.toFixed(1) + ' ms' })
-        )
-      )
-    );
-  }
-
-  ReactDOM.createRoot(document.getElementById('chart-ctx-scaling')).render(e(CtxScaling));
   ReactDOM.createRoot(document.getElementById('chart-tpu-scaling')).render(e(TpuScaling));
   ReactDOM.createRoot(document.getElementById('chart-tpu-vs-gpu')).render(e(TpuVsGpu));
-  ReactDOM.createRoot(document.getElementById('chart-progression')).render(e(Progression));
-  ReactDOM.createRoot(document.getElementById('chart-xprof')).render(e(Xprof));
 })();
 </script>
 
 <script>
 function filterView(mode) {
+  var overview = document.getElementById('section-overview');
   var tpu = document.getElementById('section-tpu');
-  var eagle3 = document.getElementById('section-eagle3');
   var gpu = document.getElementById('section-gpu');
-  var pillsTpu = document.getElementById('pills-tpu');
-  var pillsGpu = document.getElementById('pills-gpu');
   var dividers = document.querySelectorAll('.section-divider');
   var btns = document.querySelectorAll('.filter-btn');
 
   btns.forEach(function(b){ b.classList.remove('active'); });
   event.currentTarget.classList.add('active');
 
+  overview.classList.add('hidden');
+  tpu.classList.add('hidden');
+  gpu.classList.add('hidden');
+  dividers.forEach(function(d){ d.classList.add('hidden'); });
+
   if (mode === 'both') {
+    overview.classList.remove('hidden');
     tpu.classList.remove('hidden');
-    eagle3.classList.remove('hidden');
     gpu.classList.remove('hidden');
-    pillsTpu.classList.remove('hidden');
-    pillsGpu.classList.add('hidden');
     dividers.forEach(function(d){ d.classList.remove('hidden'); });
   } else if (mode === 'tpu') {
     tpu.classList.remove('hidden');
-    eagle3.classList.add('hidden');
-    gpu.classList.add('hidden');
-    pillsTpu.classList.remove('hidden');
-    pillsGpu.classList.add('hidden');
-    dividers.forEach(function(d){ d.classList.add('hidden'); });
-  } else if (mode === 'eagle3') {
-    tpu.classList.add('hidden');
-    eagle3.classList.remove('hidden');
-    gpu.classList.add('hidden');
-    pillsTpu.classList.add('hidden');
-    pillsGpu.classList.add('hidden');
-    dividers.forEach(function(d){ d.classList.add('hidden'); });
   } else if (mode === 'gpu') {
-    tpu.classList.add('hidden');
-    eagle3.classList.add('hidden');
     gpu.classList.remove('hidden');
-    pillsTpu.classList.add('hidden');
-    pillsGpu.classList.remove('hidden');
-    dividers.forEach(function(d){ d.classList.add('hidden'); });
   }
 }
 </script>
